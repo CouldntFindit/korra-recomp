@@ -20,8 +20,10 @@
 #include "../src/host/xaudio2_stub.h"
 #include "../src/host/steam_stub.h"
 
-/* native32.c is not linked here; the stubs only touch eax/esp. */
+/* native32.c is not linked here; the stubs only touch eax/esp and, for the
+ * diagnostics, g_cur_func (which the runtime sets on every lifted entry). */
 uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi, g_ebp;
+uint32_t g_cur_func;
 
 /* The CoCreateInstance shim leaves the machine lock around a forwarded call.
  * There is no machine here, so both are no-ops that keep g_esp untouched. */
@@ -209,7 +211,18 @@ static void test_xaudio2(void) {
     args[2] = (UINT32)(uintptr_t)&fmt;
     args[3] = 0;
     { union { float f; UINT32 u; } r; r.f = 2.0f; args[4] = r.u; }
-    args[5] = 0x009b38a4;    /* the guest's voice callback object */
+    /* The guest's CriNcvXAudio2VoiceCallback: an object whose first dword is
+     * its vtable, slot 4 (OnBufferEnd) = 0x7B2A24. The stub identifies the
+     * completion semantics by that slot, so the test passes the real shape
+     * instead of an unreadable guest address. */
+    {
+        static const uintptr_t cri_voice_cb_vtbl[7] = {
+            0x7B2A21u, 0x7B2A05u, 0x7B2A05u, 0x7B2A21u, 0x7B2A24u, 0x7B2A21u, 0x7B2A30u
+        };
+        static const uintptr_t *cri_voice_cb;
+        cri_voice_cb = cri_voice_cb_vtbl;
+        args[5] = (UINT32)(uintptr_t)&cri_voice_cb;
+    }
     args[6] = 0;
     args[7] = 0;
     CHECK(guest_call(dev, slot(dev, 0x20), 8, args, 32, "CreateSourceVoice") == 0 && src,
@@ -252,6 +265,25 @@ static void test_xaudio2(void) {
     CHECK(state.played >= TEST_FRAMES, "buffer retired after its duration");
     CHECK(state.queued == 0, "BuffersQueued drains (the engine can feed again)");
     CHECK(state.ctx == &ctx_token, "pCurrentBufferContext is the guest's context");
+    /* CRI's OnBufferEnd is exactly `*(u32 *)pBufferContext += 1`; a voice that
+     * retires buffers without reporting them leaves the engine's worker waiting
+     * forever (the M2 boot freeze). */
+    CHECK(ctx_token == 1, "retirement performs OnBufferEnd's counter increment");
+
+    /* The freeze case: CRI stops calling GetState while it waits for that
+     * counter. Retirement must therefore also happen from the device, on the
+     * CommitChanges the wait loop keeps issuing. */
+    args[0] = (UINT32)(uintptr_t)src;
+    args[1] = (UINT32)(uintptr_t)&buf;
+    args[2] = 0;
+    CHECK(guest_call(src, slot(src, 0x54), 3, args, 12, "SubmitSourceBuffer(again)") == 0,
+          "SubmitSourceBuffer -> S_OK");
+    Sleep(120);
+    args[0] = (UINT32)(uintptr_t)dev;
+    args[1] = 0x7FFFFFFF;
+    CHECK(guest_call(dev, slot(dev, 0x34), 2, args, 8, "CommitChanges(pump)") == 0,
+          "CommitChanges -> S_OK");
+    CHECK(ctx_token == 2, "CommitChanges retires and reports a buffer with no GetState");
 
     /* Same calls at the end of a stream: CRI does this on voice teardown. */
     args[0] = (UINT32)(uintptr_t)src;

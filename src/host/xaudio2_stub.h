@@ -41,6 +41,10 @@ typedef struct {
     unsigned buffers_submitted;
     unsigned long long frames_played;   /* sum over every voice */
     unsigned cocreate_hits, cocreate_missed;
+    unsigned callbacks_fired;           /* OnBufferEnd effects performed */
+    unsigned callbacks_no_context;      /* retired with pBufferContext == NULL */
+    unsigned callbacks_bad_context;     /* context not readable, dropped */
+    unsigned callbacks_skipped;         /* non-CRI callback, not guessed at */
 } xa2_stub_stats;
 void xa2_stub_get_stats(xa2_stub_stats *out);
 
