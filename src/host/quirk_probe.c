@@ -171,8 +171,18 @@ static void file_post_hook(uint32_t target, const uint32_t *args, uint32_t ret) 
         const char *path = (const char *)(uintptr_t)args[0];
         MEMORY_BASIC_INFORMATION mbi;
         if (path && VirtualQuery(path, &mbi, sizeof mbi) && mbi.State == MEM_COMMIT &&
-            !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+            !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
             _snprintf(line + n, sizeof line - n, " path=\"%s\"", path);
+            n = (int)strlen(line);
+            /* The interesting case is whether the save/profile path really
+             * exists: an open that reports a handle for a directory that is not
+             * on disk is a trace artefact, not a success. */
+            if (strstr(path, "Korra") || strstr(path, "SystemData")) {
+                DWORD attr = GetFileAttributesA(path);
+                _snprintf(line + n, sizeof line - n, " attrs=%s",
+                          attr == INVALID_FILE_ATTRIBUTES ? "MISSING" : "present");
+            }
+        }
     }
     fprintf(stderr, "%s -> handle=0x%08X GetLastError=%lu\n", line, ret, GetLastError());
     fflush(stderr);
