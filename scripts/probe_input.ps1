@@ -84,8 +84,27 @@ if (-not $Game) { $Game = Join-Path (Split-Path -Parent (Split-Path -Parent $roo
 
 $script:h = [IntPtr]::Zero
 function Shot([string]$name) {
+    # Re-find the window every time: the engine re-creates it when the display
+    # mode changes, and a stale handle captures a 1x1 bitmap.
+    $w = [F]::Windows([uint32]$p.Id)
+    if ($w.Count -eq 0) { Write-Host "shot ${name}: no window"; return }
+    $best = [IntPtr]::Zero; $bestArea = 0
+    foreach ($cand in $w) {
+        $rc = New-Object F+RECT
+        if ([F]::GetWindowRect($cand, [ref]$rc)) {
+            $area = ($rc.Right - $rc.Left) * ($rc.Bottom - $rc.Top)
+            if ($area -gt $bestArea) { $bestArea = $area; $best = $cand }
+        }
+    }
+    if ($best -eq [IntPtr]::Zero) { Write-Host "shot ${name}: no measurable window"; return }
+    $script:h = $best
     $r = New-Object F+RECT
     [void][F]::GetWindowRect($script:h, [ref]$r)
+    if (($r.Right - $r.Left) -lt 64 -or ($r.Bottom - $r.Top) -lt 64) {
+        Write-Host ("shot {0}: window 0x{1:X} rect {2},{3} {4}x{5} - skipped" -f $name,
+                    [int64]$script:h, $r.Left, $r.Top, ($r.Right - $r.Left), ($r.Bottom - $r.Top))
+        return
+    }
     $b = [System.Drawing.Rectangle]::FromLTRB($r.Left, $r.Top, $r.Right, $r.Bottom)
     $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
     $g = [System.Drawing.Graphics]::FromImage($bmp)
@@ -94,21 +113,30 @@ function Shot([string]$name) {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
     $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
     $g.Dispose(); $bmp.Dispose()
-    Write-Host "saved $path"
+    Write-Host ("saved {0} ({1}x{2})" -f $path, $b.Width, $b.Height)
 }
 
 $p = Start-Process -FilePath $exe -ArgumentList "`"$Game`"" -PassThru `
      -RedirectStandardOutput (Join-Path $root "build\run.out") -RedirectStandardError (Join-Path $root "build\run.err")
-Start-Sleep -Seconds $Wait
-if ($p.HasExited) { Write-Host "process exited before input (code $($p.ExitCode))"; exit 1 }
-$wins = [F]::Windows([uint32]$p.Id)
+# Wait for the window to exist (polling, not a fixed sleep): the engine creates
+# it once the CRT and D3D9 are up, which is fast but not instant.
+for ($i = 0; $i -lt 120; $i++) {
+    Start-Sleep -Milliseconds 250
+    if ($p.HasExited) { Write-Host "process exited before the window existed (code $($p.ExitCode))"; exit 1 }
+    $wins = [F]::Windows([uint32]$p.Id)
+    if ($wins.Count -gt 0) { break }
+}
 if ($wins.Count -eq 0) { Write-Host "no window"; $p.Kill(); exit 1 }
 $script:h = $wins[0]
 [F]::Force($script:h)
+Start-Sleep -Seconds 1
+[F]::Key(0x1B)      # Escape skips the startup movies
+Write-Host "sent Escape to skip the intro movies"
 Start-Sleep -Milliseconds 700
+[F]::Force($script:h)
 $fg = [F]::GetForegroundWindow()
 Write-Host ("window 0x{0:X} foreground 0x{1:X} focused={2}" -f [int64]$script:h, [int64]$fg, ($fg -eq $script:h))
-Shot "00_menu"
+Shot "00_boot"
 
 $i = 1
 foreach ($step in ($Steps -split ",")) {
