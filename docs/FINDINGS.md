@@ -683,3 +683,60 @@ interfaces (stubs). Nothing in the file, D3D9 or lift layers is implicated.
 - The `0xe4e52c` HWND global is populated by the engine itself.
 - Item 3 (does 60 fps double the logic rate) is still open: it needs the game to
   run a scene, not a title screen.
+
+## 2026-11-20 (late) - the original binary as an oracle, and what the box really is
+
+### `LoK.exe` runs on this machine
+
+The shipped binary is DRM-free and `steam_api.dll` is in the game folder, so the
+original can be started next to the port. It does not get far - it stops on a
+parchment message box that reads **"Wrong SteamID. Failed to load data."** - but
+that single frame answers two questions the port could not answer alone:
+
+- the parchment rectangle with the corner ornaments that the port draws **is the
+  message box**, and in the original it contains **text**;
+- so the port's "invisible text" is exactly one defect: the box's panel and its
+  ornaments render, the glyphs inside it do not. Font glyphs are drawn, clipped
+  or positioned by per-glyph maths, and that is what fails; every fixed-shape
+  element (panel, ornaments, logo, brush stroke, button glyphs) renders.
+
+Running the original is now the cheapest oracle for any later "is this the game
+or the port?" question. Note it needs a real Steam login to go past that box, so
+it is an oracle for the *pre-menu* state only.
+
+### The new-game crash is a state divergence, not a crash class
+
+Everything up to the HUD is now accounted for:
+
+- the crash is `UIPlHpBendingIcon` (vtable `0x96270C`) reading `0xCA3E58` and
+  dereferencing it as `BehaviorPlayer*` - the missing object is a `BehaviorPlayer`
+  (`0x9DEE90` is the value slot 1 of vtable `0x94B284` returns);
+- `sub_00503BD0` -> `sub_00507940` (the BehaviorPlayer constructor) **does run**
+  (`--firsthit` logs it before the crash), so the player is spawned;
+- `0xCA3E58` has exactly two writers, both inside the loader: `0x58DC33` sets it
+  from a list search, `0x58E79C` clears it. `--poison 0xCA3E58` shows it never
+  changes from zero;
+- the setter is the `0x710` branch of the loader dispatcher `sub_0058DAB0`, whose
+  only caller is the app state machine `sub_0053BE60` (state word `0xCA3838`).
+  `--poison 0xCA3838` shows the machine cycling 0-1-2-3-5-6-7-8-9 normally, and
+  `--poison 0xE38AB0` shows only two step ids ever dispatched: `0x0F00` and
+  `0x0A10`. **`0x710` is never dispatched.**
+
+So the loader never reaches the step that publishes the player, while the HUD is
+already updating. Creating the missing save directory
+(`...\korradecomp\Korra`, the path the engine opens `SystemData.dat` under) does
+not change it, and `KORRA_NO_AUDIO=1` does not either.
+
+### What the next session should do
+
+This needs an RE pass, not more runs:
+
+1. Read `sub_0053BE60` state by state (jump table `0x53C160`) and find which
+   condition keeps the machine from the state that queues `0x710`. Its guards are
+   `0xCA3CE0 & 0x10000000`, `0xCA3A94/0xCA3A90/0xCA3A8C/0xCA3A88`,
+   `0xCA3AC0/0xCA3ABC/0xCA3AB8` - all inside the app struct Track C mapped.
+2. Find who queues step ids into `0xE38AB0` (`0x5C1BE2`, `0x5C2CF4`, `0x5C2D74`,
+   `0x5C2DBA`, `0x5C2F70`, `0x53FD98`) and why `0x710` is never among them.
+3. For the text: find the glyph-draw function (it consumes the same message-box
+   strings) and dump the quad it builds; a sane quad points at the texture, a
+   degenerate one at the lifted per-glyph maths.

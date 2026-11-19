@@ -90,12 +90,12 @@ static uint16_t pad_single_taps(uint32_t ms) {
  * the intro movies (they take ~40 s on this machine), because a tap consumed by
  * a movie is a tap the title screen never sees. */
 static uint16_t pad_scripted_buttons(uint32_t ms) {
-    if (ms < 40000) return 0;
+    if (ms < 12000) return 0;
     /* One short A tap every 1.5 s after the title screen, so "press start",
      * then the highlighted menu entry, then any confirm prompt are all
      * answered without knowing the menu layout. */
-    if ((ms - 40000) % 1500 < 120) return PAD_A;
-    if ((ms - 40000) % 9000 > 4000 && (ms - 40000) % 9000 < 4120) return PAD_START;
+    if ((ms - 12000) % 1500 < 120) return PAD_A;
+    if ((ms - 12000) % 9000 > 4000 && (ms - 12000) % 9000 < 4120) return PAD_START;
     return 0;
 }
 
@@ -134,7 +134,10 @@ static void shim_XInputGetState(void) {
         bits = (uint16_t)pad_held_bits();
         if (pad_auto()) bits |= pad_scripted_buttons(pad_uptime_ms());
         bits |= pad_single_taps(pad_uptime_ms());
-        state->dwPacketNumber++;
+        /* dwPacketNumber changes only when the state changes, as the real
+         * XInput does: the engine uses it to detect edges, and incrementing it
+         * on every poll would report a new press on every frame. */
+        if (state->wButtons != bits) state->dwPacketNumber++;
         state->wButtons = bits;
         state->bLeftTrigger = state->bRightTrigger = 0;
         state->sThumbLX = state->sThumbLY = state->sThumbRX = state->sThumbRY = 0;
