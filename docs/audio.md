@@ -614,7 +614,7 @@ add up at first glance).
 | `BGM.bnk` HIRC | 1,456 = 295 Event / 695 Action / 187 Segment / 192 Track / 69 RanSeq / 18 Switch |
 | `Init.bnk` HIRC | 80 = 47 Bus / 8 AuxBus / 4 FxShareSet / 14 FxCustom / 7 State, no events, no media |
 | action histogram | Play 187, Stop 183, SetState 155, SetSwitch 102, Pause 38, Resume 12, SetGameParameter 10, SetVolume/ResetVolume 4, Use/UnuseState 2, SetBusVolume 1 |
-| graph | 150 distinct media reachable, 125 present in `stream\`, 25 bank-only, 0 Play-only events without media |
+| graph | 150 distinct track media (125 present in `stream\`, 25 bank-only); 183 events carry a Play action; how many of the 150 are *event*-reachable depends on switch-branch policy - 74 on the default path (`tools/verify_audio.py`), all 150 when non-default branches are walked (this session's resolver) |
 | `stream\` root | 189 files, 125 reachable from `BGM.bnk`, 64 unreferenced (as §8 states) |
 | prefetch gotcha | 119/120 media over-claim in their RIFF header; **95/95** bank copies are byte-identical prefixes (`bank == file[:bankSize]`), 0 exceptions |
 | FNV-1 ids | `init` -> 1355168291, `bgm` -> 412724365, `bgm_sync_ssbgm1` -> 1190818745 |
@@ -716,9 +716,10 @@ applies to the 14 events in `BGM.bnk` that carry zero actions.
 **(g) Small count deltas, for anyone comparing runs.** Media-reachable events
 come out as **183** here (every event with a Play action resolves at least one
 media id; none resolves only to bank-only media), vs 175 in §4 - the difference is
-reachability through non-default switch branches. Both agree that 0 Play events
-are media-less. Names: 978/987 above vs 977 in §7 (one string accepted by the
-`%d`-expansion pass). Neither changes any M4 decision.
+reachability through non-default switch branches (the committed harness reports
+the stricter figure, `74/150` for event-reachable media). Both agree that 0 Play
+events are media-less. Names: **977** by plain literals in both runs; 987 if
+`%d`/`%02d` format strings are expanded. None of this changes any M4 decision.
 
 **(h) The state objects carry the mix overrides [V].** The 7 `CAkState` objects
 are volume/pitch overrides, including a **-96 dB** state (the mute/pause state

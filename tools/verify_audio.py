@@ -32,8 +32,16 @@ def fnv1(s: str) -> int:
 
 
 def graph_from_xml(path: str):
-    """Pull event -> targets -> media out of a wwiser dump (same walk as docs/audio.md 3.3)."""
-    root = ET.parse(path).getroot()
+    """Pull event -> targets -> media out of a wwiser dump (same walk as docs/audio.md 3.3).
+
+    wwiser writes one <root> element per bank, so a dump made from two banks is
+    not well-formed XML; wrap the file so `-d xml Init.bnk BGM.bnk` also works.
+    """
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        text = re.sub(r"^<\?xml[^>]*\?>", "", fh.read())
+    if text.count("<root") > 1:
+        text = "<banks>" + text + "</banks>"
+    root = ET.fromstring(text)
 
     def fields(el):
         return {f.get("name"): f.get("value") for f in el.findall("field")}
