@@ -36,6 +36,12 @@ work/              analysis exe, seeds, catalog, logs — GITIGNORED
 
 Everything derived from the game binary lives in `work/` or `src/recomp/gen/`.
 
+**`src/host/` is a shared tree.** More than one work stream writes there (bring-up:
+`main.c`, `shims.c`, `runtime_glue.c`; audio/Steam: `steam_stub.*`, `xaudio2_stub.*`).
+Each concern owns its own file, and both build paths glob `src/host/*.c` — so a new
+file never needs a build-script edit, and nobody has to merge into somebody else's
+file. Do not rewrite a file you do not own; add a shim to `shims.c` instead.
+
 ## 3. Commands that matter
 
 ```powershell

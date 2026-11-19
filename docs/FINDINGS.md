@@ -150,6 +150,26 @@ to the lifter as Korra patches during M5. They are not blocking M2.
 RECOMP_UNIMPL sites after the first two fixes: 801 → 627 (the rest are
 `insb`/`outsb` port I/O, `pcmpistri`, and data decoded as code).
 
+### Host-level blockers found by running (M2.3/M2.4)
+
+Each one was invisible in the lift stats and obvious from a run + trace.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `[Hw::rofs::fst] ファイルサイズテーブルの作成に失敗しました` in `message_box.txt`, then exit | `GetModuleFileNameA` returned the **host** path (`…\build\korra_recomp.exe`), so the engine looked for `…\build\GameData\*.cpk` | shim `GetModuleFileNameA/W`, `GetModuleHandleA/W` |
+| window created, then orderly `SteamAPI_Shutdown` + `UnregisterClassA` + `ExitProcess(0)` with **no** file or D3D call ever made | `DirectInput8Create` returned `E_INVALIDARG` because the guest passed its load base `0x400000` as `hInstance` | the guest's "own module" is the **host HMODULE** (`GetModuleHandleA(NULL)`), not `0x400000`; `GetModuleFileName*` still answers with LoK.exe's path |
+| dies the moment a named thread starts | MSVC thread-name idiom: `RaiseException(0x406D1388)` with no debugger to catch it | VEH returns `EXCEPTION_CONTINUE_EXECUTION` for that code |
+| `[unimpl] 0x0077BCB7: bsf eax, ecx` | BSF/BSR absent from the lifter | lifter patch + `RECOMP_BSF/BSR` helpers in `recomp_types.h` (written as loops, not intrinsics: the same generated C compiles on MSVC x86 and clang arm64) |
+
+Unhandled exceptions now print code, faulting address, guest function, and the
+last 8 indirect calls (`korra_install_fault_handlers` in `runtime_glue.c`).
+
+Lifter gaps found by running, in order: `repz ret` → `cmpxchg`/`cmpxchg8b` →
+`fcomi`/`fcompi` → `bsf`. `RECOMP_UNIMPL` sites in the generated code:
+**801 → 142**. What remains is port I/O (`insb`/`insd`, dead in the PC build),
+`pcmpistri`/`palignr` (SSE4.2/SSSE3, unhandled by `simd32`), and bytes from data
+decoded as code (`ljmp`, `int 0x29`, `das`, `aas`).
+
 ### Target devices named by the user: **Galaxy S24 (Exynos 2400, Xclipse/RDNA)** and
   **Galaxy S25 (Snapdragon 8 Elite, Adreno)**. Requirement: do not ship an
   Adreno-only build. Plan: DXVK-Native over stock Vulkan 1.1+ (works on both),

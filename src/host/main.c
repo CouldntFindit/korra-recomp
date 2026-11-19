@@ -30,6 +30,8 @@ extern const uint32_t recomp_dispatch_count;
 
 int korra_shim_count(void);
 native32_shim_t *korra_shims(void);
+void korra_set_guest_module(const char *path);
+void korra_install_fault_handlers(void);
 
 /* No hand-written function overrides yet. This is where a specific guest VA
  * gets a host body (a debug hook, a stubbed subsystem), keyed by address. */
@@ -108,6 +110,8 @@ int main(int argc, char **argv) {
     fflush(stdout);
 
     native32_init();
+    korra_install_fault_handlers();
+    if (getenv("KORRA_TRACE")) native32_trace_native = 1;
 
     uint32_t base = 0x400000;
     uint32_t span = native32_map(exe_path, base);
@@ -117,6 +121,7 @@ int main(int argc, char **argv) {
     }
     printf("korra: mapped     0x%08X-0x%08X\n", base, base + span);
 
+    korra_set_guest_module(exe_path);
     int unresolved = native32_bind(base, korra_shims(), korra_shim_count());
     if (unresolved)
         fprintf(stderr, "korra: %d imports unresolved (the game will likely fault there)\n", unresolved);
@@ -129,7 +134,22 @@ int main(int argc, char **argv) {
 
     native32_call_guest(entry, 0, NULL);
 
-    printf("korra: guest returned eax=0x%08X\n", g_eax);
+    /* The guest usually leaves through ExitProcess, so reaching here means the
+     * CRT's startup returned: either WinMain finished or something gave up
+     * early. Say where, and show the last native calls -- that is almost always
+     * enough to name the subsystem that failed. */
+    printf("korra: guest returned eax=0x%08X last_func=0x%08X\n", g_eax, g_cur_func);
+    {
+        uint32_t idx = g_native_ring_idx;
+        int n = (int)(idx < NATIVE32_RING ? idx : NATIVE32_RING);
+        for (int i = 1; i <= n && i <= 24; i++) {
+            native32_call_rec_t *r = &g_native_ring[(idx - i + NATIVE32_RING) % NATIVE32_RING];
+            const char *name = native32_name(r->target);
+            printf("korra:   <- %s%s%08X from %08X args %08X %08X %08X ret %08X\n",
+                   name ? name : "", name ? " " : "", r->target, r->from,
+                   r->a0, r->a1, r->a2, r->ret);
+        }
+    }
     native32_dump_icalls(0);
     return (int)g_eax;
 }
