@@ -83,7 +83,7 @@ Start from the fault address, then the last log line, then the coverage snapshot
 | Call through `NULL` / `call [eax+8]` with garbage | unmapped function pointer: vtable slot not covered by the lift, or a vtable seeded by RTTI but never scanned | look the VA up in `work/catalog.json`; if absent, add seed and relift |
 | Assertion dialog / `int 3` | unimplemented host behaviour reached in a debug build | log + skip; never patch the guest's check away before understanding it |
 | Crash only in a hook or only after N seconds | hook ABI mismatch or stack imbalance (`__stdcall` vs `__cdecl`) | verify the import's calling convention in `pe_analyze` output |
-| Frame renders but nothing advances | fixed-timestep config -> check the `framerate_d` / `framerate_n` anchors | see `docs/FINDINGS.md` §framerate |
+| Frame renders but nothing advances / game runs at 30 fps | frame limiter, **not** `framerate_d`/`framerate_n` (those are movie fields — see `docs/quirks.md` §1) | log `DAT_00e4d210` and `[frameMgr+0x58]`; limiter is `FUN_00754840` (0x754840), 30/60 switch in `FUN_0074c580` (0x74c580) |
 | Silence instead of crash | audio thread died first | check XAudio2 COM stub return codes before blaming the engine |
 
 **Recovery loop for uncovered indirect calls:** run with coverage reporting,

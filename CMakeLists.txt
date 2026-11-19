@@ -21,7 +21,7 @@ endif()
 if(MSVC)
     # The guest image is mapped at its own base (0x400000), so the host must not
     # land there: link high and fixed, exactly like pcrecomp's own host projects.
-    add_link_options(/DYNAMICBASE:NO /FIXED /BASE:0x70000000)
+    add_link_options(/DYNAMICBASE:NO /FIXED /BASE:0x60000000)
     # Lifted code has a deep call graph; give it room.
     add_link_options(/STACK:16777216)
 

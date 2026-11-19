@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import mmap
 import os
 import struct
 import sys
@@ -136,22 +137,31 @@ class UtfTable:
 
 
 def open_cpk(path: str):
-    with open(path, "rb") as f:
-        data = f.read()
+    """Memory-map the archive: data001.cpk is 1.6 GB, so never read() it whole."""
+    f = open(path, "rb")
+    data = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
     if data[:4] != b"CPK ":
         raise ValueError(f"{path}: not a CPK (magic {data[:4]!r})")
     header = UtfTable(data, 0x10)
     return data, header
 
 
+def utf_start(data: bytes, offset: int, window: int = 0x40) -> int:
+    """Locate the @UTF table inside a chunk (TOC/ITOC/ETOC/GTOC wrappers)."""
+    if data[offset:offset + 4] == UTF_MAGIC:
+        return offset
+    rel = data.find(UTF_MAGIC, offset, offset + window)
+    if rel < 0:
+        raise ValueError(f"no @UTF near chunk at 0x{offset:x} (magic {data[offset:offset+4]!r})")
+    return rel
+
+
 def build_manifest(path: str, sample_magic: int, limit: int | None):
     data, header = open_cpk(path)
     hrow = next(header.rows())
-    if hrow.get("CpkMode"):
-        raise ValueError(f"CpkMode={hrow['CpkMode']} (UTF/TOC encryption) not handled")
     toc_offset = hrow["TocOffset"]
     content_offset = hrow["ContentOffset"]
-    toc = UtfTable(data, toc_offset)
+    toc = UtfTable(data, utf_start(data, toc_offset))
 
     entries = []
     for r in toc.rows():
@@ -162,10 +172,6 @@ def build_manifest(path: str, sample_magic: int, limit: int | None):
         offset = r.get("FileOffset") or 0
         fsize = r.get("FileSize") or 0
         xsize = r.get("ExtractSize") or fsize
-        magic = ""
-        if sample_magic and offset:
-            magic = data[offset:offset + 8]
-            magic = "".join(chr(b) if 32 <= b < 127 else "." for b in magic)
         entries.append({
             "path": path_,
             "ext": os.path.splitext(fname)[1].lower().lstrip(".") or "(none)",
@@ -173,15 +179,25 @@ def build_manifest(path: str, sample_magic: int, limit: int | None):
             "offset": offset,
             "size": fsize,
             "extract_size": xsize,
-            "crilayla": magic.startswith("CRILAYLA") if magic else (xsize > fsize),
-            "magic": magic,
             "crc": r.get("CRC"),
             "user_string": r.get("UserString") or "",
         })
         if limit and len(entries) >= limit:
             break
 
-    return data, header, hrow, toc, entries
+    # TOC FileOffset is relative to (ContentOffset - 0x800) on these archives:
+    # with that base the entries form a gapless 0x800-aligned chain that ends
+    # exactly at EtocOffset. See docs/assets.md.
+    base = content_offset - min(e["offset"] for e in entries) if entries else 0
+    for e in entries:
+        e["offset"] += base
+        magic = ""
+        if sample_magic and e["offset"]:
+            magic = "".join(chr(b) if 32 <= b < 127 else "."
+                            for b in data[e["offset"]:e["offset"] + 8])
+        e["magic"] = magic
+        e["crilayla"] = magic.startswith("CRILAYLA")
+    return data, header, hrow, toc, entries, base
 
 
 def summarise(path: str, hrow, entries) -> dict:
