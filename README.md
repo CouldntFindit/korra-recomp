@@ -77,14 +77,16 @@ the Android target (not set up yet). Details in
 ## Publishing
 
 Releases are **source-only** — no APKs, no binaries, no game data, no generated
-recompiled code. The public history is mirrored to Codeberg as insurance:
+recompiled code. A mirror script exists for when a second copy is wanted:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\sync_codeberg.ps1 -DryRun   # check
 powershell -ExecutionPolicy Bypass -File scripts\sync_codeberg.ps1           # push
 ```
 
-The script refuses a dirty tree, a non-Codeberg host, a non-fast-forward and any
+**No mirror is configured today** — the project is local-only by decision of the
+project owner, and the script exits harmlessly when no remote exists. When one is
+wanted, it refuses a dirty tree, a non-Codeberg host, a non-fast-forward and any
 tracked file the content guard rejects. Policy, one-time setup, release checklist
 and troubleshooting: [`docs/PUBLISHING.md`](docs/PUBLISHING.md).
 

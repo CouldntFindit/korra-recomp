@@ -5,6 +5,10 @@ The plan's publishing policy (§7) is **[LOCKED]**: public from day one,
 insurance against a primary host going away. This file is the operating manual
 for that policy. `scripts/sync_codeberg.ps1` is the tool.
 
+> **Status 2026-11-19:** the source-only and licensing parts are in force, but no
+> mirror is configured — the project owner decided against a hosted copy for now.
+> Treat everything below as the procedure to follow *if and when* one is set up.
+
 Two invariants everything below serves:
 
 1. **Nothing derived from the game leaves this repository.** No `LoK.exe`, no
@@ -141,8 +145,19 @@ content guard before it pushes, and never rewrites history.
 
 ## Not done yet (state on 2026-11-19)
 
-- No remote is configured in this checkout, and this machine's SSH key is not
-  registered on Codeberg (`ssh -T git@codeberg.org` → `Permission denied`), so
-  the first real sync is blocked on account setup, not on code.
+- **No remote is configured, and none is planned for now.** The project owner
+  does not want a hosted mirror, and OneDrive syncing is disabled on this
+  machine, so the repository currently exists in exactly one place. The script,
+  this document and its selftest stay in the tree so a mirror is a three-command
+  change of mind rather than a rewrite.
 - No CI. The guard and the selftest run locally; see
   `tests/sync_codeberg_selftest.ps1` (9 cases against a throwaway bare repo).
+
+If a second copy is ever wanted without an account anywhere, the cheapest option
+is a bundle or mirror clone onto separate media:
+
+```powershell
+git bundle create D:\backup\korra-recomp-$(Get-Date -Format yyyyMMdd).bundle --all
+# or, restorable like a real remote:
+git clone --mirror . D:\backup\korra-recomp.git
+```
