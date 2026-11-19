@@ -482,6 +482,25 @@ the vtable index on first run rather than guessing):
 | `IXAudio2SourceVoice` | `Start`, `Stop`, `SubmitSourceBuffer`, `FlushSourceBuffers`, `Discontinuity`, `ExitLoop`, `GetState`, `SetFrequencyRatio`, `GetFrequencyRatio`, `SetVolume`, `SetChannelVolumes`, `SetOutputMatrix`, `SetSourceSampleRate` |
 | `IXAudio2VoiceCallback` | **`OnBufferEnd` is load-bearing** — Wwise re-arms the next buffer from it. `OnStreamEnd`, `OnBufferStart`, `OnLoopEnd`, `OnVoiceProcessingPassStart/End`, `OnVoiceError` may be no-ops. |
 
+**Track D has since answered this from the shipped code** - measured map in
+`docs/xaudio2_callsites.md` (regenerate with `tools/host_import_map.py`). Where
+it disagrees with the table above, the map wins:
+
+* `IXAudio2SourceVoice::GetState` is the 2.7 shape: **one** argument
+  (`XAUDIO2_VOICE_STATE*`), no `Flags`.
+* There is no `GetChannelMask` in this ABI, and the mastering voice has no
+  `GetState`. Observed voice calls: `GetVoiceDetails`, `SetVolume`,
+  `SetOutputMatrix`, `DestroyVoice`, `Start`, `Stop`, `SubmitSourceBuffer`,
+  `FlushSourceBuffers`, `Discontinuity`, `GetState`, `SetFrequencyRatio`.
+* Both observed consumers feed from `GetState().BuffersQueued`, and CRI's
+  `OnBufferEnd` only increments a counter (`0x7B2A24`). Whether the second
+  device class needs `OnBufferEnd` is the one open question (section 6 of the
+  map); the M2 log answers it without a code change.
+* XAudio2 is created by CRI NcVoice *and* by a second device class
+  (`FUN_0088B0C0`), not provably by the Wwise runtime. Wwise's own output may be
+  the WASAPI `IMMDeviceEnumerator` path (`0x870246`) or DirectSound8
+  (`0x88AAFC`); both fall through to the real `ole32` in the current host.
+
 Format rules the sink must honour:
 
 * Accept the format the engine asks for; do not force one. Expect **16-bit PCM

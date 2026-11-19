@@ -9,7 +9,8 @@
  *                   (engine cb), vtbl+0x0C GetDeviceCount, vtbl+0x28
  *                   CreateMasteringVoice(&v,0,48000,0,deviceIndex,0), then
  *                   vtbl+0x00 GetVoiceDetails on it
- *     FUN_0088b0c0  the engine's own Hw audio device: vtbl+0x28 CreateMastering
+ *     FUN_0088b0c0  a second device class (sibling of FUN_008793f0's
+ *                   DirectSound8 factory): vtbl+0x28 CreateMastering
  *                   Voice, vtbl+0x18 RegisterForCallbacks, vtbl+0x10
  *                   GetDeviceDetails (reads OutputFormat.nChannels at +0x406),
  *                   vtbl+0x20 CreateSourceVoice (float32 extensible), vtbl+0x30
