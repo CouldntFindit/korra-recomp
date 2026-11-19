@@ -578,7 +578,9 @@ static HRESULT __stdcall dev_CommitChanges(xa2_device *self, UINT32 opset) {
 }
 static void __stdcall dev_GetPerformanceData(xa2_device *self, void *data) {
     (void)self;
-    if (data) memset(data, 0, 64);
+    /* XAUDIO2_PERFORMANCE_DATA (2.7) is 0x60 bytes; only write if the guest's
+     * buffer is really there. */
+    if (data && xa2_readable(data, 0x60)) memset(data, 0, 0x60);
 }
 static void __stdcall dev_SetDebugConfiguration(xa2_device *self, const void *cfg, const void *reserved) {
     (void)self; (void)cfg; (void)reserved;
