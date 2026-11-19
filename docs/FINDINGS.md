@@ -315,3 +315,61 @@ Full detail in `docs/assets.md`; this is the summary.
   in the HCA tables). Our readers were cross-checked against its source semantics.
 - Not verified: DAT sub-file table internals beyond 4CC/name/length, per-entry CPK
   `CRC` algorithm, audio/video length drift in `CS0071A/B`/`CS00P2`/`CS00EP`.
+
+## 2026-11-19 - Track D: steam_api + XAudio2 host shims
+
+### Deliverables
+
+- `src/host/steam_stub.c` / `.h` - the seven `steam_api.dll` imports plus real
+  `ISteamUser` / `ISteamUserStats` objects (the previous skeleton returned a
+  64-byte zero buffer, so the first `GetSteamID` would have called slot 0 of a
+  zero vtable).
+- `src/host/xaudio2_stub.c` / `.h` - silent `IXAudio2` 2.7 behind a
+  `CoCreateInstance` shim, with a QPC playback clock so `GetState` drains.
+- `docs/xaudio2_callsites.md` - the call-site map + ABI evidence (the M4 spec input).
+- `tools/host_import_map.py` - regenerates the evidence (GUIDs, IAT slots,
+  `FF 15` sites, indirect-call sweep, callers) without Ghidra.
+- `tests/selftest_host_shims.c` + `scripts/run_selftest.ps1` - **54/54 pass**.
+  Drives both vtables through real x86 thunks that set ECX/stack the way the
+  guest does and asserts the exact purge, so an ABI error fails here instead of
+  corrupting the lifted guest.
+
+All `src/host/*.c` compile (`cl /c`). Full link is M2's gate; not re-run here.
+
+### Findings
+
+- **XAudio2 2.7, COM, two consumers.** `CoCreateInstance(CLSID_XAudio2
+  {5a508685-a254-4fba-9b82-9a24b00306af} | CLSID_XAudio2Debug
+  {db05ea35-0329-4d4b-a53a-6dead03d3852}, IID_IXAudio2
+  {8bcf1f58-9fe7-4583-8ac6-e2adc465c8bb})` inside `FUN_007B22A8` (`0x7B22A8`).
+  Called from CRI NcVoice init (`0x7B2E85`) **and** from the engine's own Hw
+  audio device (`0x88B0DE`, `FUN_0088B0C0`). Each GUID appears once in `.rdata`.
+- **ABI: `__stdcall` with `this` on the stack**, not `thiscall` - the code is
+  `mov eax,[esi] / mov ecx,[eax] / push eax / call [ecx+0x64]`. `GetState` takes
+  one argument in 2.7 (`&state` only). Both would desync the guest stack if
+  declared the obvious way.
+- **`XAUDIO2_DEVICE_DETAILS`**: `DeviceID[256]`, `DisplayName[256]`, `Role`,
+  `OutputFormat`; the Hw mixer reads `OutputFormat.nChannels` at **+0x406** to
+  pick a stereo (3) or 5.1 (0x3f) channel mask.
+- **Callbacks are not required for silence.** CRI's `OnBufferEnd` (`0x7B2A24`)
+  only increments a counter; feeding is driven by `GetState().BuffersQueued < 4`
+  (`FUN_007B26B7`). The stub keeps the queue draining with a virtual clock and
+  never re-enters guest code.
+- **"Silent" is not only XAudio2.** DirectSound8 is created through
+  `CoCreateInstance` @`0x88AAFC` (`FUN_0088AAE0`, Hw factory `FUN_008793F0`) and
+  WASAPI `IMMDeviceEnumerator` @`0x870246` (`FUN_008701F0`). Both still go to the
+  real `ole32`, so a Windows build can be audible. M2 must pick one.
+- **steam_api bug fixed:** `SteamAPI_RegisterCallback`/`UnregisterCallback` are
+  `__cdecl` (guest does `add esp,8`), so the old shim's `g_esp += 12` was 8 bytes
+  too much. The shims now pop only the return address.
+- **Only `ISteamUser::GetSteamID` is ever called** (slot 2), `__thiscall` with a
+  hidden return pointer; `SteamUserStats()` is only null-checked.
+
+### Not verified
+
+- That M2.8/M2.9 work in a real boot (needs the M2 session's run; the
+  `[xa2]`/`[steam]` log lines are the check).
+- Whether the Hw mixer needs `OnBufferEnd` for its 8-slot ring (it polls
+  `GetState` at `0x88B454`; if it stalls, the fix is a guest callback
+  trampoline, not a different queue model).
+- `GetPerformanceData` sites `0x88B795`/`0x88B8D1` by offset only.
