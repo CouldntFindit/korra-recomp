@@ -42,6 +42,7 @@ What the patch series buys us (from its own subjects):
 | 0013 | `RECOMP_HOOK`: host hooks before chosen instructions |
 | 0014 | `RECOMP_X87_WINDOW`: sliding window FPU state |
 | MP2-0001 | SEH frames; `or`/`xor` condition semantics |
+| **Korra-0001** (ours, `1a8cb93`) | `lift32`: REP/REPNE prefix on RET is a hint, not an unimplemented instruction (`F3 C3` in LoK's CRT startup) |
 
 ## Local environment
 

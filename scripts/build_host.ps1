@@ -47,7 +47,7 @@ $cl = @(
 ) -join " "
 
 $libs = "kernel32.lib user32.lib gdi32.lib advapi32.lib shell32.lib ole32.lib oleaut32.lib winmm.lib dbghelp.lib synchronization.lib"
-$link = "link /nologo /OUT:`"$exe`" /SUBSYSTEM:CONSOLE /DYNAMICBASE:NO /FIXED /BASE:0x70000000 /STACK:16777216 /MAP:`"$root\build\korra_recomp.map`" `"$obj\*.obj`" $libs"
+$link = "link /nologo /OUT:`"$exe`" /SUBSYSTEM:CONSOLE /DYNAMICBASE:NO /FIXED /BASE:0x60000000 /STACK:16777216 /MAP:`"$root\build\korra_recomp.map`" `"$obj\*.obj`" $libs"
 
 $script = Join-Path $root "build\build.cmd"
 @(

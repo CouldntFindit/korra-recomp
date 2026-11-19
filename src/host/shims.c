@@ -96,3 +96,15 @@ static native32_shim_t g_shims[] = {
 
 int korra_shim_count(void) { return (int)(sizeof g_shims / sizeof g_shims[0]); }
 native32_shim_t *korra_shims(void) { return g_shims; }
+
+/* The runtime's declared-but-not-provided hook for an instruction the lifter
+ * could not express. MSVC has no weak symbols, so every host must supply it.
+ * A wrong-but-continuing body is the worst failure a recompile can have, so:
+ * name the guest address and the instruction, dump the last indirect calls,
+ * and stop. */
+void recomp_unimpl(uint32_t va, const char *what) {
+    fprintf(stderr, "\n[unimpl] 0x%08X: %s\n", va, what ? what : "(no description)");
+    native32_dump_icalls(8);
+    fflush(stderr);
+    abort();
+}
