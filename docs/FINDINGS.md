@@ -415,3 +415,71 @@ Corrections the pass found (both now fixed in `docs/assets.md`, commit `91cce7b`
 
 Also tightened: §2 now states the base rule as an explicit formula
 (`base = ContentOffset − 0x800`) instead of only showing the derived value.
+
+## 2026-11-19 — Track E: publishing (Codeberg mirror, README, notices)
+
+Commit `4a1c868`. New: `scripts/sync_codeberg.ps1`, `tests/sync_codeberg_selftest.ps1`,
+`docs/PUBLISHING.md`; refreshed `README.md`, `THIRD_PARTY_NOTICES.md`,
+`AGENTS.md` §3. `check_content` clean on all 44 tracked files.
+
+### The mirror script
+
+One command, five refusals, no force path: dirty tree (1), a tracked path the
+content guard rejects (1), a host that is not `codeberg.org` (3), a
+non-fast-forward (4), a failed push or a post-push SHA mismatch (5). `-DryRun`
+still fetches, so the history decision is real. Config through
+`KORRA_CODEBERG_REMOTE` / `KORRA_CODEBERG_BRANCH`; every run appends to the
+gitignored `logs/sync_codeberg.log`.
+
+`tests/sync_codeberg_selftest.ps1` builds a sandbox repo in `%TEMP%`, puts a bare
+repo where Codeberg would be, and drives nine cases: no remote, host check, dry
+run, tracked `.cpk`, dirty tree, first push, idempotent re-run, fast-forward,
+non-fast-forward. **9/9 pass** (two runs, before and after the commit).
+
+### Two bugs the selftest caught
+
+- A helper named `Git` **shadowed `git.exe`** — PowerShell resolves a function
+  before an application, so `& git` called the function again until "call depth
+  overflow". Renamed `Invoke-Git`.
+- `@(Invoke-Git ...).Out` binds the hashtable rather than its `Out` member under
+  `Set-StrictMode -Version 2`; empty results arrived as `$null` and `.Count`
+  threw. Pipelines are wrapped now, not members. Both were invisible when the
+  script ran on an already-clean repo with a real remote.
+
+### Notices re-checked against upstream (2026-11-19)
+
+Corrections to what earlier notes assumed:
+
+- `libadrenotools` is **BSD-2-Clause**, not BSD-3.
+- **CriCodecs has no license file** — no `LICENSE`/`COPYING`, no `license` field
+  in `pyproject.toml`. It stays "studied only" (and never built here).
+- **Steamless is CC BY-NC-ND 4.0** — now listed as excluded, never adapt it. Moot
+  in practice: the binary has no DRM.
+- `wwiser` has no license file either (dev oracle only).
+- `JJL772/d3dx9` is ToGL/MIT-style but **unused**: native32 links the real
+  `d3dx9_43`/`d3d9` (M2.2).
+- `usmbreak` is 0BSD and unused; `ngbrecomp` + `RogueSquadron64Recomp` GPL-3.0;
+  `totk-pc-recomp` MIT; `awesome-decomp-games` CC0; pcrecomp MIT; vgmstream ISC;
+  capstone BSD-3; pefile MIT; Ghidra Apache-2.0; ffmpeg LGPL-2.1+.
+
+No pcrecomp runtime header is vendored here, so its MIT notice covers generated
+code and the build only; the nfsu2 patch series is applied from a sibling clone
+and never redistributed.
+
+### README
+
+Now states M2 as **in progress** with the true rung state (lifted C compiles in
+517 s, links against real system DLLs, engine startup reached, **no first frame**),
+adds a tracks table A–E, and fixes two stale claims: this binary's relocation
+directory needs no repair, and the build section now shows
+`scripts\build_host.ps1` instead of stopping at the lift.
+
+### Not verified / not done
+
+- **No mirror is live.** The checkout has no remotes and `ssh -T
+  git@codeberg.org` answers `Permission denied (publickey)`; the key is not
+  registered. The script's no-remote path prints the three setup steps. Everything
+  up to `git push` is exercised by the selftest against a local bare repo; the
+  network edge (Codeberg's SSH server, repository permissions) is untested.
+- No CI. The guard and the selftest are local commands.
+- The optional Winlator fallback needs the user's phone and was not touched.
