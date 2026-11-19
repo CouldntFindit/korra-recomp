@@ -866,9 +866,20 @@ static void shim_CoCreateInstance(void) {
     if (xa2_readable(rclsid, sizeof(GUID)) && xa2_stub_is_xaudio2_clsid(rclsid)) {
         hr = xa2_stub_create_instance(rclsid, (DWORD)a[2], riid, ppv);
     } else {
+        /* Every other CLSID is the real COM server, and creating one can load a
+         * DLL (DirectSound8, Wwise's device enumerator). Doing that while
+         * holding the machine lock is the same hazard native_bridge avoids:
+         * the loader lock plus a thread that wants the machine is a deadlock.
+         * Leave the machine around the call, like native_bridge does. */
+        DWORD guest_error = GetLastError();
         g_stats.cocreate_missed++;
+        mach_leave();
+        SetLastError(guest_error);
         hr = CoCreateInstance((REFCLSID)(uintptr_t)a[0], (LPUNKNOWN)(uintptr_t)a[1],
                               (DWORD)a[2], (REFIID)(uintptr_t)a[3], ppv);
+        guest_error = GetLastError();
+        mach_enter();
+        SetLastError(guest_error);
     }
     g_eax = (uint32_t)hr;
     g_esp += 4 + 5 * 4;   /* ret + the five stdcall arguments */

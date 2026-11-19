@@ -23,6 +23,11 @@
 /* native32.c is not linked here; the stubs only touch eax/esp. */
 uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi, g_ebp;
 
+/* The CoCreateInstance shim leaves the machine lock around a forwarded call.
+ * There is no machine here, so both are no-ops that keep g_esp untouched. */
+void mach_enter(void) {}
+void mach_leave(void) {}
+
 static int g_fail, g_pass;
 
 #define CHECK(cond, what)                                                      \
