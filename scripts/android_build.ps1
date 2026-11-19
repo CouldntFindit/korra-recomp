@@ -52,7 +52,8 @@ try {
     $apk = Join-Path $android "app\build\outputs\apk\debug\app-debug.apk"
     if (-not (Test-Path $apk)) { throw "APK not produced at $apk" }
     $size = (Get-Item $apk).Length
-    Write-Host ("APK: {0} ({1:N1} MB)" -f $apk, ($size / 1MB))
+    # Decimal MB, so it matches the numbers in docs/TOOLCHAIN.md.
+    Write-Host ("APK: {0} ({1:N1} MB)" -f $apk, ($size / 1e6))
 
     if ($Install) {
         $adb = Join-Path $Sdk "platform-tools\adb.exe"
