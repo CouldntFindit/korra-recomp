@@ -261,3 +261,37 @@ New facts (section 12.2):
   0, 2.407 s): not a decode failure, and one of the legitimate "no sound" cases.
 - 25 bank-only media ids listed in section 12.3 for Track B to check against the
   CPK manifest (`95719221` is the single complete in-memory source).
+
+## 2026-11-19 — Track B: CPK archives + USM movies
+
+Full detail in `docs/assets.md`; this is the summary.
+
+- **Manifest (1,213 entries, no extraction):** `data000.cpk` 331 entries / 265.2 MB,
+  `data001.cpk` 882 / 1.60 GB — 1.87 GB stored, **2.05 GB extracted**. Extensions:
+  `.dat` 668, `.dtt` 523, `.evn` 12, `.bxm` 5, `.evt` 4, `.xml` 1. 57 zero-byte
+  placeholders. 672 CRILAYLA-compressed entries (128 MB stored).
+- **CRILAYLA:** all **672/672** decode to exactly their TOC `ExtractSize`, 0 errors
+  and 0 size mismatches (in-memory pass over both archives). Decoder: backwards
+  bitstream, 13-bit offset, tiered length `2 -> +3 -> +5 -> +8*255`, trailing
+  0x100 verbatim prefix.
+- **Container quirks:** UTF offsets are relative to `table + 8`; TOC `FileOffset`
+  needs base `ContentOffset - 0x800` (gapless 0x800-aligned chain that ends exactly
+  at `EtocOffset`, 0 gaps over 1,213 entries). `CpkMode = 1` is **not** encryption.
+- **Payload magics:** `DAT\0` x1,148 (named sub-file bundle: header, 4CC array,
+  name table, data), `BXM\0` x5, `vfxShadersetting.xml`, 2 `*ShaderSign.dat`.
+- **USM:** `movie\CS0041.usm` demuxed to MPEG-1 1280x720 @ 23.976 (65 frames) +
+  ADX 5.1 48 kHz, muxed with ffmpeg to MP4 and verified by ffprobe (65 frames,
+  2.711 s, 6 ch). All 34 movies parse: 1280x720 MPEG-1, ADX 48 kHz, 800 MB, 697 s,
+  no encryption, only `@SFV`/`@SFA` chunks. Chunk `frame_time` is **1/3000 s
+  ticks, not ms** - take durations from the codec.
+- **Answer to Track A's open item:** the missing Wwise banks are **inside the
+  CPKs** - 62 DAT payloads contain a `BKHD` bank sub-file (45 in `data000`, 17 in
+  `data001`), generator version `0x58` (= same Wwise build as `sound\*.bnk`), and
+  `bank_id == FNV-1 32 of the lowercase asset stem` for 61/62 (`pl/pl00f1` aliases
+  `pl0000`). IDs listed in `docs/assets.md` section 5.1.
+- **Tooling:** `tools/cpk_manifest.py`, `tools/cpk_extract.py`, `tools/usm_demux.py`
+  (stdlib only). **CriCodecs is unusable here**: PyPI ships no wheels and the
+  source fails on MSVC 14.44 (`C1083 'flat_map'`, then `C3615/C7595` consteval trig
+  in the HCA tables). Our readers were cross-checked against its source semantics.
+- Not verified: DAT sub-file table internals beyond 4CC/name/length, per-entry CPK
+  `CRC` algorithm, audio/video length drift in `CS0071A/B`/`CS00P2`/`CS00EP`.
