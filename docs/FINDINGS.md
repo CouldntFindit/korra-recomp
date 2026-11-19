@@ -165,10 +165,24 @@ Unhandled exceptions now print code, faulting address, guest function, and the
 last 8 indirect calls (`korra_install_fault_handlers` in `runtime_glue.c`).
 
 Lifter gaps found by running, in order: `repz ret` → `cmpxchg`/`cmpxchg8b` →
-`fcomi`/`fcompi` → `bsf`. `RECOMP_UNIMPL` sites in the generated code:
-**801 → 142**. What remains is port I/O (`insb`/`insd`, dead in the PC build),
-`pcmpistri`/`palignr` (SSE4.2/SSSE3, unhandled by `simd32`), and bytes from data
-decoded as code (`ljmp`, `int 0x29`, `das`, `aas`).
+`fcomi`/`fcompi` → `bsf` → `pcmpistri`. `RECOMP_UNIMPL` sites in the generated
+code: **801 → 114**. What remains is port I/O (`insb`/`insd`, dead in the PC
+build), and bytes from data decoded as code (`ljmp`, `int 0x29`, `das`, `aas`).
+
+### `pcmpistri` (SSE4.2 string compare) — how it was done
+
+MSVC's CRT uses it for its `strlen`/`strchr`/`strcmp` fast paths, so it is on the
+boot path. `tests/pcmpistri_probe.c` + `tests/pcmpistri_selftest.c` compare an
+implementation against the **host CPU's own instruction** (`_mm_cmpistri` and
+friends): the host is x86 with SSE4.2, so the oracle is free and exact.
+
+The implicit-length rules turned out to be subtle enough that a from-the-SDM
+re-derivation did not match the hardware (36,397 mismatches in 200k cases), so:
+
+- on `_MSC_VER && _M_IX86` the runtime **calls the real instruction** (switch over
+  the imm8 values MSVC emits) — exact by construction, 200k/200k cases pass;
+- the portable body is kept for arm64 and is **not yet verified**; validate it on
+  the phone with the same differential test before trusting M3 output.
 
 ### Target devices named by the user: **Galaxy S24 (Exynos 2400, Xclipse/RDNA)** and
   **Galaxy S25 (Snapdragon 8 Elite, Adreno)**. Requirement: do not ship an
