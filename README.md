@@ -29,7 +29,7 @@ side (Win32, D3D9 surface, XInput, XAudio2, CRI/Wwise audio, Steam stubs).
 | M4 | Audio: Wwise + CRI behind a host mixer | spec ready ([`docs/audio.md`](docs/audio.md)), implementation not started |
 | M5 | Gameplay validation, framerate hooks, full playthrough | not started |
 
-Parallel research tracks (each has its own document and is closed):
+Parallel research tracks (each has its own document):
 
 | Track | Scope | State |
 |---|---|---|
@@ -37,7 +37,7 @@ Parallel research tracks (each has its own document and is closed):
 | B | CPK archives + USM movies → M2.10 and optional movies | **done + independently confirmed** (45/45) — [`docs/assets.md`](docs/assets.md) |
 | C | Ghidra subsystem triage → M2 hooks and M5 frame pacing | **done** — [`docs/quirks.md`](docs/quirks.md) |
 | D | Host shims: `steam_api` + silent XAudio2 2.7 COM | **done**, selftest 54/54 — [`docs/xaudio2_callsites.md`](docs/xaudio2_callsites.md) |
-| E | Publishing: Codeberg mirror, README/notices upkeep | this session — [`docs/PUBLISHING.md`](docs/PUBLISHING.md) |
+| E | Publishing: Codeberg mirror, README/notices upkeep | **done** (publishing half; Winlator fallback not started) — [`docs/PUBLISHING.md`](docs/PUBLISHING.md) |
 
 Exact toolchain pin and per-milestone findings: [`docs/TOOLCHAIN.md`](docs/TOOLCHAIN.md),
 [`docs/FINDINGS.md`](docs/FINDINGS.md). Working rules for contributors and
