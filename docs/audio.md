@@ -593,7 +593,8 @@ python wwiser.py -d xml -dn bgm.xml "…\sound\bgm\BGM.bnk"
 ## 12. Second-session verification (2026-11-19)
 
 This section was added by a **second, independent** session before M4 starts
-using this document. Nothing above was edited except three pointers in §11.
+using this document. Nothing above was rewritten; three short additions were
+inserted instead (§4 sync-group note, §9.1 XAudio2 version, §11 item 4 pointer).
 Method differs on purpose - own HIRC resolver over a `wwiser -d xml` dump, own
 RIFF/DIDX/`.wai` parsers, `vgmstream-cli r2168` as the only decode oracle - so
 that agreement is evidence and not a copy.
