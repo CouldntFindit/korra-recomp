@@ -52,3 +52,18 @@ CMakeFiles/
 *.exp
 *.res
 *.log
+
+# ---------------------------------------------------------------------------
+# Android (M3). Build output, machine-specific paths, signing material.
+# `build/` above already covers android/build and android/app/build.
+# The Gradle wrapper jar IS committed on purpose (see THIRD_PARTY_NOTICES.md).
+# ---------------------------------------------------------------------------
+.gradle/
+local.properties
+.cxx/
+*.iml
+captures/
+android/app/release/
+keystore.properties
+*.jks
+*.keystore

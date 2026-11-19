@@ -6,7 +6,8 @@ here** — builders produce both locally from their own copy of the game (see
 `README.md` and `docs/PUBLISHING.md`).
 
 Licenses below were checked against upstream on **2026-11-19** (repository
-metadata and the license text itself, not a recollection). Where upstream has no
+metadata and the license text itself, not a recollection) and extended on
+**2026-11-20** with the Android build tooling. Where upstream has no
 license file, this file says so plainly instead of guessing.
 
 ## 1. Used at build time or linked into the result
@@ -17,7 +18,10 @@ license file, this file says so plainly instead of guessing.
 | **DXVK** / DXVK-Native | <https://github.com/doitsujin/dxvk> | zlib | Direct3D 9 → Vulkan translation, for the Windows swap and for Android (M3, not integrated yet). Built as a dependency; not vendored here. |
 | **libadrenotools** | <https://github.com/bylaws/libadrenotools> | BSD-2-Clause | Optional loading of Turnip/custom Vulkan drivers on Adreno devices (M3). Dependency only. |
 | **Turnip (Mesa)** | <https://gitlab.freedesktop.org/mesa/mesa> | MIT | Optional Vulkan driver fallback on Adreno. Shipped as a prebuilt driver blob at build time, never in this repository. |
-| **SIMDe** | <https://github.com/simd-everywhere/simde> | MIT | Optional portable intrinsics if SIMD lowering needs them for arm64. Not currently referenced by any committed source file. |
+| **SIMDe** | <https://github.com/simd-everywhere/simde> | MIT | Optional portable intrinsics if SIMD lowering needs them for arm64. Not currently referenced by any committed source file; it is also the reference implementation proposed for the `pcmpistri` arm64 fix (`docs/ANDROID_BRINGUP.md` §7.5). |
+| **AndroidX GameActivity** | <https://developer.android.com/games/agdk/game-activity> | Apache-2.0 | `androidx.games:games-activity:4.4.2`, the Activity + native input/lifecycle glue used by the Android shell. Gradle dependency, not vendored. |
+| **AndroidX AppCompat** | <https://developer.android.com/jetpack/androidx/releases/appcompat> | Apache-2.0 | `androidx.appcompat:appcompat:1.8.0`; GameActivity extends `AppCompatActivity`, so the theme and runtime are required. Gradle dependency, not vendored. |
+| **Gradle wrapper** | <https://gradle.org> | Apache-2.0 | `android/gradle/wrapper/gradle-wrapper.jar` (pinned to Gradle 8.14.3) is committed so a fresh clone builds with `gradlew` and Android Studio does not silently regenerate it. It is unmodified upstream tooling, not a build product of this project. |
 | **ngbrecomp** | <https://github.com/gamboozino/ngbrecomp> | GPL-3.0 | Methodology and Android arm64 engineering notes (`docs/TECHNICAL.md`: TLS slot trick, perf-hint API, 256 KiB signal stacks, Turnip via libadrenotools). Adapting GPL-3.0 code into this GPL-3.0 project is licence-compatible; anything taken from it stays under GPL-3.0. |
 | **RogueSquadron64Recomp** | <https://github.com/MikeSemicolonD/RogueSquadron64Recomp> | GPL-3.0 | Agent-workflow model: crash-triage trees, dead-end ledger, skills. `AGENTS.md` here is written for this project from that pattern. |
 | **totk-pc-recomp** | <https://github.com/valentderah/totk-pc-recomp> | MIT | Reference for scaled-lifter architecture and the source-only release model. Documents only; no code taken. |
