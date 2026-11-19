@@ -139,6 +139,17 @@ they abort only if reached. Top groups:
 `fcomi*` and `lock cmpxchg` are real, hot-path instructions; expect to add them
 to the lifter as Korra patches during M5. They are not blocking M2.
 
+### Lifter patches needed by Korra (found by running, not by lifting)
+
+| Patch | Symptom | Scope |
+|---|---|---|
+| `repz ret` = `ret` | CRT startup aborts on `F3 C3` at 0x779FF0 | 1 site, on the boot path |
+| `cmpxchg` / `cmpxchg8b` | aborts at 0x5218F7 (`lock cmpxchg byte ptr [edx], cl`) — MSVC's interlocked ops, thread-safe statics, `/MT` lazy init | 162 sites |
+| `fcomi`/`fcompi`/`fucomi`/`fucompi` | capstone spells FCOMI/FCOMIP this way; the lifter only knew `fcomip` | 430 sites, every optimised float compare |
+
+RECOMP_UNIMPL sites after the first two fixes: 801 → 627 (the rest are
+`insb`/`outsb` port I/O, `pcmpistri`, and data decoded as code).
+
 ### Target devices named by the user: **Galaxy S24 (Exynos 2400, Xclipse/RDNA)** and
   **Galaxy S25 (Snapdragon 8 Elite, Adreno)**. Requirement: do not ship an
   Adreno-only build. Plan: DXVK-Native over stock Vulkan 1.1+ (works on both),
@@ -216,3 +227,37 @@ bank->event map, and the M4 host-mixer spec) and `tools/audio_inventory.py`
 - Not verified: the `.wai` flag-bit meanings, the exact `CLSID_XAudio2` + interface
   set (log the `CoCreateInstance` at M2.9), and whether `data001.cpk` carries
   further banks.
+
+## 2026-11-19 - Track A verification pass (second session)
+
+Independent re-derivation of `docs/audio.md` before M4 depends on it: own HIRC
+resolver over a `wwiser -d xml` dump, own RIFF/DIDX/`.wai` parsers, vgmstream
+r2168 as the only decode oracle. Everything the doc claims reproduced (779 wems /
+codec split / 1,456 + 80 HIRC objects / 150 media / 95 byte-identical bank
+prefixes / FNV ids / 97 named music events). Added as `docs/audio.md` section 12;
+three pointers inserted into sections 4, 9.1 and 11.
+
+New facts (section 12.2):
+
+- **XAudio2 version is 2.7, located by GUID in `LoK.exe`**: `IID_IXAudio2`
+  `8bcf1f58-9fe7-4583-8ac6-e2adc465c8bb` @0x507C50, `CLSID_XAudio2`
+  `5a508685-a254-4fba-9b82-9a24b00306af` @0x507C60, `CLSID_XAudio2_Debug`
+  `db05ea35-0329-4d4b-a53a-6dead03d3852` @0x507C70; the 2.8 IID is absent. The
+  2.7 vtable carries `GetDeviceCount` / `GetDeviceDetails` / `Initialize` *before*
+  `RegisterForCallbacks`, so a shim laid out from a 2.8 header is shifted three
+  slots - the concrete trap for M2.9/M4. `CoCreateInstance(CLSID_XAudio2 2.7)` is
+  only registered where the DirectX June-2010 runtime exists, so both Windows and
+  Android need the host hook rather than real XAudio2.
+- `Init.bnk` STMG budget: `fVolumeThreshold` -80 dB, `maxNumVoicesLimitInternal`
+  **256**, 11 state groups, 9 explicit transitions + 1000/3000 ms defaults.
+- **Correction:** the music switch containers use 14 distinct game-sync groups
+  (18 argument instances), none named; `bgm_sync_ssbgm1` (= 1190818745) is one of
+  the 11 global *state* groups, not a switch group.
+- The only two non-Vorbis media are a matched 25.000 s placeholder pair
+  (`1055586713` IMA-ADPCM -> track 260164643 / segment 2169841 / event 4198189333;
+  `82801749` PCM16 -> track 933817339 / segment 38066807 / event 823604040), both
+  isolated, both RMS -3.9 dBFS.
+- `stream\English(US)\416126653.wem` is a **genuinely silent** asset (all samples
+  0, 2.407 s): not a decode failure, and one of the legitimate "no sound" cases.
+- 25 bank-only media ids listed in section 12.3 for Track B to check against the
+  CPK manifest (`95719221` is the single complete in-memory source).
