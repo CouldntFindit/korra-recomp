@@ -523,4 +523,3 @@ directory needs no repair, and the build section now shows
   up to `git push` is exercised by the selftest against a local bare repo; the
   network edge (Codeberg's SSH server, repository permissions) is untested.
 - No CI. The guard and the selftest are local commands.
-- The optional Winlator fallback needs the user's phone and was not touched.
