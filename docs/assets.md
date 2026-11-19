@@ -363,7 +363,8 @@ chunks: (length = u32@+0x04 + 8), header 0x20 B, big-endian
    +0x0E u16 type: 0 data · 1 stream table · 2 "#HEADER"/"#METADATA" · 3 metadata
    +0x10 u32 frame_time          +0x14 u32 frame_rate (×100, e.g. 2397 = 23.97)
 payload = chunk + 8 + payload_offset;  for data chunks the last `pad` bytes are
-padding (verified: 100 % of stripped bytes are 0x00/0xFF across all 34 files)
+padding (verified across all 34 movies: 0 of the stripped chunks held anything
+but 0x00/0xFF, 454,773 bytes removed)
 ```
 
 `frame_time` is **not milliseconds** — the tick is 1/3000 s. Cross-check: 125
