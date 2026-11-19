@@ -50,7 +50,7 @@ Callers — **two independent consumers**, which is why the stub covers both:
 | Caller | Address | Consumer |
 |---|---|---|
 | `FUN_007B2E24` | `0x7B2E85` | CRI NcVoice XAudio2 1.04.01 device module |
-| `FUN_0088B0C0` | `0x88B0DE` | the engine's own Hw audio device (own mixer + 8-slot ring) |
+| `FUN_0088B0C0` | `0x88B0DE` | a second device class: own mastering voice, float32 source voice, 8-slot ring. Sibling of the DirectSound8 factory `FUN_008793F0`; its runtime owner (Wwise backend vs Platinum `Hw` layer) is **not proven here**. |
 
 ## 3. IXAudio2 vtable (2.7 order), slot by slot
 
