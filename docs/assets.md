@@ -237,7 +237,7 @@ Compression is modest overall (1.87 GB → 2.05 GB, ~10 %) because the biggest
 | `bm/` | 579 | `bm####.dat`/`.dtt`, `bma###.*` | boss + large environment models |
 | `ba/` | 105 | `ba####.dat`/`.dtt`, `ba####a.*` | background/architecture |
 | `st4`,`st5`,`stb`,`st2`,`st7`,`stf`,`st6`,`st3`,`st1`,`sta` | 5–42 each | `r####.dat`, `r####a#.dtt`, `rb####.*` | per-stage rooms, each stage dir holds its own set |
-| `ph*` (`phc`,`phf`,`phe`,`ph7`,`ph2`…`phb`,`pha`,`phd`,`ph1`,`ph5`) | 1–8 each | `p####.dat`/`.dtt` | stage colliders |
+| `ph*` (`phc`,`phf`,`phe`,`ph7`,`ph2`…`ph6`,`pha`,`phb`,`phd`,`ph1` — 13 dirs) | 1–8 each | `p####.dat`/`.dtt` | stage colliders |
 
 `.dat`/`.dtt` pairing: 523 of 668 `.dat` files have a same-stem `.dtt`
 (140/169 in data000, 383/499 in data001). The `.dtt` is always the bigger one —
