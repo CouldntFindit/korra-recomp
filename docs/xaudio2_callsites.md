@@ -106,7 +106,7 @@ and desynchronise the guest stack.
 `XAUDIO2_VOICE_STATE` is `{ void *pCurrentBufferContext; UINT32 BuffersQueued;
 UINT64 SamplesPlayed; }` — 16 bytes, and the guest reads `BuffersQueued` at +4.
 
-### The two callback objects (guest code, never called by the stub)
+### The two callback objects (guest code; the stub performs OnBufferEnd's effect)
 
 | Object | Vtable | Slots |
 |---|---|---|
@@ -114,11 +114,26 @@ UINT64 SamplesPlayed; }` — 16 bytes, and the guest reads `BuffersQueued` at +4
 | `CriNcvXAudio2VoiceCallback` (`.?AVCriNcvXAudio2VoiceCallback@@`) | `0x00908FD8` | 7 slots; **`OnBufferEnd` = `0x7B2A24` = `*(UINT32 *)pBufferContext += 1`** |
 
 `OnBufferEnd` only bumps a counter. CRI's feed loop is driven by
-`GetState().BuffersQueued` (`FUN_007B26B7` submits while queued < 4), so the stub
-does not have to call back into guest code to keep the engine fed — that is why
-M2 can be silent without a guest-thread trampoline. M4 keeps the same vtables
-and adds a real sink; if a callback is ever needed it must be invoked with
-`native32_call_guest`, never by a raw call.
+`GetState().BuffersQueued` (`FUN_007B26B7` submits while queued < 4), so the
+stub does not have to call back into guest code to keep the engine *fed* - but
+it does have to report buffers as *finished*: after the feed stops, CRI's worker
+waits on the same counter (`pBufferContext`, one shared u32) and nothing else
+moves it. The stub therefore performs the callback's observed body
+(`*(u32 *)pBufferContext += 1`) when a buffer retires on the playback clock, and
+does so for buffers retired by any call on the device, not only `GetState` - see
+`src/host/xaudio2_stub.c` (`xa2_dispatch_buffer_end`). The counter increment is
+done in C rather than by entering the lifted function: a callback would have to
+run through `native32_call_guest` from inside a COM bridge call, and that path
+returns with the machine's `esp` advanced by its own arguments and every
+register holding the callee's values, while the caller is mid
+`call [ecx+0x54]` and expects callee-saved registers intact. A real audio thread
+(M4) is where guest re-entry belongs.
+
+Evidence that this is the missing piece: with the stub never incrementing, the
+boot froze right after the first CRI source voice was created - the device pump
+called `CommitChanges` ~50 times/s forever, `GetState` was never called again,
+so nothing retired, and the engine never reached the movie. With the increment
+in place the intro movies play and the guest returns further than it ever had.
 
 ## 5. What the engine does with a failing or missing device
 

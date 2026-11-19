@@ -45,6 +45,7 @@
 #include <mmreg.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
 #include "native32.h"
@@ -119,8 +120,25 @@ typedef struct xa2_voice {
     UINT64 t0;             /* QPC at start of the current run */
     UINT64 next_end;       /* frame cursor for the next submitted buffer */
     const void *last_ctx;
+    UINT32 last_logged_q;  /* diagnostics: last BuffersQueued printed */
+    const void *cb;        /* guest IXAudio2VoiceCallback, or NULL */
+    UINT32 cb_kind;        /* XA2_CB_* - what retirement dispatches to */
+    UINT32 cb_warned;
     struct { UINT64 end; const void *ctx; } q[XA2_QUEUE_MAX];
 } xa2_voice;
+
+/* What a voice's completion callback does when a buffer ends. The guest body
+ * of CRI's OnBufferEnd (0x7B2A24) is a single instruction, `inc dword ptr
+ * [pBufferContext]`: CRI passes the same counter for every buffer and its
+ * worker waits for it to catch up with the number it submitted. Anything else
+ * is left alone rather than guessed at. */
+#define XA2_CB_NONE        0u
+#define XA2_CB_CRI_COUNTER 1u
+#define XA2_CB_OTHER       2u
+
+/* Guest VAs this stub recognises, from docs/xaudio2_callsites.md. The image is
+ * mapped at its own base (Fixed, no ASLR), so these are stable identities. */
+#define XA2_CB_ONBUFFEREND_VA 0x7B2A24u   /* CriNcvXAudio2VoiceCallback slot 4 */
 
 typedef struct {
     const xa2_fn *vtbl;
@@ -148,6 +166,14 @@ static void xa2_lock(void) {
                 LARGE_INTEGER f;
                 QueryPerformanceFrequency(&f);
                 g_qpf = f.QuadPart ? f.QuadPart : 1;
+            }
+            /* KORRA_XA2_VERBOSE=0..3 overrides the default (1). Level 2 logs
+             * every voice call; 3 adds a line whenever a voice's queue length
+             * changes, which is how the feed loop is followed when the engine
+             * stalls waiting for a buffer that never retires. */
+            if (getenv("KORRA_XA2_VERBOSE")) {
+                int v = atoi(getenv("KORRA_XA2_VERBOSE"));
+                if (v >= 0 && v <= 3) g_verbose = v;
             }
             InterlockedExchange(&g_lock_state, 2);
         } else {
@@ -202,15 +228,70 @@ static UINT64 xa2_voice_now(const xa2_voice *v) {
     return v->base + (UINT64)(frames + 0.5);
 }
 
+/* ------------------------------------------------------- completion dispatch
+ * CRI's worker does not only read GetState: after it stops feeding it waits for
+ * its own completion counter, and only OnBufferEnd ever moves that counter.
+ * A voice that retires buffers on the playback clock but never reports them back
+ * is therefore indistinguishable from a voice that never plays, and the engine
+ * parks on its audio lock (boot freeze, KORRA_NO_AUDIO=1 bypasses it).
+ *
+ * So retired buffers are dispatched to the callback's observed semantics:
+ * CRI's OnBufferEnd (guest 0x7B2A24) is exactly `*(UINT32 *)pBufferContext += 1`,
+ * which is done here. The lifted body is deliberately not entered: a callback
+ * would have to run through native32_call_guest from inside a COM bridge call,
+ * and that path returns with the machine's esp advanced by its own arguments and
+ * every register holding the callee's values - the caller it would return to is
+ * mid-`call [ecx+0x54]` and expects callee-saved registers intact. A real
+ * callback thread (M4) is where re-entry belongs. */
+static void xa2_dispatch_buffer_end(xa2_voice *v, const void *ctx) {
+    if (!ctx) {
+        g_stats.callbacks_no_context++;
+        return;
+    }
+    if (v->cb_kind == XA2_CB_CRI_COUNTER) {
+        if (xa2_readable(ctx, sizeof(UINT32))) {
+            *(volatile UINT32 *)ctx += 1;
+            g_stats.callbacks_fired++;
+            return;
+        }
+        g_stats.callbacks_bad_context++;
+        if (g_verbose) xa2_log("OnBufferEnd: unreadable pBufferContext %p (dropped)", ctx);
+        return;
+    }
+    g_stats.callbacks_skipped++;
+    if (!v->cb_warned) {
+        v->cb_warned = 1;
+        xa2_log("voice %p: completion callback %p is not the CRI counter callback "
+                "(vtbl slot 4 = 0x%08X); retiring silently",
+                (void *)v, v->cb,
+                (v->cb && xa2_readable(v->cb, 4)) ? *(const UINT32 *)*(const void *const *)v->cb : 0u);
+    }
+}
+
 static void xa2_voice_retire(xa2_voice *v, UINT64 now) {
     while (v->qcount) {
         UINT64 end = v->q[v->qhead].end;
+        const void *ctx = v->q[v->qhead].ctx;
         if (now < end) break;
         g_stats.frames_played += end - v->played;
         v->played = end;
-        v->last_ctx = v->q[v->qhead].ctx;
+        v->last_ctx = ctx;
         v->qhead = (v->qhead + 1) % XA2_QUEUE_MAX;
         v->qcount--;
+        /* Called with the stub lock held: the counter is guest memory, and the
+         * guest thread that polls it can run concurrently. */
+        xa2_dispatch_buffer_end(v, ctx);
+    }
+}
+
+/* Advance every voice's clock. Called from every device/voice entry point,
+ * CommitChanges included: when the engine waits for completions it keeps
+ * committing, and nothing else would otherwise move the clock. */
+static void xa2_pump_all(void) {
+    int i;
+    for (i = 0; i < XA2_MAX_VOICES; i++) {
+        xa2_voice *v = &g_voices[i];
+        if (v->magic == XA2_MAGIC && v->qcount) xa2_voice_retire(v, xa2_voice_now(v));
     }
 }
 
@@ -539,7 +620,7 @@ static HRESULT __stdcall dev_CreateSourceVoice(xa2_device *self, void **pp, cons
                                                UINT32 flags, float max_ratio, const void *cb,
                                                const xa2_voice_sends *sends, const xa2_effect_chain *chain) {
     xa2_voice *v;
-    (void)sends; (void)chain; (void)flags; (void)cb;
+    (void)sends; (void)chain; (void)flags;
     if (!xa2_device_valid(self) || !pp) return XA2_HR_INVALID;
     *pp = NULL;
     if (!fmt || !xa2_readable(fmt, sizeof(WAVEFORMATEX))) {
@@ -553,12 +634,24 @@ static HRESULT __stdcall dev_CreateSourceVoice(xa2_device *self, void **pp, cons
     v->rate = fmt->nSamplesPerSec ? fmt->nSamplesPerSec : 48000;
     v->channels = fmt->nChannels ? fmt->nChannels : 2;
     v->block_align = fmt->nBlockAlign ? fmt->nBlockAlign : v->channels * 4;
+    /* Identify the completion callback now, not per retired buffer: the guest
+     * keeps the object alive for the voice's lifetime. */
+    v->cb = cb;
+    v->cb_kind = XA2_CB_NONE;
+    if (cb && xa2_readable(cb, sizeof(void *))) {
+        const UINT32 *vtbl = *(const UINT32 *const *)cb;
+        if (vtbl && xa2_readable(vtbl, 5 * sizeof(UINT32))) {
+            v->cb_kind = (vtbl[4] == XA2_CB_ONBUFFEREND_VA) ? XA2_CB_CRI_COUNTER : XA2_CB_OTHER;
+        }
+    }
     *pp = v;
     xa2_unlock();
     if (g_verbose)
-        xa2_log("CreateSourceVoice(%u ch, %u Hz, %u bits, tag 0x%04X, maxratio %.3f) -> #%d (silent)",
+        xa2_log("CreateSourceVoice(%u ch, %u Hz, %u bits, tag 0x%04X, maxratio %.3f) -> #%d (silent, cb=%p %s)",
                 fmt->nChannels, fmt->nSamplesPerSec, fmt->wBitsPerSample, fmt->wFormatTag,
-                max_ratio, (int)(v - g_voices));
+                max_ratio, (int)(v - g_voices), cb,
+                v->cb_kind == XA2_CB_CRI_COUNTER ? "CRI counter" :
+                v->cb_kind == XA2_CB_OTHER ? "other" : "none");
     return XA2_HR_OK;
 }
 
@@ -574,7 +667,13 @@ static HRESULT __stdcall dev_StopEngine(xa2_device *self) {
 }
 static HRESULT __stdcall dev_CommitChanges(xa2_device *self, UINT32 opset) {
     if (!xa2_device_valid(self)) return XA2_HR_INVALID;
-    if (g_verbose > 1) xa2_log("CommitChanges(0x%X) -> 0", opset);
+    /* The engine's completion wait keeps calling this. Use it to move every
+     * voice's playback clock, so buffers retire (and their callbacks fire) even
+     * while nothing calls GetState. */
+    xa2_lock();
+    xa2_pump_all();
+    xa2_unlock();
+    if (g_verbose > 1) xa2_log("CommitChanges(0x%X) -> 0 (from 0x%08X)", opset, g_cur_func);
     return XA2_HR_OK;
 }
 static void __stdcall dev_GetPerformanceData(xa2_device *self, void *data) {
@@ -735,6 +834,9 @@ static HRESULT __stdcall src_SubmitSourceBuffer(xa2_voice *self, const xa2_buffe
         self->qcount--;
         if (g_verbose) xa2_log("SubmitSourceBuffer: queue overflow, dropped one");
     }
+    /* A buffer handed over after the clock ran past the previous ones starts
+     * where playback is now, not where the last one ended. */
+    xa2_voice_retire(self, xa2_voice_now(self));
     start = self->next_end > self->played ? self->next_end : self->played;
     end = start + frames;
     self->q[(self->qhead + self->qcount) % XA2_QUEUE_MAX].end = end;
@@ -753,6 +855,9 @@ static HRESULT __stdcall src_SubmitSourceBuffer(xa2_voice *self, const xa2_buffe
 static HRESULT __stdcall src_FlushSourceBuffers(xa2_voice *self) {
     if (!xa2_voice_valid(self)) return XA2_HR_INVALID;
     xa2_lock();
+    /* Whatever already played has completed: report it before discarding the
+     * rest, so CRI's counter keeps matching what it submitted. */
+    xa2_voice_retire(self, xa2_voice_now(self));
     self->qhead = self->qcount = 0;
     self->next_end = self->played;
     self->last_ctx = NULL;
@@ -789,6 +894,12 @@ static void __stdcall src_GetState(xa2_voice *self, xa2_voice_state *state) {
     state->pCurrentBufferContext = self->qcount ? self->q[self->qhead].ctx : self->last_ctx;
     state->BuffersQueued = self->qcount;
     state->SamplesPlayed = now;
+    if (g_verbose > 2 && state->BuffersQueued != self->last_logged_q) {
+        self->last_logged_q = state->BuffersQueued;
+        xa2_log("GetState(%p): queued=%u played=%llu ctx=%p (from 0x%08X)",
+                (void *)self, state->BuffersQueued, (unsigned long long)now,
+                state->pCurrentBufferContext, g_cur_func);
+    }
     xa2_unlock();
 }
 
