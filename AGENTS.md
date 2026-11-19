@@ -94,7 +94,19 @@ control so the gain is permanent.
 ## 6. Dead-end ledger
 
 Append only; newest last. Format: date — attempt — outcome — next idea.
-(Empty: nothing burned yet.)
+
+- 2026-11-19 — Compiling the generated C straight from `run_korra_lift.py` —
+  **failed** with ~100 `C2065: 'esp'/'eax' undeclared` per file. Cause: the
+  driver wrote `recomp_types.h` without `#define RECOMP_GENERATED_CODE`, and that
+  macro is what maps register names onto the runtime's register file. Fix in the
+  driver (not in the runtime): emit `#define RECOMP_GENERATED_CODE` + `<math.h>`,
+  `<string.h>` per generated file. Relift is 290 s, so it is cheaper to fix the
+  driver and relift than to patch headers.
+- 2026-11-19 — First `build_host.ps1` run also proved the toolchain: the
+  Windows SDK was missing even after the Build Tools install; the SDK came later
+  via `winsdksetup` as part of the same install. Always check
+  `C:\Program Files (x86)\Windows Kits\10\Include` before blaming flags.
+
 
 ## 7. Reporting
 

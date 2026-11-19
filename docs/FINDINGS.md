@@ -71,11 +71,17 @@ whole `.text` as-is. Details: `docs/LIFT_REPORT.md`.
 
 ### M2 preliminary
 
-- MSVC is being installed to `C:\Users\yigit\OneDrive\Belgeler\korradecomp\msvc`
-  (VS 2022 Build Tools + VCTools workload) at the user's request, at the project
-  root so it is easy to delete later. Note: that path is inside OneDrive, so the
-  sync client will try to upload ~3–4 GB; pause OneDrive during the build phase
-  or the compile will fight the sync engine.
+- MSVC 14.44 + Windows SDK 10.0.26100 installed under `…\korradecomp\msvc`
+  (project root, per the user, so it deletes as one folder). `scripts/build_host.ps1`
+  drives `cl`/`link` directly; no CMake needed.
+- **First compile failure and fix:** the generated files must `#define
+  RECOMP_GENERATED_CODE` before including `recomp_types.h`, or every register
+  name (`eax`, `esp`, …) is undeclared. Fixed in `run_korra_lift.py`, relifted
+  (290 s), one TU compiles clean.
+- Host design settled: **native32** (real Win32 imports, VEH callbacks) means
+  M2.2 needs **no D3DX/D3D9 shims** — `d3dx9_43.dll`, `d3d9.dll`,
+  `xinput1_3.dll`, `dinput8.dll`, `XAudio2_7/8/9.dll` are all present on this
+  machine. Only steam_api (7 fns) is stubbed, plus a shim-aware GetProcAddress.
 - Target devices named by the user: **Galaxy S24 (Exynos 2400, Xclipse/RDNA)** and
   **Galaxy S25 (Snapdragon 8 Elite, Adreno)**. Requirement: do not ship an
   Adreno-only build. Plan: DXVK-Native over stock Vulkan 1.1+ (works on both),
