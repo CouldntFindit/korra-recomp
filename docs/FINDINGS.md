@@ -184,6 +184,47 @@ re-derivation did not match the hardware (36,397 mismatches in 200k cases), so:
 - the portable body is kept for arm64 and is **not yet verified**; validate it on
   the phone with the same differential test before trusting M3 output.
 
+### M2.6 / M2.7 — D3D9 device and the first frame: PASSED
+
+Proof (not committed — a game frame is game content; captures live in
+`build/shots/`, gitignored):
+
+| Shot | What it shows |
+|---|---|
+| `build/shot.png` (30 s) | 3D logo scene rendering: orange parallelograms on white |
+| `build/shots/20s.png` (audio disabled) | **an intro movie playing**, with its subtitle and progress bar |
+
+The device comes up on the real `d3d9.dll`; the engine creates textures through
+`D3DXCreateTexture` / `D3DXCreateTextureFromFileInMemoryEx` (DDS from the CPKs),
+opens `GameData\movie_logo\*.usm` and renders them.
+
+### M2.8 / M2.9 — Steam and XAudio2 stubs: live, but the audio stub blocks boot
+
+- 13–14 shims bound, 181–184 native imports, **0 unresolved**.
+- Steam: `SteamAPI_Init` → true, `SteamUser()`/`ISteamUser::GetSteamID` answered,
+  `SteamUserStats()` answered.
+- XAudio2: `CoCreateInstance(XAudio2)` → stub IXAudio2 2.7, `Initialize` → 0,
+  `RegisterForCallbacks` → 0, `CreateSourceVoice` → a silent voice.
+- **The stub is where the boot stops when it is enabled.** With audio on, the
+  frame freezes on the first logo and the process stays alive; the trace shows an
+  engine thread polling a critical section forever and `RegisterForCallbacks`
+  never firing (no `OnBufferEnd`, no buffer progress). With
+  `KORRA_NO_AUDIO=1` (added to `shims.c`; it leaves `CoCreateInstance` alone so
+  audio init fails like a machine with no device) the intro movies **play**.
+  → The XAudio2 stub needs buffer completion/progress callbacks; that is Track D
+  territory (`src/host/xaudio2_stub.c`), reported here rather than edited.
+
+### After the movies: window closes and the process waits
+
+With audio disabled the movies play, then the window is destroyed and the process
+sits at ~1.2 M trace lines doing nothing but `Enter/LeaveCriticalSection` and
+`WaitForSingleObject`. No `[fatal]`, no `[unimpl]`, no `ExitProcess`. Different
+runs reach different depths before this (one exited at 80 s), which smells like a
+race in the movie→menu transition rather than a hard fault. Next session: watch
+`sub_007F7EF0`/`sub_007F7F90` (the polling pair) and the movie-thread join with
+`recomp_trace --watch`, and check whether the menu's asset group ever gets
+requested.
+
 ### Target devices named by the user: **Galaxy S24 (Exynos 2400, Xclipse/RDNA)** and
   **Galaxy S25 (Snapdragon 8 Elite, Adreno)**. Requirement: do not ship an
   Adreno-only build. Plan: DXVK-Native over stock Vulkan 1.1+ (works on both),
