@@ -618,7 +618,7 @@ add up at first glance).
 | `stream\` root | 189 files, 125 reachable from `BGM.bnk`, 64 unreferenced (as §8 states) |
 | prefetch gotcha | 119/120 media over-claim in their RIFF header; **95/95** bank copies are byte-identical prefixes (`bank == file[:bankSize]`), 0 exceptions |
 | FNV-1 ids | `init` -> 1355168291, `bgm` -> 412724365, `bgm_sync_ssbgm1` -> 1190818745 |
-| names | 978 events named from exe literals (987 if `%d`/`%02d` format strings are expanded, e.g. `HUD_CON_BASE_%02d`); 97/295 music events |
+| names | 977 events named from exe literals (987 if `%d`/`%02d` format strings are expanded, e.g. `HUD_CON_BASE_%02d`); 97/295 music events |
 | decode | 7 files decoded to WAV incl. 4ch/5ch music; the IMA and PCM16 25 s files both decode non-silent |
 
 Decoded sample set (peak / RMS of the whole file, 16-bit WAV from vgmstream):
@@ -679,6 +679,11 @@ different output stage. [H on the registry outcome, V on the GUIDs]
 | `maxNumVoicesLimitInternal` | **256** | upper bound of concurrent voices the graph can ask for; size ring buffers/pools for this |
 | `ulNumStateGroups` | 11 | global state groups (§12.2d names one) |
 | transitions | 9 explicit, defaults 1000 ms, one group 3000 ms, one 0 ms | music bed crossfades are engine-side |
+
+Exact STMG layout for anyone parsing it without wwiser: `f32 fVolumeThreshold`
+(+0, -80.0), `u16 maxNumVoicesLimitInternal` (+4, 256), `u16 ulNumStateGroups`
+(+6, 11), then per-group transition tables. (The two are `u16`, not `u32` - a
+`u32` read at +4 returns garbage and looks like a failed hypothesis.)
 
 **(d) Correction to §4: `bgm_sync_ssbgm1` is a State group, not a switch group.**
 `fnv1("bgm_sync_ssbgm1") = 1190818745`, which is one of the 11 STMG *state*
