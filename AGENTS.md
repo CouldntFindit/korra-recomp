@@ -26,11 +26,12 @@ explicitly marked unverified.
 
 ```
 config/            lift configuration for this game (seeds, exclusions, hooks)
-docs/              TOOLCHAIN.md (pin), FINDINGS.md (append-only log), NOTES.md
-scripts/           run_korra_lift.py (catalog/lift driver)
+docs/              TOOLCHAIN.md (pin), FINDINGS.md (append-only log), PUBLISHING.md
+scripts/           run_korra_lift.py (catalog/lift driver), sync_codeberg.ps1
 src/host/          Win32 + D3D9 + XInput + XAudio2 compatibility host (ours)
 src/recomp/gen/    generated C  — GITIGNORED, never committed
 tools/             triage_pe.py, prepare_analysis_exe.py, check_content.py
+tests/             host-shim selftest, mirror selftest
 work/              analysis exe, seeds, catalog, logs — GITIGNORED
 ```
 
@@ -56,7 +57,16 @@ $env:PCRECOMP = "..\pcrecomp"
 python scripts\run_korra_lift.py seeds   work\LoK.analysis.exe work\
 python scripts\run_korra_lift.py catalog work\LoK.analysis.exe work\seeds_all.json work\catalog.json
 python scripts\run_korra_lift.py lift    work\LoK.analysis.exe work\catalog.json src\recomp\gen
+
+# publishing: mirror to Codeberg (source only). -DryRun checks, the bare form pushes.
+powershell -ExecutionPolicy Bypass -File scripts\sync_codeberg.ps1 -DryRun
+powershell -ExecutionPolicy Bypass -File scripts\sync_codeberg.ps1
 ```
+
+The mirror script refuses a dirty tree, a foreign host, a non-fast-forward and
+anything the content guard rejects. **Never force-push it** — re-create the
+mirror instead. Policy and setup: `docs/PUBLISHING.md`; its own regression test:
+`powershell -ExecutionPolicy Bypass -File tests\sync_codeberg_selftest.ps1`.
 
 ## 4. Bring-up ladder (Windows host first, Android only after)
 
