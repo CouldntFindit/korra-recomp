@@ -14,6 +14,7 @@ What this document answers:
 | Can we read every file name without extracting? | Yes — 1,213 names come out of the two TOCs in ~1–2 s per archive | 4 |
 | Does CRILAYLA decode correctly? | Yes — every compressed entry decodes to exactly its declared `ExtractSize` | 3.3 |
 | Are the movies playable? | Yes — 1280×720 MPEG-2 + 48 kHz ADX; demuxed and transcoded to MP4 | 6 |
+| Where are Track A's missing Wwise events? | In 62 banks *inside* the CPKs (DAT sub-file, 4CC `bnk`), names → FNV-1 IDs | 5.1 |
 | Does the port need any of this tooling? | No. M2.10 only needs file I/O; the lifted CRI code decompresses itself | 9 |
 
 ---
@@ -49,8 +50,15 @@ Both archives are CRI **CPK 2.42** (`Tvers = "CPKMC2.42.00, DLL3.12.00"`,
 0x0800  "TOC  " chunk header (u32 size_field, u32 0) → "@UTF" table at +0x10
 ...     padding to ContentOffset
 ContentOffset  file payload area (0x800-aligned entries, size is the *stored* size)
-EtocOffset     "ETOC" chunk (4,128 B) — extended attributes, not needed for a manifest
+EtocOffset     "ETOC" chunk — extended attributes, not needed for a manifest
 ```
+
+| | `data000.cpk` | `data001.cpk` |
+|---|---:|---:|
+| ContentOffset / ContentSize | 0x4800 / 265,187,328 | 0xA000 / 1,600,882,688 |
+| TocOffset / TocSize | 0x0800 / 14,728 | 0x0800 / 37,808 |
+| EtocOffset / EtocSize | 265,205,760 / 4,128 | 1,600,923,648 / 10,800 |
+| TOC table name | `CpkTocInfoEx` | `CpkTocInfoEx` |
 
 ### UTF table layout
 
@@ -108,8 +116,9 @@ is in `tools/cpk_manifest.py` and reproduced by `--manifest-only` in
 `tools/cpk_extract.py`.
 
 `CpkMode = 1` on both archives does **not** mean the UTF tables are encrypted —
-the header and TOC parse as plaintext. Its meaning is still unidentified
-(possibly "ID-sorted TOC" or a CRC flag); nothing in the pipeline depends on it.
+the header and TOC parse as plaintext. Its meaning is still unidentified (it is
+not the sort flag either: that is the separate `Sorted = 1` column); nothing in
+the pipeline depends on it.
 
 ---
 
@@ -249,7 +258,8 @@ Decompressed payload magic histogram over all 1,213 entries: `DAT\0` × 1,148,
 (`80 01 80 00 …`, a shader-signature table), `VfxShaderSign.dat`
 (`e1 89 80 06 …`) and `vfxShadersetting.xml` (plain `<root>` XML). So essentially
 every asset is a **DAT container** and the shader bundles are `BXM`
-(binary XML, "BXM\0" magic).
+(binary XML, "BXM\0" magic). 62 of those DAT payloads additionally carry a Wwise
+bank sub-file — see §5.1.
 
 Observed `DAT\0` header (first 0x40 bytes of `core/coreph.dat` and
 `ui/ui_tex_pl01.dat`):
@@ -268,6 +278,74 @@ u32 names_off  |
 That is enough to confirm `.dat` is a named sub-file bundle (4CC + name + length
 + payload), which is what the engine's `Hw::` asset loader walks. Full DAT
 semantics are Ghidra work (Track C) — not needed for M2.
+
+### 5.1 Wwise banks live inside the CPKs (M4 input)
+
+The `.bnk` inside these archives is **not** a Platinum-only format: 62 payloads
+carry a real Wwise bank header (`BKHD`, little-endian, bank generator version
+`0x58` = the same Wwise 2013.1/2 build as the loose `sound\*.bnk`; one exception,
+`pl/plffff.dat`, is version `0x48`). They are sub-files with 4CC `bnk` inside the
+DAT container, which is why the CPK TOC shows no `.bnk` extension — the TOC only
+sees `.dat`/`.dtt`.
+
+| archive | payloads with a Wwise bank | bank generator version |
+|---|---:|---|
+| `data000.cpk` | 45 (`core/core.dat`, `em/*`, `et/et0030`, `pl/*`, `st8/r8a0`, `st8/r8a1`) | 0x58 (all) |
+| `data001.cpk` | 17 (`phc/pc10`, `st1`–`st7` room files) | 0x58 (all) |
+
+**Bank IDs are mechanical:** `bank_id = FNV-1 32 of the lowercase asset stem`
+(`fnv1("core") = 3787826988`, `fnv1("em0000") = 981535219`,
+`fnv1("r1a0") = 2433061241`). 61 of 62 match their own stem; the one exception is
+`pl/pl00f1.dat`, whose bank ID is `fnv1("pl0000")` — it reuses Korra's base bank.
+Room banks come in consecutive pairs (`r1a0`/`r1a1`, `r2c0`/`r2c1`, …), so a bank
+name is derivable from the file name without touching the binary.
+
+This answers Track A's open item "`core.bnk` and the other ~2,286 events": the
+missing banks are here, one per character/enemy/room `.dat`, and their IDs can be
+generated from the manifest rather than searched for.
+
+<details><summary>all 62 in-CPK banks</summary>
+
+```
+data000.cpk  core/core.dat      3787826988   em/em0000.dat    981535219
+             em/em0020.dat     1015090393   em/em0030.dat    998312806
+             em/em0100.dat     1417606186   em/em0140.dat   1350495742
+             em/em0200.dat     3464225441   em/em0220.dat   3430670171
+             em/em0240.dat     3531335917   em/em0300.dat   3363412664
+             em/em0320.dat     3396967838   em/em0340.dat   3430523108
+             em/em0400.dat     3532321623   em/em0420.dat   3565876925
+             em/em0500.dat     3431508846   em/em0600.dat   3330696037
+             em/em1000.dat     3668746568   em/em2000.dat   2539699049
+             em/em2010.dat     2522921462   em/em3000.dat   3105386462
+             em/em5000.dat      389371444   em/em5010.dat    406149031
+             em/em5020.dat      422926618   em/em5030.dat    439704205
+             em/em5040.dat      322260872   em/em5050.dat    339038587
+             em/em5060.dat      355816174   em/em5070.dat    372593729
+             em/em5080.dat      255150428   em/em5090.dat    271928015
+             em/em50a0.dat     3895790647   em/em50b0.dat   3912568234
+             em/em50c0.dat     3929345821   em/em50d0.dat   3811902488
+             em/em50e0.dat     3828680075   et/et0030.dat   2852258151
+             pl/pl0000.dat     2464884769   pl/pl00f1.dat   2464884769 (alias of pl0000)
+             pl/pl00f3.dat     1693114260   pl/pl1000.dat    320245078
+             pl/pl5000.dat     1335837122   pl/pl5010.dat   1352614837
+             pl/plffff.dat     2827390945   st8/r8a0.dat    2770040612
+             st8/r8a1.dat      2770040613
+data001.cpk  phc/pc10.dat      2868869665   st1/r1a0.dat    2433061241
+             st1/r1a1.dat      2433061240   st2/r2c0.dat    2802021732
+             st2/r2c1.dat      2802021733   st3/r3a0.dat    2231435527
+             st3/r3a2.dat      2231435525   st4/r4a0.dat    2633951320
+             st4/r4a1.dat      2633951321   st5/r500.dat    1207706674
+             st5/r501.dat      1207706675   st5/r5a0.dat    2029809941
+             st5/r5c0.dat      1996254671   st6/r6a0.dat    2432222566
+             st6/r6a1.dat      2432222567   st7/r7a0.dat    1828081187
+             st7/r7a3.dat      1828081184
+```
+
+</details>
+
+Note: the four-byte value after `BKHD` is the BKHD *chunk* length (20–32 bytes
+here), not the bank size — the bank body continues through its `DIDX`/`DATA`
+chunks inside the same sub-file.
 
 ---
 
@@ -445,6 +523,10 @@ $g  = "The Legend of Korra\GameData"
   better default: it keeps names/offsets intact and avoids a 1,213-file tree.
 * **Asset work later** (higher-res UI, cutscene re-encode) only needs
   `tools/cpk_extract.py` + `tools/usm_demux.py`; nothing here is committed.
+* **M4 (audio):** the events Track A could not find on disk are in **62 Wwise
+  banks inside the CPKs** (§5.1), named by their owning `.dat` and addressable by
+  FNV-1 ID. Reaching them needs one extra layer (DAT sub-file extraction), not a
+  new decoder — the bank *format* is identical to the loose `sound\*.bnk`.
 
 ---
 
