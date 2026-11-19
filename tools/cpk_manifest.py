@@ -192,9 +192,10 @@ def build_manifest(path: str, sample_magic: int, limit: int | None):
     for e in entries:
         e["offset"] += base
         magic = ""
-        if sample_magic and e["offset"]:
+        # Zero-length entries would otherwise "sniff" the next entry's magic.
+        if sample_magic and e["offset"] and e["size"]:
             magic = "".join(chr(b) if 32 <= b < 127 else "."
-                            for b in data[e["offset"]:e["offset"] + 8])
+                            for b in data[e["offset"]:e["offset"] + sample_magic])
         e["magic"] = magic
         e["crilayla"] = magic.startswith("CRILAYLA")
     return data, header, hrow, toc, entries, base
@@ -210,11 +211,11 @@ def summarise(path: str, hrow, entries) -> dict:
     return {
         "cpk": os.path.basename(path),
         "bytes": os.path.getsize(path),
-        "codec": hrow.get("Codec") or "none",
+        "codec": "CRILAYLA" if hrow.get("Codec") == 0 else hrow.get("Codec"),
         "cpk_mode": hrow.get("CpkMode"),
         "version": hrow.get("Version"),
         "revision": hrow.get("Revision"),
-        "cpk_tools": hrow.get("Comment"),
+        "cpk_tools": hrow.get("Tvers"),
         "align": hrow.get("Align"),
         "total_files": hrow.get("TotalFiles"),
         "content_offset": hrow.get("ContentOffset"),
@@ -243,8 +244,10 @@ def main(argv=None):
     ap.add_argument("--schema", action="store_true", help="dump both UTF schemas")
     args = ap.parse_args(argv)
 
-    data, header, hrow, toc, entries = build_manifest(args.cpk, args.sample_magic, args.limit)
+    data, header, hrow, toc, entries, base = build_manifest(
+        args.cpk, args.sample_magic, args.limit)
     info = summarise(args.cpk, hrow, entries)
+    info["content_base"] = base
     info["entries_detail"] = entries
 
     if args.schema:
