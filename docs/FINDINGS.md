@@ -373,3 +373,31 @@ All `src/host/*.c` compile (`cl /c`). Full link is M2's gate; not re-run here.
   `GetState` at `0x88B454`; if it stalls, the fix is a guest callback
   trampoline, not a different queue model).
 - `GetPerformanceData` sites `0x88B795`/`0x88B8D1` by offset only.
+
+## 2026-11-19 — Track B: confirmation pass (second run, 45/45 assertions)
+
+Re-derived every Track B number from `GameData\` (throwaway script, temp-only; no
+notes trusted). All headline claims hold:
+
+- CPK sizes/entry counts/stored/extract totals byte-for-byte; extension **and**
+  directory counts each sum to the entry count (331 / 882) in both archives.
+- `FileOffset` base rule re-checked as a property, not a sample: both archives
+  form a **gapless 0x800-aligned chain ending exactly at `EtocOffset`**.
+- **All 182 + 490 = 672** CRILAYLA entries decoded again, every one matching its
+  `ExtractSize` (345 s), with `DAT\0` x1,148 / `BXM\0` x5 / 57 zero-byte / 3
+  outliers reproduced exactly.
+- Movies: 34 files / 799,975,616 B / 17,265 `@SFV` + 21,058 `@SFA` chunks,
+  17,095 pictures, 697.4 s, all 1280x720, fps set {23.976, 29.97, 30, 59.94},
+  ADX only 48 kHz 2ch/6ch, **0 bad padding chunks**.
+- In-CPK Wwise banks: 62 (45 + 17), generator `0x58` except `pl/plffff.dat`
+  `0x48`, `bank_id == fnv1(stem)` for 61/62 (`pl/pl00f1` = `fnv1("pl0000")`).
+
+Corrections the pass found (both now fixed in `docs/assets.md`, commit `91cce7b`):
+
+- "1.87 GB → 2.05 GB, ~9 %" was wrong arithmetic: it is **~10 %** (2,053,247,987
+  vs 1,865,341,798 = +10.1 %).
+- §6.2 gave 697 s but no frame total; the measured total is **17,095 pictures**
+  (697.4 s) — the per-file table already summed to it.
+
+Also tightened: §2 now states the base rule as an explicit formula
+(`base = ContentOffset − 0x800`) instead of only showing the derived value.
