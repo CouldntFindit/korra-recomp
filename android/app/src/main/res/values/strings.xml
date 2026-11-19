@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Korra</string>
+    <string name="pick_prompt">Select the folder that contains GameData</string>
+    <string name="pick_hint">Tap anywhere to open the system file picker.</string>
+    <string name="copying">Copying game data: %1$s</string>
+    <string name="copy_done">Game data ready (%1$s)</string>
+    <string name="copy_failed">Copy failed: %1$s</string>
+    <string name="no_game_data">The selected folder does not contain a GameData folder.</string>
+    <string name="no_space">Not enough free space: %1$s needed, %2$s available.</string>
+</resources>
