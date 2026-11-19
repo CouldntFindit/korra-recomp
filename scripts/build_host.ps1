@@ -1,12 +1,16 @@
 # Builds the Windows host (32-bit, MSVC x86) without CMake.
 #
-#   powershell -ExecutionPolicy Bypass -File scripts\build_host.ps1 [-Clean] [-Jobs 8]
+#   powershell -ExecutionPolicy Bypass -File scripts\build_host.ps1 [-Clean] [-Jobs 8] [-Trace]
 #
-# Requires the VS 2022 Build Tools + C++ x86 toolset. Point KORRA_MSVC at the
-# install root if it is not <workspace>\msvc (see docs/TOOLCHAIN.md).
+# -Trace builds a separate object tree (build\obj-trace) with -DRECOMP_TRACE,
+# which turns on the runtime's per-entry diagnostics (--calltrace, --firsthit,
+# --argtrace, --watch; see recomp_trace.h). Guest code must be rebuilt for it,
+# because RECOMP_ENTER is a macro in every generated translation unit, so the
+# two trees cannot share objects. The normal tree is left alone.
 param(
     [switch]$Clean,
-    [int]$Jobs = 8
+    [int]$Jobs = 8,
+    [switch]$Trace
 )
 $ErrorActionPreference = "Stop"
 
@@ -22,7 +26,9 @@ if (-not (Test-Path (Join-Path $gen "recomp_dispatch.c"))) {
 }
 
 $obj = Join-Path $root "build\obj"
+if ($Trace) { $obj = Join-Path $root "build\obj-trace" }
 $exe = Join-Path $root "build\korra_recomp.exe"
+if ($Trace) { $exe = Join-Path $root "build\korra_recomp_trace.exe" }
 if ($Clean -and (Test-Path $obj)) { Remove-Item -Recurse -Force $obj }
 New-Item -ItemType Directory -Force -Path $obj, (Join-Path $root "build") | Out-Null
 
@@ -53,6 +59,7 @@ $cl = @(
     "cl /nologo /c /O1 /MT /W1 /MP$Jobs",
     "/wd4996 /wd4244 /wd4146 /wd4102 /wd4013 /wd4101 /wd4267 /wd4018 /wd4305 /wd4310 /wd4054 /wd4065 /wd4204",
     "/D_CRT_SECURE_NO_WARNINGS /DWIN32_LEAN_AND_MEAN /DNDEBUG",
+    $(if ($Trace) { "/DRECOMP_TRACE" } else { "" }),
     "/I`"$root\src\host`" /I`"$gen`" /I`"$pcrecomp\runtime\recomp32`" /I`"$pcrecomp\runtime\native32`"",
     "/Fo`"$obj\\`"",
     "@`"$rsp`""

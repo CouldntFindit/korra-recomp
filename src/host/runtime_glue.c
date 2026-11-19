@@ -43,7 +43,10 @@ static LONG CALLBACK korra_veh(EXCEPTION_POINTERS *ep) {
 }
 
 /* Anything else that reaches the top is fatal; say what and where before the
- * process dies, because a bare exit code is not a debugging trail. */
+ * process dies, because a bare exit code is not a debugging trail. Also name
+ * the lifted function that contains the faulting address: the map file has the
+ * range, and without it the report says only "access violation" (the M2
+ * cutscene crash was pinned that way by hand). */
 static LONG CALLBACK korra_unhandled(EXCEPTION_POINTERS *ep) {
     uint32_t code = ep->ExceptionRecord->ExceptionCode;
     uint32_t addr = (uint32_t)(uintptr_t)ep->ExceptionRecord->ExceptionAddress;
@@ -54,6 +57,7 @@ static LONG CALLBACK korra_unhandled(EXCEPTION_POINTERS *ep) {
         uint32_t info1 = (uint32_t)ep->ExceptionRecord->ExceptionInformation[1];
         fprintf(stderr, "[fatal] %s of 0x%08X\n", info0 ? "write" : "read", info1);
     }
+    fprintf(stderr, "[fatal] last guest functions:\n");
     native32_dump_icalls(8);
     fflush(stderr);
     return EXCEPTION_EXECUTE_HANDLER;

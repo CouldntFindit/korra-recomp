@@ -118,6 +118,11 @@ static void shim_GetProcAddress(void) {
 static native32_shim_t g_shims[32];
 static int g_shim_n;
 
+/* exit_probe.c: names whoever calls ExitProcess, so a silent quit is not
+ * mistaken for a crash. */
+const native32_shim_t *exit_probe_shims(int *count);
+const native32_shim_t *xinput_stub_shims(int *count);
+
 static void add(const native32_shim_t *table, int n) {
     int i;
     for (i = 0; i < n && g_shim_n < (int)(sizeof g_shims / sizeof g_shims[0]); i++)
@@ -128,6 +133,8 @@ static void build(void) {
     int n;
     const native32_shim_t *t;
     if (g_shim_n) return;
+    t = exit_probe_shims(&n);  add(t, n);
+    if (getenv("KORRA_PAD")) { t = xinput_stub_shims(&n); add(t, n); }
     t = steam_stub_shims(&n);  add(t, n);
     /* KORRA_NO_AUDIO=1 leaves CoCreateInstance alone, so the engine's audio
      * init fails the way it would on a machine with no sound device. A boot
