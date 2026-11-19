@@ -19,7 +19,9 @@
 #ifndef KORRA_XAUDIO2_STUB_H
 #define KORRA_XAUDIO2_STUB_H
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include "native32.h"
 
