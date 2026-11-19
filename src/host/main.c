@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "native32.h"
+#include "recomp_trace.h"
 
 extern const recomp_dispatch_entry_t recomp_dispatch_table[];
 extern const uint32_t recomp_dispatch_count;
@@ -65,11 +66,21 @@ static int file_exists(const char *p) {
 
 int main(int argc, char **argv) {
     char exe_path[MAX_PATH], log_path[MAX_PATH], game_dir[MAX_PATH];
+    char *dir_arg = NULL;
 
-    /* Game directory: argv[1], else KORRA_GAME_DIR, else ../../The Legend of Korra
-     * (the layout of the development tree). */
-    if (argc > 1) {
-        snprintf(game_dir, sizeof game_dir, "%s", argv[1]);
+    /* The runtime's bring-up diagnostics take their own arguments
+     * (--calltrace, --firsthit, --argtrace, --watch, --poison, --poke; see
+     * recomp_trace.h). They only do anything in a -DRECOMP_TRACE build. */
+    for (int i = 1; i < argc; i++) {
+        int n = recomp_trace_arg(argc, argv, i);
+        if (n) { i += n - 1; continue; }
+        if (!dir_arg) dir_arg = argv[i];
+    }
+
+    /* Game directory: first bare argument, else KORRA_GAME_DIR, else
+     * ../../The Legend of Korra (the layout of the development tree). */
+    if (dir_arg) {
+        snprintf(game_dir, sizeof game_dir, "%s", dir_arg);
     } else if (getenv("KORRA_GAME_DIR")) {
         snprintf(game_dir, sizeof game_dir, "%s", getenv("KORRA_GAME_DIR"));
     } else {
