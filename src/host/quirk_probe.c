@@ -214,3 +214,118 @@ void korra_file_probe_init(void) {
     fprintf(stderr, "[file] native diagnostics on (files=%d, d3d failures=%d)\n",
             getenv("KORRA_TRACE_FILE") != NULL, getenv("KORRA_TRACE_D3D") != NULL);
 }
+
+/* ----------------------------------------------------------- windowed mode
+ * KORRA_WINDOWED=1 rewrites the engine's D3DPRESENT_PARAMETERS to windowed just
+ * before IDirect3D9::CreateDevice/Reset. An exclusive fullscreen swapchain
+ * hijacks the desktop, steals focus from everything else and makes a
+ * CopyFromScreen capture unreliable; a window is what a test harness wants, and
+ * the engine's own setting lives in the registry, not in the game folder.
+ *
+ * D3DPRESENT_PARAMETERS: Windowed at +0x20, FullScreen_RefreshRateInHz at
+ * +0x30, PresentationInterval at +0x34 (0x38 bytes, the size the engine memsets
+ * in FUN_00758e40). */
+#define D3DPP_WINDOWED        0x20u
+#define D3DPP_REFRESH_HZ      0x30u
+#define D3DPP_INTERVAL        0x34u
+#define D3DPRESENT_INTERVAL_IMMEDIATE 0x80000000u
+
+static int is_create_device(const char *name) {
+    return name && (strstr(name, "d3d9.dll!CreateDevice") || strstr(name, "d3d9.dll!Reset"));
+}
+
+static void windowed_pre_hook(uint32_t target, uint32_t *args) {
+    const char *name = native32_name(target);
+    uint32_t params;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!is_create_device(name)) return;
+    /* CreateDevice: this, adapter, type, hFocus, flags, pParams, ppDevice
+     * Reset:        this, pParams, ppDevice */
+    params = strstr(name, "Reset") ? args[1] : args[5];
+    if (!params || !VirtualQuery((const void *)(uintptr_t)params, &mbi, sizeof mbi) ||
+        mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+        return;
+    if ((size_t)((const char *)mbi.BaseAddress + mbi.RegionSize - (const char *)(uintptr_t)params) < 0x38)
+        return;
+    *(uint32_t *)(uintptr_t)(params + D3DPP_WINDOWED) = 1;
+    *(uint32_t *)(uintptr_t)(params + D3DPP_REFRESH_HZ) = 0;
+    *(uint32_t *)(uintptr_t)(params + D3DPP_INTERVAL) = D3DPRESENT_INTERVAL_IMMEDIATE;
+    fprintf(stderr, "[host] %s: forced windowed (%ux%u backbuffer)\n", name,
+            *(uint32_t *)(uintptr_t)params, *(uint32_t *)(uintptr_t)(params + 4));
+    fflush(stderr);
+}
+
+/* The engine creates its window as a popup at desktop size; make it a real
+ * window once it exists, and keep it there (the engine rewrites the style when
+ * it changes display mode). */
+static HWND g_game_window;
+
+static BOOL CALLBACK find_window_proc(HWND h, LPARAM l) {
+    DWORD pid = 0;
+    RECT r;
+    (void)l;
+    GetWindowThreadProcessId(h, &pid);
+    if (pid != GetCurrentProcessId() || !IsWindowVisible(h)) return TRUE;
+    if (!GetWindowRect(h, &r) || (r.right - r.left) < 200 || (r.bottom - r.top) < 150) return TRUE;
+    g_game_window = h;
+    return FALSE;
+}
+
+static DWORD WINAPI windowed_thread(LPVOID unused) {
+    (void)unused;
+    for (;;) {
+        Sleep(1000);
+        /* The engine destroys and re-creates its window when the display mode
+         * changes, so a handle kept from the first find can go stale. */
+        if (g_game_window && !IsWindow(g_game_window)) g_game_window = NULL;
+        if (!g_game_window) {
+            EnumWindows(find_window_proc, 0);
+            if (g_game_window) {
+                fprintf(stderr, "[host] windowed: game window 0x%p moved to 1280x720\n",
+                        (void *)g_game_window);
+                fflush(stderr);
+            }
+        }
+        if (g_game_window) {
+            RECT r;
+            if (GetWindowRect(g_game_window, &r) &&
+                (r.right - r.left != 1280 + 16 || r.bottom - r.top != 720 + 39))
+                SetWindowPos(g_game_window, HWND_TOP, 40, 40, 1280 + 16, 720 + 39, SWP_NOACTIVATE);
+        }
+    }
+    return 0;
+}
+
+void korra_windowed_init(void) {
+    if (!getenv("KORRA_WINDOWED")) return;
+    native32_pre_hook = windowed_pre_hook;
+    CreateThread(NULL, 0, windowed_thread, NULL, 0, NULL);
+    fprintf(stderr, "[host] windowed mode forced for CreateDevice/Reset\n");
+}
+
+
+/* ------------------------------------------------------------ message trace
+ * KORRA_TRACE_MSG=1 logs the engine's message dispatcher: the id (ECX) and the
+ * two stack arguments, one line per message. The M2 new-game crash needs to
+ * know whether message 0x710 - the one handler that creates the game manager at
+ * 0xCA3E58 - is ever dispatched, and with what payload.
+ *
+ * Needs the -DRECOMP_TRACE build (scripts\build_host.ps1 -Trace): the hook rides
+ * on recomp_trace_extra, which RECOMP_ENTER calls on every lifted function.
+ * In a normal build the pointer is never called, so this is inert there. */
+#define KORRA_MSG_DISPATCH 0x0058DAB0u
+static unsigned g_msg_count;
+
+static void msg_trace_hook(uint32_t va) {
+    if (va != KORRA_MSG_DISPATCH) return;
+    if (g_msg_count++ < 4000)
+        fprintf(stderr, "[msg] id=0x%08X a0=0x%08X a1=0x%08X\n",
+                g_ecx, MEM32(g_esp + 8), MEM32(g_esp + 0xC));
+}
+
+void korra_msg_probe_init(void) {
+    extern void (*recomp_trace_extra)(uint32_t va);
+    if (!getenv("KORRA_TRACE_MSG")) return;
+    recomp_trace_extra = msg_trace_hook;
+    fprintf(stderr, "[msg] dispatcher trace on (0x%08X)\n", KORRA_MSG_DISPATCH);
+}

@@ -34,6 +34,8 @@ void korra_set_guest_module(const char *path);
 void korra_install_fault_handlers(void);
 void korra_quirk_probe_init(void);
 void korra_file_probe_init(void);
+void korra_msg_probe_init(void);
+void korra_windowed_init(void);
 /* No hand-written function overrides yet. This is where a specific guest VA
  * gets a host body (a debug hook, a stubbed subsystem), keyed by address. */
 recomp_func_t recomp_lookup_manual(uint32_t va) {
@@ -124,6 +126,8 @@ int main(int argc, char **argv) {
     korra_install_fault_handlers();
     korra_quirk_probe_init();
     korra_file_probe_init();
+    korra_windowed_init();
+    korra_msg_probe_init();
     if (getenv("KORRA_TRACE")) native32_trace_native = 1;
 
     uint32_t base = 0x400000;

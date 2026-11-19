@@ -66,6 +66,25 @@ static unsigned pad_held_bits(void) {
     return cached;
 }
 
+/* KORRA_PAD_TAP=<ms>[,<ms>...] presses A once for 150 ms at each time: a
+ * single controlled press, so a run can leave the "press start" prompt and stop
+ * at the main menu instead of being walked through it by repeating taps. */
+static uint16_t pad_single_taps(uint32_t ms) {
+    static uint32_t taps[8];
+    static int n = -1;
+    if (n < 0) {
+        const char *s = getenv("KORRA_PAD_TAP");
+        n = 0;
+        while (s && *s && n < 8) {
+            taps[n++] = (uint32_t)strtoul(s, (char **)&s, 0);
+            while (*s == ',' || *s == ' ') s++;
+        }
+    }
+    for (int i = 0; i < n; i++)
+        if (ms >= taps[i] && ms < taps[i] + 150) return PAD_A;
+    return 0;
+}
+
 /* Scripted taps: a fixed timeline, so a run is repeatable. A frame is ~16 ms,
  * and the engine reads the pad once per frame. The timeline starts well past
  * the intro movies (they take ~40 s on this machine), because a tap consumed by
@@ -114,6 +133,7 @@ static void shim_XInputGetState(void) {
     } else {
         bits = (uint16_t)pad_held_bits();
         if (pad_auto()) bits |= pad_scripted_buttons(pad_uptime_ms());
+        bits |= pad_single_taps(pad_uptime_ms());
         state->dwPacketNumber++;
         state->wButtons = bits;
         state->bLeftTrigger = state->bRightTrigger = 0;
