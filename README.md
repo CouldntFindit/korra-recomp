@@ -30,7 +30,7 @@ the XAudio2 stub blocker.*
 |---|---|---|
 | M0 | Environment, toolchain pin, repo bootstrap, PE gate | **done** (2026-11-19) |
 | M1 | Seeds + function catalog + full lift to C | **done**: 37,029/37,029 functions, 0 lift failures — see [`docs/LIFT_REPORT.md`](docs/LIFT_REPORT.md) |
-| M2 | Boots to the main menu on Windows (no Steam, silent, movies skipped) | **D3D9 device, first frame and the intro movies render**; the boot then stalls at the movie-to-menu transition, and the silent XAudio2 stub blocks it when enabled. Ladder state in [`docs/HOST.md`](docs/HOST.md), log in [`docs/FINDINGS.md`](docs/FINDINGS.md) |
+| M2 | Boots to the main menu on Windows (no Steam, silent, movies skipped) | **intro movies, title screen and menus render; the pad drives them.** Open: menu text does not draw, and the new-game transition crashes on a null manager (`sub_00603C00`). Ladder state in [`docs/HOST.md`](docs/HOST.md), log in [`docs/FINDINGS.md`](docs/FINDINGS.md) |
 | M3 | Boots and plays the first area on an Android arm64 device | not started (NDK not installed) |
 | M4 | Audio: Wwise + CRI behind a host mixer | spec ready ([`docs/audio.md`](docs/audio.md)), implementation not started |
 | M5 | Gameplay validation, framerate hooks, full playthrough | not started |

@@ -122,6 +122,49 @@ Append only; newest last. Format: date — attempt — outcome — next idea.
   Windows SDK was missing even after the Build Tools install; the SDK came later
   via `winsdksetup` as part of the same install. Always check
   `C:\Program Files (x86)\Windows Kits\10\Include` before blaming flags.
+- 2026-11-20 — "CRI's `OnBufferEnd` is not needed for M2" (Track D's conclusion,
+  from the feed loop being `GetState`-driven) — **wrong on the second half of the
+  cycle**. Feeding is GetState-driven, but once the feed stops CRI waits on the
+  counter that only `OnBufferEnd` bumps, and it holds the engine's audio lock
+  while it waits: the boot froze right after the first source voice, with the
+  device pump calling `CommitChanges` ~50x/s and `GetState` never called again.
+  Retirement on the QPC clock existed but only ran inside `GetState`, so it never
+  ran again either. Fix in `src/host/xaudio2_stub.c`: retire (and perform
+  `*(u32 *)pBufferContext += 1`, the whole body of guest 0x7B2A24) from every
+  device entry point, `CommitChanges` included. Do not "fix" this by making
+  `CoCreateInstance` fail: CRI then takes its silent fallback and the engine
+  never exercises the path the shipping build uses.
+- 2026-11-20 — Entering the lifted `OnBufferEnd` with `native32_call_guest` from
+  inside a COM method — **rejected before trying it**: the bridge call returns
+  with the machine's `esp` advanced by its own arguments and every register
+  holding the callee's values, while the lifted caller is mid `call [ecx+0x54]`
+  and expects callee-saved registers intact. The counter increment is the whole
+  callback body, so perform it in C. Guest re-entry belongs on a real audio
+  thread (M4), not inside a method the guest called.
+- 2026-11-20 — `lock xadd dword ptr [eax], esi` at `0x660D25` **aborted the boot**
+  (`RECOMP_UNIMPL`) once the movies were past: a shared-refcount release. Added
+  `xadd` to `pcrecomp/tools/lift/lift32.py` (temp = dst; dst += src; src = temp;
+  flags as ADD; single-threaded semantics are exact under the machine lock,
+  like `cmpxchg`), relifted (220 s, 37,029/37,029, 0 failures), rebuilt. Remaining
+  unimplemented sites went 114 -> 111. Check the site list before relifting:
+  `Select-String -Path src\recomp\gen\*.c -Pattern RECOMP_UNIMPL`.
+- 2026-11-20 — Two `build_host.ps1` runs at once (one background, one foreground)
+  on the same `build\obj` — **corrupted an .obj in both directions** (`LNK1136`,
+  then `LNK1104`) and cost two 7-minute rebuilds. The script is not more than one
+  invocation at a time; `-Trace` now uses `build\obj-trace` so a diagnostic build
+  and a normal one can coexist.
+- 2026-11-20 — Chasing "`data001.cpk` fails to open" — **never happened.** The
+  `[native]` trace printed its line in two `fprintf` calls, so with several guest
+  threads the return half of one call landed on another call's line, and a
+  successful `CreateFileA` looked like it returned 0. The trace now builds one
+  line and prints it once; `KORRA_TRACE_FILE` prints arguments *and* result in a
+  single write for the same reason. Read a two-part log line as untrustworthy
+  before believing it.
+- 2026-11-20 — Driving the menus with `keybd_event`/`SendInput` and window
+  messages — **does nothing**, even with the window foreground, focused and
+  topmost. The engine's keyboard path is DirectInput and it does not see injected
+  input in this build; the XInput pad does. Do not spend time on synthetic
+  keyboard input until the DInput device path is wired (M2.11).
 
 
 ## 7. Reporting
