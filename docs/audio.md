@@ -210,6 +210,9 @@ needed.
   exe: `bgm_sync_ssbgm1`. Values include `NORMAL`/`Normal` and `Prologue`
   (recovered by hash). These are what the game posts during play — useful as M5
   hooks when checking "is the right cue playing". **[V ids, H meaning]**
+  *Refined in §12.2d: the switch containers use **14 distinct** groups (18
+  argument instances), none named; `bgm_sync_ssbgm1` is one of the 11 global
+  **state** groups from `Init.bnk`, not a switch group.*
 
 ### 4.1 Named music events
 
@@ -382,13 +385,26 @@ table1: 2 × 16 B { u32 a, u32 mask, u32 unk, u32 count }
     { 0x00010000, 0xFFFF0000, 0x0020, 14 }
     { 0x00020000, 0xFFFF0000, 0x0160, 30 }      <- 14 + 30 = 44 = table2 count
 
-table2: 44 × 24 B { u32 a, u32 b, u32 selector, u32 0, u32 0, u32 wem_id }
+table2: 44 × 24 B { u32 value, u32 mask, u32 selector, u32 0, u32 0, u32 wem_id }
     e.g. { 0x00010000, 0xFFFF0000, 0x51, 0, 0, 0x2CC97CFE }
 ```
-`a`/`b` form a (value, mask) pair — each dataset narrows the selector width
-(`0xFFFF0000` → `0xFFFFF000` → `0xFFFFFF00`) while `selector` walks 0x52 → 0x00.
-The 10 distinct `wem_id`s are the footstep sounds; **none of them is in
-`stream\`**, so they live inside `core.bnk` in the CPK (§8). This file is a
+`value`/`mask` form a (value, mask) pair in three groups that match table1's split:
+
+| `value` | `mask` | records | selector range |
+|---|---|---:|---|
+| `0x00010000` | `0xFFFF0000` | 14 | `0x00`–`0x0C` |
+| `0x00025000` | `0xFFFFF000` | 15 | `0x50`–`0x52` |
+| `0x00023000` | `0xFFFFFF00` | 15 | `0x50`–`0x52` |
+
+So the lookup is `(id & mask) == value` over a 32-bit surface/character id, with
+`selector` (0x00–0x52, 83 values) picking a variant inside the group; the last two
+words are always zero.
+
+**11 distinct `wem_id`s** are the footstep sounds (`0x2CC97CFE`, `0x48896D1C`,
+`0x2FE99727`, `0x2A7DF2DD`, `0x2EF661D4`, `0xFD3D2ED9`, `0x6ED0F683`, `0x7AAB588A`,
+`0x9E3C3DFA`, `0xB003822A`, `0x40DCC1A1`) and **none of them is in
+`stream\`**, so they live inside `core.bnk` in the CPK (§8). `0x48896D1C` is the
+default (12 of 44 rules). This file is a
 Platinum gameplay table read by the lifted engine code — the host does nothing
 with it, but it proves the SFX media live in the CPK-hosted bank.
 
@@ -444,9 +460,15 @@ python tools\audio_inventory.py names "The Legend of Korra\LoK.exe" --ids work\i
 
 The engine creates its audio device through **COM**, not through an import: the
 2014 triage (§2 of the plan) found no `XAudio2_*.dll` import and flagged
-`ole32!CoCreateInstance` as the instantiation path. So M4 = a COM server. Confirm
-the CLSID and the interface set by logging the `CoCreateInstance` arguments at
-M2.9 — **[H until then]**.
+`ole32!CoCreateInstance` as the instantiation path. So M4 = a COM server.
+
+**Resolved (§12.2a): the binary asks for the XAudio2 2.7 pair** —
+`CLSID_XAudio2 {5a508685-a254-4fba-9b82-9a24b00306af}` (and its `_Debug`
+variant), `IID_IXAudio2 {8bcf1f58-9fe7-4583-8ac6-e2adc465c8bb}`, all three present
+in `.rdata`; the 2.8 IID is absent. The 2.7 vtable has three extra head methods,
+see the layout in §12.2a - laying it out from a 2.8 header shifts every call by
+three slots. Still log every call by vtable index at M2.9 to pin the voice
+interfaces.
 
 Minimum surface to expect from Wwise 2013 + CRI NcVoice (verify each by logging
 the vtable index on first run rather than guessing):
@@ -558,3 +580,171 @@ python wwiser.py -d xml -dn bgm.xml "…\sound\bgm\BGM.bnk"
 4. Does the engine create **more than one** mastering voice (e.g. a CRI one for
    `NcVoice`, never used because it has no content)? Check the COM call log during
    M2.9 — if a second device is created and never fed, stub it immediately and log it.
+   *(The CLSID/interface family is settled in §12.2a — 2.7, normal + debug; the
+   "how many devices" half still needs the runtime log.)*
+
+---
+
+## 12. Second-session verification (2026-11-19)
+
+This section was added by a **second, independent** session before M4 starts
+using this document. Nothing above was edited except three pointers in §11.
+Method differs on purpose - own HIRC resolver over a `wwiser -d xml` dump, own
+RIFF/DIDX/`.wai` parsers, `vgmstream-cli r2168` as the only decode oracle - so
+that agreement is evidence and not a copy.
+
+Units: MiB = 1,048,576 B (the per-folder table in §2 is MiB; the 171.6 MB total
+there is the same folder in decimal MB = 163.7 MiB, which is why the two do not
+add up at first glance).
+
+### 12.1 Reproduced exactly (independent run)
+
+| Claim from §2-§7 | This session's value |
+|---|---|
+| `sound\` contents | 783 files / 171,644,455 B; 779 `.wem`, 2 `.bnk`, 1 `.wai`, 1 `.bin` |
+| `.wem` codecs | 777 Wwise Vorbis, 1 IMA-ADPCM (`1055586713`), 1 PCM16 (`82801749`) |
+| `.wem` rates / channels | 32 kHz x649, 48 kHz x130; 1ch x582, 2ch x65, 4ch x50, 5ch x79, 6ch x3 |
+| channel masks | 0x4 x582 (voice), 0x3 x65, 0x33 x50 (quad), 0x3b x79 (5.0), 0x3f x3 (5.1) |
+| `BGM.bnk` HIRC | 1,456 = 295 Event / 695 Action / 187 Segment / 192 Track / 69 RanSeq / 18 Switch |
+| `Init.bnk` HIRC | 80 = 47 Bus / 8 AuxBus / 4 FxShareSet / 14 FxCustom / 7 State, no events, no media |
+| action histogram | Play 187, Stop 183, SetState 155, SetSwitch 102, Pause 38, Resume 12, SetGameParameter 10, SetVolume/ResetVolume 4, Use/UnuseState 2, SetBusVolume 1 |
+| graph | 150 distinct media reachable, 125 present in `stream\`, 25 bank-only, 0 Play-only events without media |
+| `stream\` root | 189 files, 125 reachable from `BGM.bnk`, 64 unreferenced (as §8 states) |
+| prefetch gotcha | 119/120 media over-claim in their RIFF header; **95/95** bank copies are byte-identical prefixes (`bank == file[:bankSize]`), 0 exceptions |
+| FNV-1 ids | `init` -> 1355168291, `bgm` -> 412724365, `bgm_sync_ssbgm1` -> 1190818745 |
+| names | 978 events named from exe literals (987 if `%d`/`%02d` format strings are expanded, e.g. `HUD_CON_BASE_%02d`); 97/295 music events |
+| decode | 7 files decoded to WAV incl. 4ch/5ch music; the IMA and PCM16 25 s files both decode non-silent |
+
+Decoded sample set (peak / RMS of the whole file, 16-bit WAV from vgmstream):
+
+| file | format | peak | rms | note |
+|---|---|---:|---:|---|
+| `stream\1012706428.wem` | Vorbis 4ch 48k 94.9 s | 0.940 | 0.136 | quad music |
+| `stream\English(US)\986060765.wem` | Vorbis 1ch 32k 25.9 s | 0.933 | 0.094 | voice line |
+| `stream\English(US)\94870230.wem` | Vorbis 1ch 32k 20.6 s | 0.949 | 0.105 | voice line |
+| `stream\1055586713.wem` | IMA-ADPCM 2ch 48k 25.0 s | 1.000 | 0.641 | placeholder cue (below) |
+| `stream\82801749.wem` | PCM16 2ch 48k 25.0 s | 1.000 | 0.654 | placeholder cue (below) |
+| `stream\English(US)\416126653.wem` | Vorbis 1ch 32k 2.4 s | **0.000** | **0.000** | genuinely silent asset |
+
+### 12.2 New facts and corrections
+
+**(a) The XAudio2 version is 2.7 - GUIDs located in `LoK.exe` [V].** This closes
+the `[H until then]` in §9.1 and most of §11 item 4 without runtime logging:
+
+| constant | GUID | file offset |
+|---|---|---|
+| `IID_IXAudio2` (2.7) | `8bcf1f58-9fe7-4583-8ac6-e2adc465c8bb` | 0x507C50 |
+| `CLSID_XAudio2` (2.7) | `5a508685-a254-4fba-9b82-9a24b00306af` | 0x507C60 |
+| `CLSID_XAudio2_Debug` (2.7) | `db05ea35-0329-4d4b-a53a-6dead03d3852` | 0x507C70 |
+
+The three sit adjacent in `.rdata`, so they come from one `XAudio2.h` include
+(the June-2010 DirectX SDK pair). The 2.8 IID `60d8dac8-5aa1-4e8e-b597-2f5e2883d484`
+is **absent**, i.e. no fallback path to a newer interface exists in the binary.
+
+Two consequences the M4 shim must get right:
+
+1. **The 2.7 vtable has three methods that 2.8 does not**: `GetDeviceCount`,
+   `GetDeviceDetails`, `Initialize` come *first*, right after `IUnknown`. An
+   implementation laid out from a 2.8 header will be shifted by three slots and
+   every call lands on the wrong method. Order to implement (§9.1's method list
+   already contains all of them, this fixes the layout):
+   `[0-2] IUnknown`, `[3] GetDeviceCount`, `[4] GetDeviceDetails`,
+   `[5] Initialize`, `[6] RegisterForCallbacks`, `[7] UnregisterForCallbacks`,
+   `[8] CreateSourceVoice`, `[9] CreateSubmixVoice`, `[10] CreateMasteringVoice`,
+   `[11] StartEngine`, `[12] StopEngine`, `[13] CommitChanges`,
+   `[14] GetPerformanceData`, `[15] SetDebugConfiguration`.
+2. **Both CLSIDs must be answered.** A debug-engine request uses
+   `CLSID_XAudio2_Debug`; return the same object (and log which one was asked).
+
+**(b) `CoCreateInstance` on a stock Windows 10/11 will probably fail.**
+`CLSID_XAudio2` (2.7) is only registered when the DirectX June-2010 runtime is
+installed; 2.8/2.9 are registered under *different* CLSIDs that this binary does
+not ask for. Expect `REGDB_E_CLASSNOTREG` on a clean machine. So M2.9/M4 should
+**not** plan on "real XAudio2 does the work on Windows" - the Windows host needs
+the same `CoCreateInstance` hook as Android, and both then share one mixer. This
+also makes the M2.9 silent stub and the M4 sink the *same* code path with a
+different output stage. [H on the registry outcome, V on the GUIDs]
+
+**(c) `Init.bnk` global settings (STMG) - numbers for the mixer budget [V].**
+
+| field | value | why it matters |
+|---|---|---|
+| `fVolumeThreshold` | -80 dB | voices below this are culled by the engine, not by the host |
+| `maxNumVoicesLimitInternal` | **256** | upper bound of concurrent voices the graph can ask for; size ring buffers/pools for this |
+| `ulNumStateGroups` | 11 | global state groups (§12.2d names one) |
+| transitions | 9 explicit, defaults 1000 ms, one group 3000 ms, one 0 ms | music bed crossfades are engine-side |
+
+**(d) Correction to §4: `bgm_sync_ssbgm1` is a State group, not a switch group.**
+`fnv1("bgm_sync_ssbgm1") = 1190818745`, which is one of the 11 STMG *state*
+groups above (it is the group driven by the `bgm_Paused_*` / `bgm_Sync_*`
+events). The music **switch** containers use **14 distinct game-sync groups**
+(18 argument instances across 18 containers), and **none of them is named** in
+the exe. So: 14 unnamed switch groups + 1 named state group, not "18 named-by-one
+groups". The state *values* that do resolve are the ones already listed in §4:
+`Normal` (1160234136), `Prologue` (4203473902), `ON` (1651971902),
+`OFF` (930712164), `None` (748895195).
+
+**(e) The two non-Vorbis 25 s files are a matched placeholder pair [V].**
+
+| media | codec | track | segment | event |
+|---|---|---|---|---|
+| `1055586713` | IMA-ADPCM 4-bit | 260164643 | 2169841 (25.000 s) | 4198189333 (unnamed) |
+| `82801749` | PCM16 | 933817339 | 38066807 (25.000 s) | 823604040 (unnamed) |
+
+Both segments are isolated (no parent container), both tracks are the only
+source of their segment, and both files are 25.000 s of a loud (RMS -3.9 dBFS)
+tonal signal. That is a shipped dev/test cue pair, not production music. If M4
+hears exactly these two, the music data is being followed literally - it is not
+a decoder bug.
+
+**(f) `stream\English(US)\416126653.wem` is a silent asset, not a broken one.**
+528 B, 2.407 s, Vorbis, every decoded sample is 0 (peak 0.000). Do not use it as a
+decode smoke test, and expect it in the "silence" acceptance case - the same
+applies to the 14 events in `BGM.bnk` that carry zero actions.
+
+**(g) Small count deltas, for anyone comparing runs.** Media-reachable events
+come out as **183** here (every event with a Play action resolves at least one
+media id; none resolves only to bank-only media), vs 175 in §4 - the difference is
+reachability through non-default switch branches. Both agree that 0 Play events
+are media-less. Names: 978/987 above vs 977 in §7 (one string accepted by the
+`%d`-expansion pass). Neither changes any M4 decision.
+
+**(h) The state objects carry the mix overrides [V].** The 7 `CAkState` objects
+are volume/pitch overrides, including a **-96 dB** state (the mute/pause state
+behind `bgm_Paused_enter`) and -12/-6 dB duck states. That is how the music
+"pause" works - as a state, not as a voice stop - which is exactly the behaviour
+acceptance test 5 in §9.4 checks.
+
+### 12.3 The 25 bank-only media ids (checklist for Track B)
+
+Media that `BGM.bnk` prefetches but that has **no** `stream\<id>.wem` on disk.
+If the CPK manifest finds `<id>.wem` inside `data000/001.cpk`, they are ordinary
+streams; if not, they are dead branches and safe to ignore.
+
+```
+95719221 343469247 804953904 270223848 742038440 981971968 416888964
+550134730 974380557 336134214 1068033235 642122720 751865138 892357526
+508409409 639870417 760211043 291869469 1031870517 702230346 698412628
+514160359 1015534854 894179784 731157682
+```
+
+`95719221` (338 B, 0.1 s) is the one complete in-memory source and the only one
+that is not a prefix head. The other 24 are ~34-56 KB heads.
+
+### 12.4 What this changes for M2.9 / M4
+
+* Implement the **2.7** `IXAudio2` layout from §12.2a verbatim, with a
+  name-per-slot dispatch table so every call logs `index + name + args`. That
+  turns the first M2.9 run into a call trace instead of a debug session, and it
+  is where any remaining uncertainty about the voice interfaces is settled.
+* Answer both `CLSID_XAudio2` and `CLSID_XAudio2_Debug`; log `QueryInterface`
+  IIDs and return `E_NOINTERFACE` for unknown ones (voicing is created through
+  `Create*Voice`, so the voice IIDs should never be asked for by name).
+* Budget for 256 voices and a -80 dB cull threshold, and expect the engine to
+  hand over **already downmixed PCM** - the host never sees Vorbis.
+* Silence cases to expect and not chase: event `bgm_Sync_Pause` (control only),
+  the 14 zero-action events, media `416126653` (all-zero samples), and the two
+  25 s placeholder cues.
+* Still open after this session: `core.bnk` contents/size (Track B), the `.wai`
+  flag bits, and whether the engine constructs a second (CRI) mastering voice
+  that is never fed - all three stay as §11 items 1-4.
