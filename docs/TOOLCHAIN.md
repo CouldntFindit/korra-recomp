@@ -43,6 +43,8 @@ What the patch series buys us (from its own subjects):
 | 0014 | `RECOMP_X87_WINDOW`: sliding window FPU state |
 | MP2-0001 | SEH frames; `or`/`xor` condition semantics |
 | **Korra-0001** (ours, `1a8cb93`) | `lift32`: REP/REPNE prefix on RET is a hint, not an unimplemented instruction (`F3 C3` in LoK's CRT startup) |
+| **Korra-0002** (ours, `346a509`) | `lift32`: `cmpxchg` / `cmpxchg8b` (MSVC interlocked ops, 162 sites) and capstone's `fcomi`/`fcompi`/`fucomi`/`fucompi` names (430 sites) |
+| **Korra-0003** (ours, `d3f7803`) | `lift32` + `recomp_types.h`: `bsf` / `bsr` and portable `RECOMP_BSF/BSR` |
 
 ## Local environment
 

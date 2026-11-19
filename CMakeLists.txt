@@ -42,10 +42,11 @@ endif()
 # ---------------------------------------------------------------------------
 # Sources
 # ---------------------------------------------------------------------------
-set(HOST_SOURCES
-    src/host/main.c
-    src/host/shims.c
-)
+# The whole host directory: src/host is shared between concurrent work streams
+# (bring-up, audio, Steam), each in its own file, so new files must not need a
+# build-script edit.
+set(HOST_SOURCES "")
+file(GLOB HOST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/host/*.c")
 
 set(PCRECOMP_RUNTIME
     "${PCRECOMP}/runtime/native32/native32.c"

@@ -26,9 +26,7 @@ $exe = Join-Path $root "build\korra_recomp.exe"
 if ($Clean -and (Test-Path $obj)) { Remove-Item -Recurse -Force $obj }
 New-Item -ItemType Directory -Force -Path $obj, (Join-Path $root "build") | Out-Null
 
-$sources = @(
-    (Join-Path $root "src\host\main.c"),
-    (Join-Path $root "src\host\shims.c"),
+$sources = @(Get-ChildItem (Join-Path $root "src\host") -Filter "*.c" | ForEach-Object { $_.FullName }) + @(
     (Join-Path $pcrecomp "runtime\native32\native32.c"),
     (Join-Path $pcrecomp "runtime\recomp32\image_loader.c"),
     (Join-Path $pcrecomp "runtime\recomp32\recomp_trace.c")
@@ -36,6 +34,20 @@ $sources = @(
 
 $rsp = Join-Path $root "build\sources.rsp"
 $sources | ForEach-Object { '"' + $_ + '"' } | Set-Content -Encoding ascii $rsp
+
+# Incremental by default: a translation unit is recompiled only when its .c is
+# newer than its .obj. -Clean forces the full 75-TU rebuild (about 7 minutes).
+if (-not $Clean) {
+    $stale = @($sources | Where-Object {
+        $o = Join-Path $obj ((Split-Path $_ -Leaf) -replace '\.c$', '.obj')
+        (-not (Test-Path $o)) -or ((Get-Item $o).LastWriteTime -lt (Get-Item $_).LastWriteTime)
+    })
+} else {
+    $stale = $sources
+}
+if (-not $Clean) {
+    $stale | ForEach-Object { '"' + $_ + '"' } | Set-Content -Encoding ascii $rsp
+}
 
 $cl = @(
     "cl /nologo /c /O1 /MT /W1 /MP$Jobs",
@@ -50,16 +62,12 @@ $libs = "kernel32.lib user32.lib gdi32.lib advapi32.lib shell32.lib ole32.lib ol
 $link = "link /nologo /OUT:`"$exe`" /SUBSYSTEM:CONSOLE /DYNAMICBASE:NO /FIXED /BASE:0x60000000 /STACK:16777216 /MAP:`"$root\build\korra_recomp.map`" `"$obj\*.obj`" $libs"
 
 $script = Join-Path $root "build\build.cmd"
-@(
-    "@echo off",
-    "call `"$vcvars`" x86 >nul || exit /b 1",
-    "cd /d `"$root`"",
-    $cl,
-    "if errorlevel 1 exit /b 1",
-    $link
-) | Set-Content -Encoding ascii $script
+$lines = @("@echo off", "call `"$vcvars`" x86 >nul || exit /b 1", "cd /d `"$root`"")
+if ($stale.Count -gt 0) { $lines += $cl; $lines += "if errorlevel 1 exit /b 1" }
+$lines += $link
+$lines | Set-Content -Encoding ascii $script
 
-Write-Host "compiling $($sources.Count) sources with $Jobs jobs..."
+Write-Host "compiling $($stale.Count) of $($sources.Count) sources with $Jobs jobs..."
 $sw = [Diagnostics.Stopwatch]::StartNew()
 & cmd.exe /c $script
 $code = $LASTEXITCODE
