@@ -542,7 +542,7 @@ python wwiser.py -d xml -dn bgm.xml "…\sound\bgm\BGM.bnk"
   shipped audio is Wwise, and CriCodecs targets CRI formats that do not occur
   here. If it is ever needed, build it in a Python 3.12 venv with CMake installed.
 * `pip install wwiser` — not on PyPI. Run it from the GitHub zip (`wwiser.py`).
-* Reading the `.wai` extension bytes as "duration" only works as a *cue length*
+* Reading the `.wai` `value` field as a duration only works as a *cue length*
   hint; do not use it to size PCM buffers.
 
 ---
@@ -551,7 +551,8 @@ python wwiser.py -d xml -dn bgm.xml "…\sound\bgm\BGM.bnk"
 
 1. **`core.bnk`** (in `data000.cpk`): size, event count, whether it uses the same
    Wwise version. Blocks the other 2,286 events → Track B.
-2. Do the 25 missing `bgm_csNN_skip` media exist inside the CPK as `<id>.wem`?
+2. Do the 25 bank-only music media (the `stream\` files that do not exist) exist
+   inside the CPK as `<id>.wem`?
 3. `.wai` flag bits (`flagB`/`flagC`) — unproven meanings; only matters if the
    engine's lookup is reimplemented (route B).
 4. Does the engine create **more than one** mastering voice (e.g. a CRI one for
