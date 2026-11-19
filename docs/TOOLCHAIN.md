@@ -56,10 +56,74 @@ What the patch series buys us (from its own subjects):
 | Git | 2.56.0.4 (installed 2026-11-19 via `winget install Git.Git`) |
 | MSVC | **VS 2022 Build Tools 17.14.45**, MSVC **14.44.35207**, Windows SDK **10.0.26100.0** — installed to `…\korradecomp\msvc` (custom path, at the user's request so it can be deleted as one folder) |
 | CMake / Ninja | none — `scripts/build_host.ps1` drives `cl`/`link` directly (vcvarsall x86 + response file) |
-| Android SDK / NDK | **not installed**. Blocks M3 |
+| Android SDK / NDK | **installed 2026-11-20** — see the "Android toolchain" section below (blocks M3) |
 | Java | OpenJDK 21.0.12 (Gradle-capable) |
 | Ghidra | 12.2 PUBLIC at `%LOCALAPPDATA%\Programs\ghidra_12.2_PUBLIC` (optional) |
 
 Reference toolchain in the source projects: MSVC 14.51 x86, Android NDK
 28.2.13676358, LLVM/clang 22 via `clang32.bat` (`--target=i686-pc-windows-msvc`).
 Match MSVC 14.51 if the lift hits codegen errors on a newer toolset.
+
+## Android toolchain (M3, installed 2026-11-20)
+
+Installed at the project root, the same way MSVC was, so the whole SDK can be
+deleted as one folder: `C:\Users\yigit\OneDrive\Belgeler\korradecomp\android-sdk`.
+OneDrive sync is disabled on this machine, so keeping it inside the workspace
+does not upload ~4 GB.
+
+| Item | Exact version | Path |
+|---|---|---|
+| Command-line tools | `1.1.16919734` (Android CLI; `sdkmanager` reports `cmdline-tools 23.0.0`, deprecated but working) | `android-sdk\cmdline-tools\latest` |
+| platform-tools | `37.0.3` | `android-sdk\platform-tools` (`adb.exe`) |
+| SDK platform | `android-36`, package revision 2 | `android-sdk\platforms\android-36` |
+| Build tools | `36.1.0` | `android-sdk\build-tools\36.1.0` |
+| NDK | **`28.2.13676358` (r28c)** — the same release the nfsu2 reference toolchain uses | `android-sdk\ndk\28.2.13676358` |
+| CMake (SDK package) | `3.31.5` | `android-sdk\cmake\3.31.5` |
+| JDK (Gradle) | Temurin `21.0.12.101` | `C:\Program Files\Eclipse Adoptium\jdk-21.0.12.101-hotspot` |
+| Gradle | `8.14.3` (wrapper, committed) | `android\gradle\wrapper` |
+| Android Gradle Plugin | `8.13.2` | `android\build.gradle.kts` |
+| GameActivity / AppCompat | `4.4.2` / `1.8.0` | `android\app\build.gradle.kts` |
+
+Reproduce the SDK install (PowerShell; the `/` package form matters, see the
+notes below):
+
+```powershell
+$sdk = "C:\Users\yigit\OneDrive\Belgeler\korradecomp\android-sdk"
+$env:JAVA_HOME = "C:\Program Files\Eclipse Adoptium\jdk-21.0.12.101-hotspot"
+Invoke-WebRequest -UseBasicParsing `
+  -Uri "https://dl.google.com/android/repository/commandlinetools-win-16111833_latest.zip" `
+  -OutFile "$env:TEMP\cmdline-tools.zip"
+Expand-Archive "$env:TEMP\cmdline-tools.zip" "$env:TEMP\cmdline-unpack"
+Move-Item "$env:TEMP\cmdline-unpack\cmdline-tools" "$sdk\cmdline-tools\latest"
+& "$sdk\cmdline-tools\latest\bin\sdkmanager.bat" --licenses   # answer y to all
+& "$sdk\cmdline-tools\latest\bin\sdkmanager.bat" `
+    "platform-tools" "platforms/android-36" "build-tools/36.1.0" `
+    "ndk/28.2.13676358" "cmake/3.31.5"
+```
+
+Three notes worth their kilobytes:
+
+1. `sdkmanager.bat` re-parses its arguments through `cmd`, which splits on `;`,
+   so `"ndk;28.2.13676358"` arrives as two packages ("Package ndk not found").
+   Use the `/` form shown above.
+2. `JAVA_HOME` on this machine points at a **JDK 8** install
+   (`C:\Users\yigit\Downloads\jdk8\...`), which AGP cannot use. `java` on PATH is
+   JDK 21, so the build works only when `JAVA_HOME` is set — `scripts\android_build.ps1`
+   does it, and any manual `gradlew` run needs it too.
+3. The installed command-line tools warn that `sdkmanager` is deprecated in
+   favour of the new `android` binary. The warning is harmless; the old tool is
+   what Google's install docs still describe. AGP 8.13 also prints "SDK XML
+   version 4" warnings against these tools — also harmless.
+
+Verified build on this machine (2026-11-20):
+
+```
+cd android
+.\gradlew.bat :app:assembleDebug
+BUILD SUCCESSFUL in 1m 56s (cold, 38 tasks)
+app/build/outputs/apk/debug/app-debug.apk   9.8 MB
+lib/arm64-v8a/libkorra.so                   73 KB, PT_LOAD aligned 0x4000
+```
+
+Android-specific plan, shell choice, DXVK path and the `pcmpistri` assessment:
+`docs/ANDROID_BRINGUP.md`.
