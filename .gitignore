@@ -1,0 +1,54 @@
+# ---------------------------------------------------------------------------
+# Generated output. Never commit anything under these paths.
+# ---------------------------------------------------------------------------
+work/
+src/recomp/gen/
+game_files/
+logs/
+dumps/
+build/
+out/
+.android-out/
+
+# ---------------------------------------------------------------------------
+# Game content (bring your own copy; see README).
+# ---------------------------------------------------------------------------
+*.exe
+*.dll
+*.cpk
+*.usm
+*.hca
+*.adx
+*.acb
+*.awb
+*.bnk
+*.wai
+*.wem
+*.pck
+*.sgb
+*.texture
+*.snd
+*.mfx
+*.ico
+GameData/
+
+# ---------------------------------------------------------------------------
+# Tooling
+# ---------------------------------------------------------------------------
+__pycache__/
+*.pyc
+.venv/
+venv/
+.vscode/
+.idea/
+*.user
+*.suo
+CMakeCache.txt
+CMakeFiles/
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.res
+*.log
