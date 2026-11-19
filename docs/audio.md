@@ -390,15 +390,16 @@ table2: 44 × 24 B { u32 value, u32 mask, u32 selector, u32 0, u32 0, u32 wem_id
 ```
 `value`/`mask` form a (value, mask) pair in three groups that match table1's split:
 
-| `value` | `mask` | records | selector range |
+| `value` | `mask` | records | selectors used |
 |---|---|---:|---|
-| `0x00010000` | `0xFFFF0000` | 14 | `0x00`–`0x0C` |
-| `0x00025000` | `0xFFFFF000` | 15 | `0x50`–`0x52` |
-| `0x00023000` | `0xFFFFFF00` | 15 | `0x50`–`0x52` |
+| `0x00010000` | `0xFFFF0000` | 14 | `0x00`–`0x09`, `0x0B`, `0x0C`, `0x50`, `0x51` |
+| `0x00025000` | `0xFFFFF000` | 15 | `0x00`–`0x09`, `0x0B`, `0x0C`, `0x50`–`0x52` |
+| `0x00023000` | `0xFFFFFF00` | 15 | same 15 as above |
 
 So the lookup is `(id & mask) == value` over a 32-bit surface/character id, with
-`selector` (0x00–0x52, 83 values) picking a variant inside the group; the last two
-words are always zero.
+`selector` picking a variant inside the group. 15 distinct selectors overall
+(`0x00`–`0x09`, `0x0B`, `0x0C`, `0x50`, `0x51`, `0x52`; `0x0A` unused); the last
+two words of every record are zero.
 
 **11 distinct `wem_id`s** are the footstep sounds (`0x2CC97CFE`, `0x48896D1C`,
 `0x2FE99727`, `0x2A7DF2DD`, `0x2EF661D4`, `0xFD3D2ED9`, `0x6ED0F683`, `0x7AAB588A`,
@@ -544,6 +545,10 @@ Every ID below is from the verified table in §4.1 / §5.
 ## 10. Reproduction recipes
 
 ```powershell
+# self-check: re-derive every claim in this document (25 assertions, exits non-zero on drift)
+python tools\verify_audio.py --game "The Legend of Korra"
+python tools\verify_audio.py --game "The Legend of Korra" --dump work\bgm.xml   # + event-graph checks
+
 # inventory (no third-party packages)
 python tools\audio_inventory.py scan  "The Legend of Korra\GameData\sound" --json work\audio_scan.json
 python tools\audio_inventory.py bank  "The Legend of Korra\GameData\sound\Init.bnk" "The Legend of Korra\GameData\sound\bgm\BGM.bnk"
