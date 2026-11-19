@@ -176,3 +176,43 @@ Output: **`docs/quirks.md`** (~70-address hook index, decoded constants, port no
 - Not verified: which value `DAT_00e4d210` settles on at runtime (the focus branch
   reads inverted), and whether the simulation step is tied to the limiter interval.
   Both need one log line on the first working Windows build. See `docs/quirks.md` §8.
+
+## 2026-11-19 - Track A (audio stack inventory)
+
+Read-only pass over `GameData\sound\` (783 files / 171.6 MB) plus `LoK.exe`
+string literals. Output: **`docs/audio.md`** (inventory, container formats, the
+bank->event map, and the M4 host-mixer spec) and `tools/audio_inventory.py`
+(stdlib-only: `scan` / `wem` / `bank` / `wai` / `names` / `prefix`).
+
+- **Everything is Wwise 2013.1/2** (bank generator version `0x58`): 779 `.wem`
+  (777 Vorbis, 1 IMA-ADPCM, 1 PCM16), `Init.bnk`, `BGM.bnk`, `WwiseInfo.wai`,
+  `SeFootstep.bin`. **No HCA/ADX/ACB content exists in `sound\`** - the CRI
+  NcVoice/HCA-MX strings in the exe are linked but unused for content, so M4
+  needs no HCA decoder (CPK interior still unconfirmed).
+- Content: 6,257 s (104 min) of audio. Music is 4/5/6-channel (quad / 5.0 / 5.1)
+  at 48 kHz; voice is mono 32 kHz, English(US) only.
+- **`BGM.bnk` media are prefetch heads, not audio.** 119 of 120 DIDX entries have
+  a RIFF header claiming more bytes than stored, and for all 95 that also exist as
+  `stream\<id>.wem` the bank copy is a byte-identical prefix. Only the single
+  in-memory source is complete. A host that serves bank media alone plays ~1 s of
+  every cue.
+- **Wwise IDs are FNV-1 32 of the lowercase name** (verified: `init` ->
+  1355168291, `bgm` -> 412724365). Hashing every string literal in `LoK.exe`
+  named **977 of 2581** events in `WwiseInfo.wai` and **97 of 295** music events.
+- `WwiseInfo.wai` = 16-byte header + 2,581 x 20-byte records (u32 id, f32 value,
+  3 flag words), sorted by id, contains all 295 `BGM.bnk` events -> it is the
+  game-wide event table, not a music table.
+- Music graph: 295 events -> 695 actions (187 Play) -> 86 distinct targets
+  (51 segments / 60 playlists / 76 switch containers) -> 192 tracks -> 150 media
+  (125 present in `stream\`). 18 game-sync groups drive the switch containers;
+  only `bgm_sync_ssbgm1` is named in the exe.
+- **Gap for Track B:** `core.bnk` exists inside `data000.cpk` (found in the CPK
+  TOC string table). It must own the other ~2,286 events - the `SeFootstep.bin`
+  media IDs and the 25 bank-only music media are not on disk under `sound\`.
+- M4 recommendation: keep the engine's own Wwise runtime and implement the
+  **XAudio2 COM object**; declare 2.0/48 kHz on the mastering voice and let the
+  engine downmix. Re-implementing Wwise is now specified but is a weeks-scale
+  detour (`docs/audio.md` section 9.2).
+- Not verified: the `.wai` flag-bit meanings, the exact `CLSID_XAudio2` + interface
+  set (log the `CoCreateInstance` at M2.9), and whether `data001.cpk` carries
+  further banks.
