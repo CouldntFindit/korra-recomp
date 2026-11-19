@@ -123,12 +123,7 @@ def main(argv=None):
     ap.add_argument("--manifest-only", action="store_true")
     args = ap.parse_args(argv)
 
-    data, header, hrow, toc, entries = build_manifest(args.cpk, 0, None)
-    # FileOffset in the TOC is relative to a base 8 bytes before the content
-    # region on these archives; verified by a zero-gap chain walk (docs/assets.md).
-    base = hrow["ContentOffset"] - min(e["offset"] for e in entries)
-    for e in entries:
-        e["offset"] += base
+    data, header, hrow, toc, entries, base = build_manifest(args.cpk, 8, None)
 
     if args.manifest_only:
         for e in entries:

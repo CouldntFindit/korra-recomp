@@ -116,13 +116,18 @@ def parse_wem(path: str) -> dict:
         info["channels"] = ch
         info["rate"] = rate
         # Wwise codec extension: u16 cbSize at fmt+0x10, then codec params.
-        # For Vorbis and IMA the total sample count sits at fmt+0x18.
-        if fmt_size >= 0x1C:
-            samples = struct.unpack_from("<I", data, fmt_off + 0x18)[0]
-            if tag == 0xFFFF or tag in (0xFFFE, 0x0001):
-                info["samples"] = samples
-            elif tag == 0x0002 and info["data_size"]:
-                info["samples"] = samples or (info["data_size"] * 2 // max(ch, 1))
+        # For Vorbis the total sample count sits at fmt+0x18 (verified against
+        # vgmstream on all 779 shipped files).  IMA ADPCM stores its *block*
+        # count there instead, so derive frames from the block geometry.
+        if tag == 0x0002 and align and info["data_size"]:
+            # 4-bit IMA: every block carries a 4-byte header per channel.
+            per_block = (align - 4 * ch) * 2 // max(ch, 1)
+            info["samples"] = (info["data_size"] // align) * per_block
+            info["blocks"] = info["data_size"] // align
+        elif fmt_size >= 0x1C:
+            ext = struct.unpack_from("<I", data, fmt_off + 0x18)[0]
+            if tag in (0xFFFF, 0xFFFE, 0x0001):
+                info["samples"] = ext
         if info["samples"] is None and info["data_size"] and align:
             info["samples"] = info["data_size"] // align
         if info["samples"] and rate:
