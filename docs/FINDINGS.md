@@ -523,3 +523,163 @@ directory needs no repair, and the build section now shows
   up to `git push` is exercised by the selftest against a local bare repo; the
   network edge (Codeberg's SSH server, repository permissions) is untested.
 - No CI. The guard and the selftest are local commands.
+
+## 2026-11-20 - M2: the XAudio2 boot freeze, a lifter gap, and the title screen
+
+### The freeze: a completion that was never dispatched
+
+Track D concluded that CRI's `OnBufferEnd` (guest `0x7B2A24`) was not needed for
+M2 because the feed loop is `GetState`-driven (`FUN_007B26B7`: submit while
+`BuffersQueued < 4`). The first half is true. The second half is not:
+
+- With the silent stub, the boot froze immediately after CRI created its first
+  source voice (`[xa2] CreateSourceVoice ... -> #2`). `KORRA_NO_AUDIO=1` bypassed
+  it, which is what made it look like "the stub blocks the boot".
+- `KORRA_XA2_VERBOSE=2` showed the shape of the wait: the device pump called
+  `CommitChanges(0x7FFFFFFF)` about 50 times a second forever, and `GetState` was
+  never called again. Retirement only ran inside `GetState`, so 68 submitted
+  buffers never retired, and one guest worker thread spun on a lock
+  (`Enter/LeaveCriticalSection` around `0x00A9BD18`) while the engine waited.
+- CRI submits every buffer with the *same* `pBufferContext` (a u32 counter at
+  `0x11C9130C` in that run), and the guest's `OnBufferEnd` body is exactly
+  `inc dword ptr [pBufferContext]` (`0x7B2A22..0x7B2A2A`). Nothing else in the
+  system moves that counter.
+
+Fix (`src/host/xaudio2_stub.c`): retirement is now dispatched from **every**
+device entry point, `CommitChanges` included, and every retired buffer performs
+the callback's observed effect - `*(u32 *)pBufferContext += 1` - when the voice's
+callback vtable has the CRI `OnBufferEnd` at slot 4 (`0x7B2A24`). Other callbacks
+are counted and logged once per voice instead of being guessed at. The lifted
+callback body is deliberately *not* entered: `native32_call_guest` from inside a
+COM method returns with `esp` advanced by its own arguments and the caller's
+callee-saved registers replaced by the callee's, while the lifted caller is mid
+`call [ecx+0x54]`. M4 can hang a real audio thread here, which is where re-entry
+belongs.
+
+Verification:
+
+- `tests/selftest_host_shims.c` extended: the fake callback object now carries
+  CRI's real vtable shape (slot 4 = `0x7B2A24`), and two checks assert the
+  counter increments - once via `GetState`, once via `CommitChanges` with no
+  `GetState` at all (the freeze case). **60/60 pass**, and the two new calls are
+  also purge-checked.
+- Full boot with `KORRA_NO_AUDIO` unset: the freeze is gone. The engine now
+  creates and tears down one audio device per movie, the intro movies render, and
+  the title/loading screen appears. New knobs: `KORRA_XA2_VERBOSE=0..3`.
+
+### A lifter gap that the movies concealed
+
+Once audio worked, the guest returned further and hit an unimplemented
+instruction: `[unimpl] 0x00660D25: lock xadd dword ptr [eax], esi` (a shared
+refcount release), which aborts by design. `xadd` was the only missing
+interlocked form left (`cmpxchg`/`cmpxchg8b` were already implemented).
+
+- `pcrecomp/tools/lift/lift32.py` gained `xadd` (temp = dst; dst += src;
+  src = temp; flags as ADD; exact single-threaded under the runtime's machine
+  lock). Three sites in the image: `0x5209E5`, `0x5A5605`, `0x660D25`.
+- Relift: 37,029/37,029, **0 failures**, 220 s, 12,019,200 lines. Full rebuild
+  467 s (85 host+runtime+generated TUs, `/MP12`). `RECOMP_UNIMPL` sites 114 -> 111.
+  What remains is string I/O (`insb`/`insd`), SSE4 (`palignr`, `addsubps`,
+  `movshdup`/`movsldup`, `pinsrb`) and legacy junk (`aas`, `das`, `arpl`,
+  `bound`, `cli`, `hlt`, `int`, `ljmp`) - none reached yet.
+
+### Build tooling added while chasing this
+
+- `scripts/build_host.ps1 -Trace` builds a separate `build\obj-trace` with
+  `-DRECOMP_TRACE` (the runtime's `--calltrace`, `--firsthit`, `--argtrace`,
+  `--watch`, `--poison`), so a diagnostic build and the normal one can coexist.
+  The two object trees cannot be shared: `RECOMP_ENTER` is a macro in every
+  generated translation unit.
+- `scripts/run_host.ps1` gained `-Extra` (runtime arguments) and `-Exe`.
+- `src/host/quirk_probe.c` (new, `KORRA_QUIRK_PROBE=1`): samples the guest's own
+  frame-manager data once a second - `DAT_00e4d210`, `DAT_00e4d214`,
+  `[frameMgr+0x58]`, `DAT_00e4d01c`, the `0xe4e52c` HWND, window focus, and the
+  measured frames/s + frame-interval min/mean/max from `[frameMgr+0x5c]`.
+
+## 2026-11-20 (continued) - input, the title screen, and the new-game crash
+
+### The title screen is alive; the menus are not
+
+With the XAudio2 fix in place the intro movies play and the title screen appears.
+It looked static and black earlier only because nothing could press anything: the
+engine polls four XInput pads and no controller exists on this machine, so the
+"press start" prompt waited forever while the render loop ran at a measured
+59 fps.
+
+Two additions made it observable:
+
+- `src/host/xinput_stub.c` answers pad 0 as connected (`KORRA_PAD=1`, plus
+  `KORRA_PAD_BITS` / `KORRA_PAD_AUTO`). The imports are by ordinal, so
+  `native32_bind` learned to match a shim named `<dll>!#<ordinal>`.
+- `scripts/probe_input.ps1` takes the foreground properly (AttachThreadInput to
+  the *current* foreground thread) and screenshots each step. Injected keyboard
+  and mouse input does **not** reach the engine even with the window foreground
+  and focused; the pad does. That is a finding for M2.11, not a bug to chase:
+  the DInput keyboard path is not wired yet.
+
+With the pad the title screen animates: black + logo, then the parchment
+background with an "A" button glyph (`build/shots/44s.png`, `52s.png`). Menu
+*text* is still missing - the art, the button glyph and the selection brush
+stroke draw, the glyphs do not. Not yet diagnosed; D3D9/D3DX report no failures
+(every `D3DXCreateTexture*` returns S_OK, all 506 `D3DXGetShaderConstantTable`
+calls parse), so it is not a rejected resource.
+
+### The new-game transition crashes, deterministically
+
+An A press leaves the title screen, the screen fades to black, and the process
+dies with an access violation on every run. Two things were needed to see it:
+
+- The guest's static CRT calls `SetUnhandledExceptionFilter` during startup and
+  replaced the host's, so the [fatal] report never ran. That import is shimmed
+  now; the first crash was located through the Windows event log
+  (`0xC0000005` at offset `0x02aede67`, i.e. VA `0x62AEDE67` with `/BASE` fixed),
+  which the map file resolves to lifted `sub_00603C00`.
+- `run_until_exit.ps1` reports how a run ended.
+
+The report now reads:
+
+```
+[fatal] exception 0xC0000005 at 0x62B070E2, guest func 0x00603C00
+[fatal] read of 0x00000000
+```
+
+`--watch 0x00603C00` shows a single entry, argument 0, then the fault: the
+function's case 0 does
+
+```c
+p = MEM32(0xCA3E58);
+if (p) eax = MEM32(p + 0x2CD4); else eax = MEM32(0);   /* 0x603C23 */
+call [eax + 0x1C]
+```
+
+so the engine dereferences a manager it expects to exist. `0xCA3E58` is only
+ever written by the message handler `sub_0058DAB0` at `0x58DC33`, from a list
+search that stores **0** when no object with type marker `0x9DEE90` is linked,
+and cleared by `sub_0058E730` at `0x58E79C`. `--poison 0xCA3E58` reports no
+change during the whole menu-to-new-game run: the pointer is null from the
+moment the title screen exists, and the null check in the guest is only there
+because the original code trusts its own state (the null path dereferences 0 in
+the shipped binary too).
+
+So the question for the next session is narrow and state-shaped: which object is
+`0xCA3E58` supposed to point at, and why is it not in the list when the new-game
+flow starts? The candidates that have *not* been ruled out are the ones this port
+still fakes: the pad (now synthetic), the sound device (silent), and the Steam
+interfaces (stubs). Nothing in the file, D3D9 or lift layers is implicated.
+
+### Measurements taken on this build (M2.13, quirks section 8)
+
+`KORRA_QUIRK_PROBE=1` samples the engine's own frame data once a second:
+
+```
+[probe] focus=1 mode=0(60fps) applied=0 interval=50(60fps) frames=58.8/s
+        mean=17.0ms min=13.6ms max=21.0ms flags=0x00000000 hwnd=0x0003...
+```
+
+- **`DAT_00e4d210` is 0 while the window is focused**, i.e. 60 fps, and
+  `[frameMgr+0x58]` is 50 (1/3 ms units = 60 Hz). The focus branch does not flip
+  a focused window to 30 fps. Quirks section 8 item 1 is answered.
+- `DAT_00e4d01c` is 0 (limiter enabled); it gained bit 1 only while unfocused.
+- The `0xe4e52c` HWND global is populated by the engine itself.
+- Item 3 (does 60 fps double the logic rate) is still open: it needs the game to
+  run a scene, not a title screen.

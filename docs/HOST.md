@@ -49,10 +49,32 @@ runtime's crash report lands there too).
 | M2.6 D3D9 device | — | real `d3d9.dll`; DXVK-native swap comes after it boots |
 | M2.7 first frame | — | screenshot as proof |
 | M2.8 Steam | **done** | 7 shims in `shims.c`, `SteamAPI_Init` → 1 |
-| M2.9 XAudio2 | open | `CoCreateInstance` goes to the real COM; `XAudio2_7.dll` exists on this machine, so the pre-2.8 CLSIDs may just work — if not, stub it |
-| M2.10 CPK | expected free | CRI File System is lifted code; real `CreateFileA`/`ReadFile` serve `GameData\*.cpk`, CRILAYLA decompression runs in the guest |
-| M2.11 menus/input | — | XInput by ordinal 2/3 resolves to `xinput1_3.dll` |
-| M2.12 USM | open | movies will be attempted for real first; skip only if they hang |
+| M2.9 XAudio2 | **done** | `xaudio2_stub.c` is a real 2.7 device: it retires buffers on a QPC clock and performs CRI's `OnBufferEnd` counter increment (guest `0x7B2A24`), retire triggered from every device entry point. `KORRA_XA2_VERBOSE=0..3` |
+| M2.10 CPK | **works** | CRI File System runs lifted; every `CreateFileA`/`ReadFile` in a full boot succeeds, both CPKs and the four loose sound files included |
+| M2.11 menus/input | **partial** | the title screen animates and the pad drives it (`xinput_stub.c`: `KORRA_PAD=1`, `KORRA_PAD_AUTO=1`); menu *text* does not render yet, and injected keyboard/mouse input does not reach the engine |
+| M2.12 USM | **works** | the CRI Sofdec player plays the intro and logo movies for real; nothing needed stubbing |
+
+Known open blocker: the new-game transition dies with `0xC0000005` in lifted
+`sub_00603C00` (null manager at `0xCA3E58`) - see `docs/FINDINGS.md`,
+2026-11-20.
+
+## Diagnostics
+
+Everything below is opt-in and off by default.
+
+| Knob | Effect |
+|---|---|
+| `KORRA_XA2_VERBOSE=0..3` | XAudio2 stub logging, 3 = queue-length changes |
+| `KORRA_QUIRK_PROBE=1` | once per second: `DAT_00e4d210`, `[frameMgr+0x58]`, flags, HWND, measured frames/s |
+| `KORRA_PAD=1` [`KORRA_PAD_BITS=0x1000`] [`KORRA_PAD_AUTO=1`] | synthetic pad 0 |
+| `KORRA_TRACE_FILE=1` / `KORRA_TRACE_D3D=1` | `CreateFileA` arguments + result; failed d3d9 results and every d3dx call |
+| `KORRA_TRACE=1` | one line per bridged native call |
+| `build_host.ps1 -Trace` | separate `build\obj-trace` with `-DRECOMP_TRACE` (`--calltrace`, `--firsthit`, `--argtrace`, `--watch`, `--poison`) |
+
+Logs are per run (`korra_host-YYYYMMDD-HHMMSS.log` in the game folder), so a
+manual play session and an automated run never overwrite each other.
+`scripts\run_until_exit.ps1` reports how a run ended; `scripts\probe_input.ps1`
+drives the window and screenshots each step.
 
 ## Crash protocol
 
