@@ -129,7 +129,13 @@ static void build(void) {
     const native32_shim_t *t;
     if (g_shim_n) return;
     t = steam_stub_shims(&n);  add(t, n);
-    t = xa2_stub_shims(&n);    add(t, n);
+    /* KORRA_NO_AUDIO=1 leaves CoCreateInstance alone, so the engine's audio
+     * init fails the way it would on a machine with no sound device. A boot
+     * that gets further without audio means the stub (not the rest of the port)
+     * is what the game is waiting on. */
+    if (!getenv("KORRA_NO_AUDIO")) {
+        t = xa2_stub_shims(&n); add(t, n);
+    }
     g_shims[g_shim_n].name = "GetProcAddress";
     g_shims[g_shim_n].fn = shim_GetProcAddress;
     g_shim_n++;
