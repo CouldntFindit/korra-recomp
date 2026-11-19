@@ -20,9 +20,9 @@ side (Win32, D3D9 surface, XInput, XAudio2, CRI/Wwise audio, Steam stubs).
 
 | Milestone | What it means | State |
 |---|---|---|
-| M0 | Environment, toolchain pin, repo bootstrap, PE gate | in progress |
-| M1 | Seeds + function catalog + full lift to C | not started |
-| M2 | Boots to the main menu on Windows (no Steam, silent, movies skipped) | not started |
+| M0 | Environment, toolchain pin, repo bootstrap, PE gate | **done** (2026-11-19) |
+| M1 | Seeds + function catalog + full lift to C | **done**: 37,029/37,029 functions, 0 failures — see [`docs/LIFT_REPORT.md`](docs/LIFT_REPORT.md) |
+| M2 | Boots to the main menu on Windows (no Steam, silent, movies skipped) | in progress |
 | M3 | Boots and plays the first area on an Android arm64 device | not started |
 | M4 | Audio (Wwise + CRI behind a host mixer) | not started |
 | M5 | Gameplay validation, framerate hooks, full playthrough | not started |
