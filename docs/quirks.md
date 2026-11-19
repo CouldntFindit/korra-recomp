@@ -273,7 +273,7 @@ while (true) {
 Call chain to the entry: `FUN_005409a0` (`0x5409a0`) → `FUN_005409c0()` (init) →
 **`FUN_00540e10` (main loop)** → `FUN_00541020()` (shutdown).
 
-⚠️ **Unresolved detail:** the two branches above read oddly — *focused* selects **30 fps**,
+**Unresolved detail:** the two branches above read oddly — *focused* selects **30 fps**,
 *unfocused* selects **60 fps**. I could not confirm what `0x00ca3ce0` (`0x10000000`/`0x40000000`)
 and `0x00ca3d04` (`0x400000`) actually mean; they are read in ~50 places, several of them in the
 very first `.text` pages, so they may not be pure focus flags. **Do not build the 60 fps patch on

@@ -53,8 +53,8 @@ What the patch series buys us (from its own subjects):
 | Python | 3.15.1 (`C:\Users\yigit\AppData\Local\Python\pythoncore-3.15-64\python.exe`) |
 | capstone / unicorn / pefile | 5.0.7 / 2.1.4 / 2024.8.26 — installed |
 | Git | 2.56.0.4 (installed 2026-11-19 via `winget install Git.Git`) |
-| MSVC | ✅ **VS 2022 Build Tools 17.14.45**, MSVC **14.44.35207**, Windows SDK **10.0.26100.0** — installed to `…\korradecomp\msvc` (custom path, at the user's request so it can be deleted as one folder) |
-| CMake / Ninja | ❌ none — `scripts/build_host.ps1` drives `cl`/`link` directly (vcvarsall x86 + response file) |
+| MSVC | **VS 2022 Build Tools 17.14.45**, MSVC **14.44.35207**, Windows SDK **10.0.26100.0** — installed to `…\korradecomp\msvc` (custom path, at the user's request so it can be deleted as one folder) |
+| CMake / Ninja | none — `scripts/build_host.ps1` drives `cl`/`link` directly (vcvarsall x86 + response file) |
 | Android SDK / NDK | **not installed**. Blocks M3 |
 | Java | OpenJDK 21.0.12 (Gradle-capable) |
 | Ghidra | 12.2 PUBLIC at `%LOCALAPPDATA%\Programs\ghidra_12.2_PUBLIC` (optional) |
