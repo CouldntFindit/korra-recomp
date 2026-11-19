@@ -104,10 +104,11 @@ table itself is wrapped in a `"TOC "` chunk, so the `@UTF` magic sits at
 | `CRC` | u32 | per-entry CRC (algorithm not identified; not needed) |
 
 **Offset quirk (verified, not guessed):** `FileOffset` is *not* relative to
-`ContentOffset`. The correct base is
+`ContentOffset`. The rule that holds for both archives is
 
 ```
-absolute = FileOffset + (ContentOffset - min(FileOffset)) = FileOffset + 0x800
+base = ContentOffset − 0x800          (0x800 for both archives)
+absolute = FileOffset + base
 ```
 
 With that base the entries form a **gapless, 0x800-aligned chain** (0 gaps over
@@ -196,7 +197,7 @@ Neither archive stores a flattened path list; the path is `DirName + FileName`
 | largest entry | `ui/ui_manual.dtt` 67.2 MB | `st4/r4a2.dtt` 30.8 MB | |
 | archive size | 265,209,888 | 1,600,934,448 | 1.87 GB |
 
-Compression is modest overall (1.87 GB → 2.05 GB, ~9 %) because the biggest
+Compression is modest overall (1.87 GB → 2.05 GB, ~10 %) because the biggest
 `.dtt` blobs are stored raw on purpose (`FileSize == ExtractSize`); the files that
 *are* compressed shrink a lot (e.g. 300 B → 4,096 B, 931 KB → 3.6 MB).
 
@@ -417,7 +418,8 @@ story cutscenes, stereo on the Nickelodeon logo, absent on the CRIWARE logo.
 | `movie_logo/PG5R.usm` | 4.7 MB | 150 | 29.97 | 5.00 s | ADX 6ch/48k | 5.00 s |
 | `movie_logo/criware.usm` | 2.7 MB | 150 | 30.0 | 5.00 s | – | – |
 
-Total 800 MB, 697 s of video. Four files (`CS0071A/B`, `CS00P2`, `CS00EP`) have
+Total **800 MB**, **697.4 s** of video and **17,095 pictures** across 17,265 `@SFV`
++ 21,058 `@SFA` chunks. Four files (`CS0071A/B`, `CS00P2`, `CS00EP`) have
 up to 1.9 s of audio beyond the last video frame — the audio stream is simply
 longer than the picture; a player should follow the *video* length.
 
