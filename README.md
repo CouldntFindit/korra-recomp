@@ -43,7 +43,7 @@ Parallel research tracks (each has its own document):
 | B | CPK archives + USM movies → M2.10 and optional movies | **done + independently confirmed** (45/45) — [`docs/assets.md`](docs/assets.md) |
 | C | Ghidra subsystem triage → M2 hooks and M5 frame pacing | **done** — [`docs/quirks.md`](docs/quirks.md) |
 | D | Host shims: `steam_api` + silent XAudio2 2.7 COM | **done**, selftest 54/54 — [`docs/xaudio2_callsites.md`](docs/xaudio2_callsites.md) |
-| E | Publishing: Codeberg mirror, README/notices upkeep | **done** (publishing half; Winlator fallback not started) — [`docs/PUBLISHING.md`](docs/PUBLISHING.md) |
+| E | Publishing: mirror script, README/notices upkeep | **done** — [`docs/PUBLISHING.md`](docs/PUBLISHING.md) |
 
 Exact toolchain pin and per-milestone findings: [`docs/TOOLCHAIN.md`](docs/TOOLCHAIN.md),
 [`docs/FINDINGS.md`](docs/FINDINGS.md). Working rules for contributors and
