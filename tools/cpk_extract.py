@@ -52,7 +52,11 @@ class ReverseBitReader:
             self.bits = (self.bits << 8) | self.buf[self.pos]
             self.count += 8
         self.count -= n
-        return (self.bits >> self.count) & ((1 << n) - 1)
+        value = (self.bits >> self.count) & ((1 << n) - 1)
+        # Drop the bits already consumed: without this the accumulator grows
+        # without bound and the shifts become quadratic on large streams.
+        self.bits &= (1 << self.count) - 1
+        return value
 
 
 def crilayla_decompress(blob: bytes) -> bytes:
@@ -115,7 +119,7 @@ def extract_entry(data, entry) -> tuple[bytes, bool]:
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Extract single CPK entries")
     ap.add_argument("cpk")
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out", help="output directory (required unless --manifest-only)")
     ap.add_argument("--index", type=int, action="append", default=[])
     ap.add_argument("--path", action="append", default=[])
     ap.add_argument("--smallest", type=int, default=0,
@@ -130,6 +134,9 @@ def main(argv=None):
             print(f"0x{e['offset']:08x} {e['size']:>10,} {e['extract_size']:>10,} "
                   f"{e['path']}")
         return 0
+
+    if not args.out:
+        sys.exit("--out is required unless --manifest-only")
 
     picks = []
     for i in args.index:
