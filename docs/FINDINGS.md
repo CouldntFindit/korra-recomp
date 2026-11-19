@@ -42,6 +42,42 @@
 Rich C++ surface is a good sign: every vtable slot is a known function entry,
 which is exactly the class of function the prologue/branch scans miss.
 
-### Catalog
+### Catalog (M1)
 
-(pending — see below when filled in)
+| Stage | Result |
+|---|---|
+| Discovery rounds | 6 to a fixpoint |
+| Functions | **37,029** (`start` 25,188 / `alias` 11,841 / thunks 107) |
+| C++ EH stubs folded as aliases | 1,958 |
+| Data-pointer-only functions | 2,146 |
+| Branch targets given a body | 3,020 |
+| Wall time | 622.7 s |
+
+Korra lands at 37k functions vs NFSU2's 27.7k — the extra ~9k is the alias bodies
+(labels inside other functions that still need a dispatchable entry) plus a much
+larger C++ virtual surface (1,880 vtables).
+
+### Lift (M1 gate: PASSED)
+
+| Stage | Result |
+|---|---|
+| Functions lifted | **37,029 / 37,029** |
+| Failures | **0** |
+| Output | 75 C files, 12,016,872 lines, 613 MB |
+| Wall time | 229.5 s |
+
+No Korra-specific lifter fix was needed — the NFSU2 patch series covered the
+whole `.text` as-is. Details: `docs/LIFT_REPORT.md`.
+
+### M2 preliminary
+
+- MSVC is being installed to `<workspace>\msvc`
+  (VS 2022 Build Tools + VCTools workload) at the user's request, at the project
+  root so it is easy to delete later. Note: that path is inside a synced folder, so the
+  sync client will try to upload ~3–4 GB; pause the sync client during the build phase
+  or the compile will fight the sync engine.
+- Target devices named by the user: **Galaxy S24 (Exynos 2400, Xclipse/RDNA)** and
+  **Galaxy S25 (Snapdragon 8 Elite, Adreno)**. Requirement: do not ship an
+  Adreno-only build. Plan: DXVK-Native over stock Vulkan 1.1+ (works on both),
+  with Turnip/libadrenotools as an *option* on Adreno, and no Xclipse-specific
+  path required. Verify on both before calling M3 done.
