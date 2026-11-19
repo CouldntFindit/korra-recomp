@@ -6,7 +6,7 @@ primary host going away. This file is the operating manual for that policy.
 GitHub is the primary host today; `scripts/sync_codeberg.ps1` is the failover.
 
 > **Status 2026-11-19:** the project is published on GitHub
-> (`github.com/<owner>/korra-recomp`, public, work-in-progress) — that push is
+> (`github.com/CouldntFindit/korra-recomp`, public, work-in-progress) — that push is
 > the primary hosted copy and the off-site backup; the earlier local-only
 > decision is superseded. The Codeberg procedure below is the failover, kept
 > ready but not configured.
