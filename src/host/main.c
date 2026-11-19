@@ -32,7 +32,8 @@ int korra_shim_count(void);
 native32_shim_t *korra_shims(void);
 void korra_set_guest_module(const char *path);
 void korra_install_fault_handlers(void);
-
+void korra_quirk_probe_init(void);
+void korra_file_probe_init(void);
 /* No hand-written function overrides yet. This is where a specific guest VA
  * gets a host body (a debug hook, a stubbed subsystem), keyed by address. */
 recomp_func_t recomp_lookup_manual(uint32_t va) {
@@ -49,12 +50,23 @@ static const char *readable_time(void) {
     return buf;
 }
 
-/* Send both stderr and a file, so a run from Explorer leaves a log behind. */
-static void open_log(const char *path) {
+/* Send both stderr and a file, so a run from Explorer leaves a log behind.
+ * One file per run: the game folder is also where a human plays the same build,
+ * and a shared korra_host.log meant the last automated run overwrote the
+ * evidence from the last manual one. The newest korra_host-*.log is the run to
+ * read; scripts\run_host.ps1 picks it up automatically. */
+static void open_log(const char *dir) {
+    char path[MAX_PATH];
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    snprintf(path, sizeof path, "%s\\korra_host-%04d%02d%02d-%02d%02d%02d.log", dir,
+             t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
     FILE *f = fopen(path, "a");
     if (!f) return;
     fprintf(f, "\n=== korra_recomp %s ===\n", readable_time());
     fflush(f);
+    printf("korra: log        %s\n", path);
+    fflush(stdout);
     /* Duplicate our stderr handle onto the file's: the runtime writes with
      * fprintf(stderr, ...) everywhere, including the crash report. */
     int fd = _dup(2);
@@ -67,7 +79,7 @@ static int file_exists(const char *p) {
 }
 
 int main(int argc, char **argv) {
-    char exe_path[MAX_PATH], log_path[MAX_PATH], game_dir[MAX_PATH];
+    char exe_path[MAX_PATH], game_dir[MAX_PATH];
     char *dir_arg = NULL;
 
     /* The runtime's bring-up diagnostics take their own arguments
@@ -101,8 +113,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "korra: %s not found\n", exe_path);
         return 2;
     }
-    snprintf(log_path, sizeof log_path, "%s\\korra_host.log", game_dir);
-    open_log(log_path);
+    open_log(game_dir);
 
     printf("korra: game dir  %s\n", game_dir);
     printf("korra: module     %s\n", exe_path);
@@ -111,6 +122,8 @@ int main(int argc, char **argv) {
 
     native32_init();
     korra_install_fault_handlers();
+    korra_quirk_probe_init();
+    korra_file_probe_init();
     if (getenv("KORRA_TRACE")) native32_trace_native = 1;
 
     uint32_t base = 0x400000;
