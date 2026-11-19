@@ -1,0 +1,16 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  content-guard:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Content guard
+        shell: bash
+        run: python tools/check_content.py $(git ls-files)
