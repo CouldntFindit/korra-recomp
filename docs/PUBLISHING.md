@@ -1,13 +1,15 @@
-# Publishing and the Codeberg mirror
+# Publishing
 
 The plan's publishing policy (§7) is **[LOCKED]**: public from day one,
-**GPL-3.0**, **source-only** releases, and a regularly synced Codeberg mirror as
-insurance against a primary host going away. This file is the operating manual
-for that policy. `scripts/sync_codeberg.ps1` is the tool.
+**GPL-3.0**, **source-only** releases, and a mirror as insurance against the
+primary host going away. This file is the operating manual for that policy.
+GitHub is the primary host today; `scripts/sync_codeberg.ps1` is the failover.
 
-> **Status 2026-11-19:** the source-only and licensing parts are in force, but no
-> mirror is configured — the project owner decided against a hosted copy for now.
-> Treat everything below as the procedure to follow *if and when* one is set up.
+> **Status 2026-11-19:** the project is published on GitHub
+> (`github.com/<owner>/korra-recomp`, public, work-in-progress) — that push is
+> the primary hosted copy and the off-site backup; the earlier local-only
+> decision is superseded. The Codeberg procedure below is the failover, kept
+> ready but not configured.
 
 Two invariants everything below serves:
 
@@ -145,11 +147,11 @@ content guard before it pushes, and never rewrites history.
 
 ## Not done yet (state on 2026-11-19)
 
-- **No remote is configured, and none is planned for now.** The project owner
-  does not want a hosted mirror, and Cloud syncing is disabled on this
-  machine, so the repository currently exists in exactly one place. The script,
-  this document and its selftest stay in the tree so a mirror is a three-command
-  change of mind rather than a rewrite.
+- **Hosting 2026-11-19:** GitHub is the primary host (public,
+  work-in-progress, pushed at each milestone); the earlier local-only decision
+  is superseded. The Codeberg mirror stays unconfigured — the script, this
+  document and its selftest remain in the tree so it is a three-command change
+  of mind rather than a rewrite.
 - No CI. The guard and the selftest run locally; see
   `tests/sync_codeberg_selftest.ps1` (9 cases against a throwaway bare repo).
 

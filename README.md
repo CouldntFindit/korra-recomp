@@ -12,13 +12,19 @@ No emulator, no interpreter for the game's own code: every function of the
 original binary is translated ahead of time, and this project supplies the host
 side (Win32, D3D9 surface, XInput, XAudio2, CRI/Wwise audio, Steam stubs).
 
+> **Work in progress — pre-alpha.** Nothing is playable yet and there are no
+> releases. The Windows host currently boots the engine and renders through the
+> intro movies; the main menu is not reached yet. The milestone table below is
+> the source of truth for what works today.
+
 > **This repository contains no game content.** You must own and supply your own
 > copy of the PC game. Builds are produced locally by each builder from their own
 > files; nothing derived from the game binary is published here.
 
 ## Status
 
-*Last updated 2026-11-19.*
+*Last updated 2026-11-19. Current focus: M2 — the movie-to-menu transition and
+the XAudio2 stub blocker.*
 
 | Milestone | What it means | State |
 |---|---|---|
@@ -45,7 +51,7 @@ agents: [`AGENTS.md`](AGENTS.md).
 
 ## Building
 
-Everything is generated from *your* sale copy:
+Everything is generated from your own copy:
 
 ```powershell
 # 1. Toolchain: the pinned pcrecomp (commit + patch series, see docs/TOOLCHAIN.md)
@@ -77,18 +83,18 @@ the Android target (not set up yet). Details in
 ## Publishing
 
 Releases are **source-only** — no APKs, no binaries, no game data, no generated
-recompiled code. A mirror script exists for when a second copy is wanted:
+recompiled code. This GitHub repository is the project's home and its hosted
+copy; it is pushed at each milestone. A Codeberg failover script is kept in the
+tree in case a second host is ever wanted:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\sync_codeberg.ps1 -DryRun   # check
 powershell -ExecutionPolicy Bypass -File scripts\sync_codeberg.ps1           # push
 ```
 
-**No mirror is configured today** — the project is local-only by decision of the
-project owner, and the script exits harmlessly when no remote exists. When one is
-wanted, it refuses a dirty tree, a non-Codeberg host, a non-fast-forward and any
-tracked file the content guard rejects. Policy, one-time setup, release checklist
-and troubleshooting: [`docs/PUBLISHING.md`](docs/PUBLISHING.md).
+It refuses a dirty tree, a non-Codeberg host, a non-fast-forward and any tracked
+file the content guard rejects. Policy, setup, release checklist and
+troubleshooting: [`docs/PUBLISHING.md`](docs/PUBLISHING.md).
 
 ## Legal
 
@@ -96,3 +102,11 @@ Unofficial fan interoperability project. Not affiliated with Activision,
 PlatinumGames, Nickelodeon or Viacom. The Legend of Korra is a trademark of its
 respective owners. Original code here is GPL-3.0; see [`LICENSE`](LICENSE) and
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
+## Development
+
+This project is developed with AI coding agents under human direction. Most of
+the tooling, documentation and analysis here was agent-produced, then verified —
+independently, against the shipped game files — and merged at the owner's
+decision. The verification runs and their results are recorded in
+[`docs/FINDINGS.md`](docs/FINDINGS.md).
