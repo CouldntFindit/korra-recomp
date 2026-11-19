@@ -121,6 +121,24 @@ prefixes on ret normalize to `ret`), committed to the pcrecomp tree as
 Only **1 occurrence in 12 M lines**, and it was on the boot path — a good example
 of why a lift failure count of 0 does not mean "nothing was unimplemented".
 
+### Known instruction debt (measured, not guessed)
+
+`grep RECOMP_UNIMPL` over the 12 M lines: **801 sites**. The lift reported 0
+*failures*, so these are instructions the lifter consciously has no case for —
+they abort only if reached. Top groups:
+
+| Instruction | Sites |
+|---|---|
+| `fcompi st(1)` / `fcomi st(1)` / `fucompi st(1)` (x87 compare-and-pop) | 430 |
+| `lock cmpxchg r/m, reg` (dword/byte, several bases) | 152 |
+| `lock cmpxchg8b` | 10 |
+| `insb`/`insd`/`outsb` (port I/O) | 34+ (likely dead in the PC build) |
+| `pcmpistri` (SSE4.2 string compare) | 10 |
+| `ljmp`/`int 0x29` junk from data decoded as code | 13 |
+
+`fcomi*` and `lock cmpxchg` are real, hot-path instructions; expect to add them
+to the lifter as Korra patches during M5. They are not blocking M2.
+
 ### Target devices named by the user: **Galaxy S24 (Exynos 2400, Xclipse/RDNA)** and
   **Galaxy S25 (Snapdragon 8 Elite, Adreno)**. Requirement: do not ship an
   Adreno-only build. Plan: DXVK-Native over stock Vulkan 1.1+ (works on both),
