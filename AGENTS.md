@@ -255,6 +255,19 @@ Append only; newest last. Format: date — attempt — outcome — next idea.
   at the device call (`src/host/perf_probe.c`, `KORRA_PERF=1`) before trusting an
   OSD number. `D3DPRESENTFLAG_LOCKABLE_BACKBUFFER` is **not** the mechanism
   (clearing it changed nothing).
+- 2026-11-20 — building the generated tree with `/O2` — **does not compile**:
+  `recomp_0021.c` and `recomp_0035.c` (~90 MB each) die with `C1002: out of heap
+  space in pass 2`, and `cl` raises it to `D8040`. `/Zm1200` does not help; do
+  not retry `/O2` on these translation units. `scripts\build_host.ps1 -Fast`
+  therefore uses `/O1` plus `RECOMP_MEM_QUAL` empty, which is the part of the
+  optimisation that matters for this code (every guest memory access was
+  `volatile`) and compiles in the same time as the normal build.
+- 2026-11-20 — making the machine-lock hand-over cheaper (thread-local state
+  instead of `TlsGetValue`, `WakeByAddressAll` only when a ticket is queued,
+  longer spin) — **correct but neutral**: 45.3 fps in the first area vs 44.9
+  before, same min/max. The frame is not limited by the hand-over. Kept as
+  unconditionally cheaper code (`pcrecomp` Korra-0007), and it is a reminder to
+  measure a "obviously faster" change before writing it up as a win.
 
 
 ## 7. Reporting

@@ -55,6 +55,7 @@
 #endif
 #include <windows.h>
 #include <tlhelp32.h>
+#include <powrprof.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -435,6 +436,28 @@ static double qpc_ms(ULONGLONG ticks, LARGE_INTEGER freq) {
     return (double)ticks * 1000.0 / (double)freq.QuadPart;
 }
 
+/* Core 0's current clock. The first-area fps alternates between ~40 and ~58 in
+ * a regular cycle with the same call count per frame, so throughput rather than
+ * work varies; this is the cheap way to tell a CPU power state from a guest
+ * periodic task. (PROCESSOR_POWER_INFORMATION is not declared by every SDK's
+ * powrprof.h, so the layout is spelled out here.) */
+typedef struct {
+    ULONG Number;
+    ULONG MaxMhz;
+    ULONG CurrentMhz;
+    ULONG MhzLimit;
+    ULONG MaxIdleState;
+    ULONG CurrentIdleState;
+} korra_ppi;
+
+static unsigned cpu_mhz(void) {
+    korra_ppi info[64];
+    if (CallNtPowerInformation((POWER_INFORMATION_LEVEL)11 /* ProcessorInformation */,
+                               NULL, 0, info, sizeof info) != 0)
+        return 0;
+    return info[0].CurrentMhz;
+}
+
 static DWORD WINAPI perf_thread(LPVOID unused) {
     LARGE_INTEGER freq, now;
     ULONGLONG qpc_prev_frame, qpc_period, cpu_prev, cpu_period_base;
@@ -595,9 +618,9 @@ static DWORD WINAPI perf_thread(LPVOID unused) {
                 cpu_ms = (double)(cpu - cpu_period_base) / 10000.0;
                 cpu_period_base = cpu;
             }
-            fprintf(stderr, "[perf] t=%.0fs 1s tick=%u/s present=%u/s cpu=%.0f%% natcalls=%u eip: ",
+            fprintf(stderr, "[perf] t=%.0fs 1s tick=%u/s present=%u/s cpu=%.0f%% mhz=%u natcalls=%u eip: ",
                     elapsed_s(), (unsigned)(frames / secs + 0.5), g_period_presents,
-                    cpu_ms * 100.0 / (secs * 1000.0), g_period_native_calls);
+                    cpu_ms * 100.0 / (secs * 1000.0), cpu_mhz(), g_period_native_calls);
             print_eip_tops((int)g_tops);
             if (idle_seconds) fprintf(stderr, "[perf] STALL tick unchanged for %us, native calls still %u/s\n",
                                       idle_seconds, g_period_native_calls);
