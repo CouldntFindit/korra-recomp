@@ -866,3 +866,42 @@ deleting the save directory, waiting 12 s between runs. None changed it.
   unattended run does not spend its budget on a dead window.
 - `scripts/probe_input.ps1`: `-Exe` / `-Extra`, so the trace build can be driven
   by the same harness.
+
+### Resolution of the instrumented run: the lookup returns 0, the object appears one call later
+
+Two more runs with the probe extended to the lookup itself settle it. The
+new-game sequence, in order, with `KORRA_PAD=1 KORRA_PAD_AUTO=1`:
+
+    publish  step=0x00000A10  mode=0  name="START"     <- cutscene step applied
+    scene-lookup 0x005201D0   mode=0                   <- sub_005201D0("Player", 0x10000)
+    player-spawn 0x00503BD0                            <- so the player is created NOW
+    (0xE381F8 stays 0 -> then 0x80 via the ui-flags pass)
+    hud-ctor  0x00602D80
+    hud-update 0x00603C00   player=0x00000000          <- crash
+
+and the two markers that only run on the success path **never appear**:
+
+- `0040F6F0` (the publish's tail, reached only when the scene object was non-null)
+- `0058EE10` (stage UI, reached only when the player was non-null)
+
+So the publish did **not** "fail to find the player inside a stage object". It
+never got a stage object at all: `sub_005201D0("Player", 0x10000 + mode, …)`
+returned 0, and `0x0058DBC4` sent it straight to the epilogue. Then
+`0x00503BD0` -> `0x00507940` created the `BehaviorPlayer` in the *next* call, and
+nothing re-published it: the pending step id had already been consumed
+(`0xE38AB0` is set to -1 by `sub_005C1AC0` before the dispatch), so no later
+sequencer cycle runs the publish.
+
+That makes the defect an **ordering one**, and it is one frame wide:
+
+> the Player scene object is created one call *after* the publish that looks for
+> it. Because the publish is the only writer of `0xCA3E58`, the global stays 0
+> for the rest of the cutscene and the HUD - which is constructed right after -
+> dereferences it.
+
+Next step, and it is narrow: find who is supposed to create the "Player" scene
+object *before* the lookup (it is not `0x00503BD0`; that one runs later by
+design), and why it never ran on the way into `Cutscene_01`. The tooling is in
+place: `KORRA_TRACE_CRASH=1` prints `scene-lookup`, `publish`, `publish-tail`,
+`stage-ui` and the step name, so a candidate fix is confirmed by `publish-tail`
+appearing with a non-zero player.
