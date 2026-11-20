@@ -274,3 +274,5 @@ __declspec(allocate(".CRT$XIU")) static void (__cdecl *g_scene_ctor)(void) = sce
 
 /* Keep the double-checked variable reachable from a debugger. */
 int korra_scene_probe_active(void) { return g_enabled; }
+
+
