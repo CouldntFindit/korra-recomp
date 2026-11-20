@@ -443,12 +443,15 @@ DXVK is in, shared is the smaller risk (one copy instead of one per library).
   16 imm8 values `0x00 0x04 0x08 0x0C 0x0D 0x10 0x14 0x18 0x1C 0x20 0x30 0x38
   0x40 0x44 0x48 0x4C`. (The switch is required: these intrinsics need an
   immediate, so a variable imm8 does not compile.)
-- everything else (so: **arm64**) → a portable C loop that assumes
-  **unsigned bytes**, implicit lengths, aggregations 0–3, polarity bit 0, and
-  the msb index bit. It returns only ZF and CF.
+- everything else (so: **arm64**) → a portable C body. **Fixed 2026-11-20**
+  (`recomp_types.h`, Korra-0005): it now implements all four data formats
+  (unsigned/signed bytes/words), all four aggregations, all four polarity modes
+  and both index directions, and returns ZF/CF/SF/OF. The old body (unsigned
+  bytes, implicit lengths, ZF/CF only) is what the measurements below recorded.
 
-The header's own comment says the portable body is "NOT yet verified against
-the hardware". That is the flag this section resolves.
+The header's own comment used to say the portable body was "NOT yet verified
+against the hardware". That is resolved: `tests/run_pcmpistri_diff.ps1` compares
+7,520,000 tuples and all four flags, and passes.
 
 ### 7.2 The six sites in LoK.exe
 
@@ -502,6 +505,10 @@ random bytes with random NULs, and needles copied out of the haystack.
 | `0x48` | ubyte equal-each masked msb | 344,655 | 73.3 % | no |
 | `0x4C` | ubyte equal-ordered masked msb | 28,888 | 6.1 % | no |
 
+**Measurement before the fix** (2026-11-20, same day; kept as the evidence that
+drove it). After Korra-0005 the same harness reports **0 differences for all 16
+imm8 values**. At the time it read:
+
 Verdict: the portable body is **not** equivalent to the instruction. For this
 binary:
 
@@ -519,50 +526,57 @@ binary:
 - The equal-each family diverges too, but Korra has no equal-each site; treat it
   as a trap for the next binary, not as an M3 blocker.
 
-### 7.4 The second problem: SF and OF are not modelled
+### 7.4 The second problem: SF and OF (fixed)
 
-`lift32.py` lowers `pcmpistri` to `_cf` + a fake `cmp` (`_flag_a`, `_flag_b`)
-that reproduces **ZF and CF only**, with the comment "SF (null in `a`) and OF
-(IntRes2[0]) ... are left out only because no generated site branches on them".
+**Status: stale as written, then fixed in two steps.** The text below records
+what this section originally claimed; the corrected facts follow it.
 
-That is not true for this binary. At `0x77A38B` the lifted code is:
+The original claim was that `lift32.py` lowers `pcmpistri` to `_cf` + a fake
+`cmp` that reproduces **ZF and CF only**, with the comment that SF and OF "are
+left out only because no generated site branches on them".
 
-```c
-ecx = recomp_pcmpistri(...g_xmm[1]..., 0x0Cu, &_pcmpf);
-_cf = ...; _flag_a = ((_pcmpf & 1u) ? 0u : 1u); _flag_b = 0;
-if (CMP_NO(_flag_a, _flag_b)) goto L_0077A326;   /* 0x77A392: jno */
-if (CMP_NS(_flag_a, _flag_b)) goto L_0077A363;   /* 0x77A394: jns */
-```
+That was wrong for this binary, and it was fixed on 2026-11-20 in Korra-0004
+(`pcrecomp` `b0b2ce2`): site `0x77A38B` branches `jno`/`jns` on exactly SF/OF,
+so the lowering now packs all four into `FK_EFLAGS` through
+`recomp_pcmp_eflags`. On x86 the four bits are the CPU's own intrinsics, so
+every following branch is exact. The current lifted tree has 28 `pcmpistri`
+instances (12 in `recomp_0041.c`, 16 in `recomp_0042.c`) and all 28 use the
+packed-EFLAGS form — **"the lifter drops SF/OF" is stale and should not be
+re-quoted.**
 
-`CMP_NO`/`CMP_NS` are OF/SF tests, and the artificial subtraction makes both
-constant (OF=0, SF=0), so the first branch is always taken. On hardware,
-OF = `IntRes2[0]`, which is 1 when the needle matches at offset 0. Why the port
-still works: the always-taken branch lands on the CRT's byte-wise path, which
-re-tests the first byte and then verifies the candidate at `0x77A35F` — a
-slower but correct route. That explains the Windows build, but it is not a
-guarantee: it depends on a fallback path that must be reachable in every state.
+The second, separate error was in the **portable** body: it modelled
+`SF = IntRes2[15]`. Hardware defines SF as **"any null element in `a`"** (and
+ZF as "any null element in `b`"); probe evidence: `a="ab"`, `b="xaby"` gives
+SF=1 on hardware while `IntRes2[15]` is 0. Korra-0005 fixes that and the
+differential harness now compares all four flags, not just ZF/CF.
 
-This is an x86-side defect as well (it exists on the working build today). It is
-listed here because arm64 removes the "hardware is the reference" safety net:
-the only implementation will be the portable one, and the flag model has to be
-right, not merely unexercised.
+The original text, for the record:
+
+> At `0x77A38B` the lifted code is `... CMP_NO(_flag_a, _flag_b) ...` and the
+> artificial subtraction makes both constant, so the first branch is always
+> taken. On hardware, OF = `IntRes2[0]`, which is 1 when the needle matches at
+> offset 0. Why the port still works: the always-taken branch lands on the CRT's
+> byte-wise path... That explains the Windows build, but it is not a guarantee.
+
+That reasoning is superseded: the `jno` branch no longer sees a constant.
 
 ### 7.5 Options for arm64 (ranked)
 
-**A. Fix the portable body in the runtime header (recommended).**
+**A. Fix the portable body in the runtime header (recommended) — IMPLEMENTED 2026-11-20.**
 One file (`recomp_types.h`), no relift: rebuild only. Work items:
 1. honour imm8[1:0] — unsigned bytes **and unsigned words** (Korra needs words);
 2. implement the hardware validity rule for equal-ordered (index 0 / CF=1 when
-   the needle cannot fit), or special-case `len1 == 0`;
-3. compute SF and OF so the lift driver can carry them, and extend the
-   `pcmpistri` lowering to store them (`_flag_k` with sign/overflow semantics);
+   the needle cannot fit, including an empty needle);
+3. compute SF and OF (and ZF/CF) as the instruction defines them. The lowering
+   already carried four bits (Korra-0004); the missing piece was the portable
+   body's SF rule (`IntRes2[15]` instead of "any null in `a`");
 4. verify with the harness below, and add it to the repo's test commands.
 
-Cost: small (the body is ~35 lines) but it needs the exact semantics. Use
-SIMDe's `simde_mm_cmpistri` (MIT) as the reference implementation to re-derive
-from, or add SIMDe as a dependency (option B). Do **not** copy QEMU's helper:
-QEMU is GPL-2.0-only, which cannot be combined with this repo's GPL-3.0 — read
-it to understand, re-derive the code.
+Result: `recomp_types.h` (`dc18f83`) plus the harness extension, 7,520,000
+tuples × index/ZF/CF/SF/OF pass; the 21 site-shaped cases pass. SIMDe was read
+as a reference but its `cmpistri` is unimplemented upstream, so the body is
+derived from the SDM rules and validated against this CPU. QEMU's helper was
+read for the validity rules and re-derived, not copied.
 
 **B. Use SIMDe for the whole helper.** `simde_mm_cmpistri/z/c/s` exist (MIT,
 header-only) and are the same call shape. Force `SIMDE_NO_NATIVE` on arm64 so
@@ -591,20 +605,18 @@ python tools\scan_pcmpistri.py "The Legend of Korra\LoK.exe"
 
 # 2. differential: hardware (Win32) vs portable (x64), 7.52 M tuples
 powershell -ExecutionPolicy Bypass -File tests\run_pcmpistri_diff.ps1
-# today: FAIL, listing 0x0C and 0x0D (this is the finding, not a broken test)
+# 2026-11-20: PASS for all 16 imm8 values, index and ZF/CF/SF/OF included,
+# plus 21 site-shaped cases (0x0C strstr, 0x0D wide string, 0x40 strrchr)
 ```
 
-The acceptance test for the M3 session: the harness passes for every
-**Korra-used** imm8 (0x0C, 0x0D, 0x40), and the harness is extended with
-hardware-vs-portable checks for **SF/OF** once the lowering carries them. A
-pass on the other 13 values is nice; a pass on all 16 plus words is the goal.
-
-Two limits of this evidence, stated once: it validates the *algorithm* against
-one Intel CPU (i5-13450HX), not against arm64 silicon; and no device run
-exists yet. The remaining risk after a green harness is a compiler/optimiser
-difference on arm64 — integer C only, so this is small, but the first arm64
-build should still log the six sites' results once and compare against the x86
-log for the same boot path.
+The acceptance condition is met for every imm8 value (not only Korra's three),
+with all four defined flags compared, and the harness also exercises the six
+sites' input shapes (`tests/pcmpistri_sites.c`). What this evidence still does
+not cover: it validates the *algorithm* against one Intel CPU (i5-13450HX),
+not against arm64 silicon, and no device run exists yet. The remaining risk
+after a green harness is a compiler/optimiser difference on arm64 — integer C
+only, so this is small, but the first arm64 build should still log the six
+sites' results once and compare against the x86 log for the same boot path.
 
 ## 8. M3 task list (after the M2 gate)
 

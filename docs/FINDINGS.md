@@ -1305,3 +1305,106 @@ change was made in this session.
 - Behaviour on a CPU where `__isa_available` is 2 but the ambient `strstr` path
   differs (arm64 uses the portable body, which now also carries SF/OF but is
   still unverified against hardware).
+
+## 2026-11-20 - M3 close: portable pcmpistri fixed and verified; FCOMI*/LAHF audit fix
+
+Scope: the pinned `pcrecomp` tree, `tests/`, and the `m3-prep` merge. No host
+file was edited and no game run was made (the perf session owns those).
+
+### STEP 0 - merge and re-validation
+
+- `m3-prep` (forked at `16a241a`, before the SF/OF fix and the relift) was
+  rebased onto `origin/main` (`470ab9e`) with no conflicts, pushed, and
+  fast-forwarded into `main`: `origin/main` = `c27500a`.
+- `tools/scan_pcmpistri.py` on the shipped exe still reports 6 sites:
+  `0x77A34F`/`0x77A38B` imm8 `0x0C`, `0x77C33B` imm8 `0x40`,
+  `0x77CF3D`/`0x77CF53`/`0x77CF88` imm8 `0x0D`. The current lifted tree has 28
+  instances (12 `recomp_0041.c`, 16 `recomp_0042.c`) and all 28 already use
+  `recomp_pcmp_eflags` / `FK_EFLAGS`.
+- `tests/run_pcmpistri_diff.ps1` still reproduced both defects: `0x0C`
+  28,480/470,000 (6.06 %), `0x0D` 469,592/470,000 (99.9 %), `0x40` 0. So the
+  defects are in the **portable body**, not the relift.
+- The "lifter drops SF/OF" note is **stale**: the lowering carries all four
+  bits and x86 takes them from the CPU. The portable body's own SF was wrong
+  in a different way (see below).
+
+### The fix (Korra-0005, `pcrecomp` `dc18f83`)
+
+`recomp_pcmpistri` is rewritten against the SDM rules: four data formats, four
+aggregations, four polarity modes, both index directions, and the real flag
+definitions. Notes worth keeping:
+
+- **Equal-ordered does not window to `b`'s null.** The match condition is "all
+  valid `a` elements equal `b[j+i]`, with `j+i <= 15`"; an empty needle matches
+  every position (all 16 bits set, index 0, CF=1). A non-empty needle may only
+  start at `j <= len(b) - len(a)` when `b` has a null, or at any `j <= 15` when
+  `b` has none (partial comparison at the edge). The old
+  `i + len1 <= len2` rule is what produced the 6.06 % divergence.
+- **Equal-each sets bits to 1 past the longer operand's end**, and 0 between
+  the two lengths. Modelling it as a plain byte-wise equality with `b` masking
+  is wrong even when the data is null-padded.
+- **Masked positive == positive**; masked negative is a negative XOR limited
+  to `b`'s valid lanes. Polarity must be applied before CF/OF are derived.
+- **SF is "any null element in `a`"** (ZF is the same for `b`), not
+  `IntRes2[15]`. The harness had been hashing only `flags & 3`, which hid it.
+- **Word mode (`0x0D`) returns the element index 0..7, 8 for no match.** The
+  lifted code at `0x77CF53` applies `lea edx,[edx+ecx*2]`; pre-scaling in the
+  body would double it.
+- No relift: the header is compiled by every TU, so a rebuild is enough. The
+  Windows host build was not run (perf session owns it).
+
+### Verification
+
+`tests/run_pcmpistri_diff.ps1`, 470,000 cases x 16 imm8 = **7,520,000 tuples**,
+Win32 SSE4.2 vs the x64 portable body, comparing index and ZF/CF/SF/OF:
+
+```
+PASS: portable body agrees with hardware on all 7520000 tuples (16 imm8 values)
+PASS: 21 Korra site-shaped cases agree (0x0C strstr, 0x0D wide string, 0x40 strrchr)
+```
+
+The site-shaped cases are new (`tests/pcmpistri_sites.c`) and use the shapes
+the six sites see: asset paths/class names for the byte `strstr`, the same names
+as UTF-16 for the wide path, and a single searched byte for the `strrchr` msb
+form. Named sites: `0x77A34F`/`0x77A38B` in `sub_0077A1D0` (`strstr`),
+`0x77CF3D`/`0x77CF53`/`0x77CF88` in the wide-string family
+(`sub_0077CEA8`/`sub_0077CF2B`/…; word index then `*2`), `0x77C33B` in
+`sub_0077C280` (msb byte scan).
+
+### Audit: other partially modelled flag writes
+
+Evidence: a capstone pass over every catalog block (1,495,735 unique
+instructions, 271,473 unique blocks) tracking the last flag writer and the next
+flag consumer. Instructions whose flags are *undefined* on hardware (DIV/IDIV;
+BSF/BSR except ZF; 1-operand MUL/IMUL except CF/OF; SHLD/SHRD OF; logic AF;
+shift count > 1 OF) are deliberately not modelled and are not defects.
+
+- **Fixed: `FCOMI/FCOMIP/FUCOMI/FUCOMIP` + `LAHF`** (Korra-0006, `5cfccf3`).
+  The `i` forms write ZF/PF/CF and clear OF/SF/AF, but the lifter published
+  only the lazy `'fcom'` tuple, so `LAHF` (and `PUSHFD`) reported the flags of
+  an earlier instruction. Eight real functions use MSVC's
+  `fucompi st(1); fstp st(0); lahf; test ah, 0x44; jnp` float-zero test
+  (`0x8523E9`, `0x8524A7`, `0x864164`, `0x8641F1`, `0x866911`, `0x8788B4`,
+  `0x884DE2`, `0x897823`). The i-forms now publish `FK_EFLAGS` via
+  `recomp_fcomi_eflags`; the plain FCOM/FCOMP/FUCOM/FUCOMP forms are untouched.
+  Codegen change, so the tree was relifted (37,029/37,029, 0 failures, 259 s).
+  The 11 changed generated files (0053-0063) compile as one TU with the host
+  flags. **Not runtime-verified** - no game run from this session.
+- **Not a defect: `imul r32, r/m32, imm32` then `jbe`** at `0x4E7180`
+  (`sub_004E7062`/`sub_004E70C1`/`sub_004E712B` - three overlapping catalog
+  entries). The surrounding bytes decode to nonsense (`push 0x6869004E`,
+  `add bh, dh`) with ASCII-looking immediates, i.e. a misdecoded data region,
+  not code. No fix.
+- **No sites** for: `shl/shr by 1` followed by an OF condition; `bt*` followed
+  by a direct CF reader (`adc`/`sbb`/`rcl`/`rcr`); rotate followed by an OF
+  condition. Those remain latent traps for the next binary, not Korra defects.
+
+### Not verified / open
+
+- The arm64 body is validated against one Intel CPU, not against arm64 silicon;
+  no device run exists.
+- The FCOMI fix has no game-level run yet. First check for the perf session:
+  a float `== 0` test at the eight addresses above, and a rebuild before any
+  further profiling (the generated tree changed).
+- `tools/scan_pcmpistri.py` counts static sites only; the 28 lifted instances
+  are catalog aliases.
