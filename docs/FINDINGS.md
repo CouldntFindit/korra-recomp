@@ -1652,3 +1652,48 @@ instead runs one fixed step per frame, gameplay would be ~33 % slow at 40 fps.
 The one test that settles it is timing a known-duration event (an intro movie, or
 the auto-save notice) at cap 30 vs cap 60 - wall-clock identical means
 time-based.
+
+### Delta-timing test: the sim advances on wall time, not on frames (`perf_probe` `KORRA_PERF_WATCH`)
+
+Question: does the logic step tie to the frame rate (so a cap changes game speed),
+or to the clock (so any cap is valid)?
+
+Method: same binary, same scripted path, only `KORRA_FPS` differs; log a sim-driven
+state change with its wall clock and frame number (`KORRA_PERF_WATCH=0xE38A84`,
+the sequencer's current step id). The boot chain is the one fixed-length event both
+runs share: menu step `0xF00` is reached by the engine itself, with no input.
+
+| cap | menu step `0xF00` reached | frame | frames/s over the boot |
+|---|---|---|---|
+| 60 | **25.2 s** | 953 | 37.8 |
+| 30 | **34.1 s** | 577 | 16.9 |
+
+Read it against the two hypotheses: 2.24x fewer frames per second, so a
+frame-stepped chain would have taken ~2.24x longer (56 s) and a purely time-based
+one exactly 25.2 s. Measured 34.1 s - **between** the two, i.e. neither.
+
+That is what a mixed boot looks like: asset loading and movie playback are
+time-based (that is the bulk of it), and a smaller part - fades and a couple of UI
+waits - is counted in frames. It is **not** frame-stepping: if the sim itself were
+frame-counted, the whole chain would have scaled with the frame rate, and the
+game's own shipped 30 fps mode would run at half speed, which it does not.
+
+Two further data points, both consistent and both honest about their limits:
+
+- the auto-save notice measured by pixel (a 120x40 patch of its pale paper) lasted
+  **5.48 s at cap 60 and 4.75 s at cap 30** - but in that window both runs were
+  boot-bound at ~17 fps, so the measurement cannot discriminate and is not claimed
+  as evidence either way;
+- a menu-to-cutscene interval is **not** usable: the transition is triggered by the
+  scripted pad tap, so it measures the tap, not the game.
+
+**Conclusion for the port:** the logic advances on wall-clock time, so 30, 40 and
+60 are all valid caps; the residual frame-counted UI waits make the engine's own
+two rates (30 and 60) the safest choices, and 30 the default on Android - it is
+also the cheapest thermally and the one the shipped engine already defines.
+`KORRA_FPS` stays a knob (F9 cycles 30/40/60/engine on the Windows host).
+
+What would settle the *gameplay* sim beyond doubt: watch a monotonic game-time
+float and compare its advance per wall second at cap 30 vs 60. That needs the
+address, which this pass did not hunt; the boot-chain result above is the evidence
+the decision rests on.
