@@ -1506,3 +1506,58 @@ windowed, no vsync, so neither vsync nor exclusive fullscreen is involved.
 - The first-area fps depends on the *measuring tool*: an overlay that hooks
   Present can add 300 ms per frame. Measure with `KORRA_PERF=1` (present/s is
   counted at the real device call) before believing an OSD number.
+
+## 2026-11-20 (later) - first-area follow-up: two levers measured, neither moves it
+
+Owner ruling after the overlay finding: aim for a solid 30-40 fps now, 60 later.
+So this pass asked whether the frame is limited by the runtime's per-call cost.
+
+Result first: **the first area already holds 39-58 fps, average 45, with no
+second below 30 and no Present over 50 ms** (140 s of gameplay, overlay
+detached). The experiments below are recorded as negatives so nobody repeats
+them.
+
+| build | first area (t >= 150 s) | min | max | avg | < 30 fps | Present > 50 ms |
+|---|---|---|---|---|---|---|
+| `/O1`, `volatile`, before Korra-0007 | 135 s | 39 | 58 | 44.9 | 0 s | 0 |
+| `/O1`, `volatile`, after Korra-0007 | 135 s | 39 | 58 | 45.3 | 0 s | 0 |
+| `/O1`, `RECOMP_MEM_QUAL` empty | 140 s | 40 | 58 | 45.7 | 0 s | 0 |
+
+- **Korra-0007 (`pcrecomp` `82495cb`) is neutral.** The machine-lock hand-over
+  does 3 `TlsGetValue` calls and a `GetLastError` clobber per bridge crossing,
+  and woke all waiters on every release even with an empty queue; replacing the
+  slot with a `__declspec(thread)` pointer, waking only when a ticket is queued,
+  and spinning 4096 times before sleeping changed the frame time by nothing
+  measurable. Kept because the removals are unconditional, recorded because it
+  is not a win.
+- **Dropping `volatile` from guest memory is neutral too** (45.7 vs 45.3),
+  although the binary shrinks 131.8 MB -> 109.5 MB (17 %): the compiler merges
+  and keeps loads, which is the point of the `RECOMP_MEM_QUAL` note in the
+  runtime header, but the frame does not care. It stays an opt-in switch
+  (`scripts\build_host.ps1 -Fast`, separate `build\obj-fast` tree and
+  `build\korra_recomp_fast.exe`), not the default: the default build keeps the
+  conservative semantics that have been validated by every run so far.
+- **`/O2` cannot be used at all**: `recomp_0021.c` and `recomp_0035.c` (~90 MB
+  each) die with `C1002: out of heap space in pass 2` and `cl` raises `D8040`;
+  `/Zm1200` does not help. Recorded in the AGENTS ledger so it is not retried.
+- **What the frame actually is**, unchanged by all of the above: 25 ms with the
+  main thread waiting 16-21 ms on 34 `ReleaseSemaphore`/`WaitForSingleObject`
+  handshakes to the engine's worker threads (callers `0x740CC0`, `0x741410`).
+  Those workers run lifted guest code, and the runtime serialises all lifted
+  code under one machine lock, so the frame costs the *sum* of the workers'
+  guest work. Neither faster instructions nor a cheaper hand-over changes that,
+  which points at the single-lock design, not at codegen.
+- **Still unexplained, harmless at this target:** the first area alternates
+  between ~17.5 ms frames (57 fps) and ~25 ms frames (40 fps) on a regular ~9 s
+  cycle with the *same* ~2,200 bridged calls per frame. Candidates left are the
+  Windows scheduler placing 24 guest threads on P/E cores, a guest periodic task,
+  or the game's own auto-save. It never drops below 39 fps, so it does not gate
+  the 30-40 target; a run with affinity control and the `mhz` column that
+  `perf_probe` now prints would settle it.
+- **What a real 60 needs (recorded, not attempted):** the register file
+  (`g_eax`, `g_esp`, the x87/SSE state) is global and `mach_enter`/`mach_leave`
+  save and reload it around every native call so that another guest thread can
+  run in the gap. Making that state thread-local is what would let the engine's
+  24 threads run on 24 cores instead of one at a time. That is a runtime
+  redesign affecting every pcrecomp host, not a host fix, and it does not block
+  M3.
