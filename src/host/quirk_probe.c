@@ -339,3 +339,161 @@ void korra_msg_probe_init(void) {
     recomp_trace_extra = msg_trace_hook;
     fprintf(stderr, "[msg] dispatcher trace on (0x%08X)\n", KORRA_MSG_DISPATCH);
 }
+
+/* --------------------------------------------------- new-game crash timeline
+ * KORRA_TRACE_CRASH=1 prints one ordered timeline of the values that decide the
+ * new-game crash, instead of the seven separate runs it took to collect them by
+ * hand. Two halves, because the two questions are different shapes:
+ *
+ *  - --poison reports a change between two function entries, so it silently
+ *    misses an A -> B -> A round trip inside one frame. Here a set of dwords is
+ *    sampled at every entry and any difference is printed with the function that
+ *    is being entered, so the round trip is visible.
+ *  - the named sites print the registers that matter at the point they are
+ *    live: ECX at the step dispatcher is the step id, and the globals around it
+ *    are the stage mode, the UI visibility word and the published player.
+ *
+ * The crash is the HUD widget reading 0xCA3E58 when it is null, and 0xCA3E58 is
+ * written only by the stage publish in 0x0058DAB0, so the timeline answers
+ * whether the publish ran, with which stage mode, and whether the player it
+ * looked for was in the scene. Nothing here changes target state.
+ *
+ * Needs -DRECOMP_TRACE (scripts\build_host.ps1 -Trace). */
+#define CRASH_WATCH_MAX 10
+#define CRASH_LOG_MAX   80
+
+static struct { uint32_t addr, last; unsigned count; } g_cw[CRASH_WATCH_MAX];
+static unsigned g_cw_n;
+
+/* 0xCA3E58 and friends only exist once the guest image is mapped, and
+ * RECOMP_ENTER fires before that (the CRT's first entries are at low VAs), so
+ * nothing is sampled until a real image address is entered. */
+static int g_crash_live;
+
+static unsigned g_site_calls[12];
+
+static int crash_site_budget(int slot, unsigned cap) {
+    if (g_site_calls[slot]++ >= cap) return 0;
+    return 1;
+}
+
+static void crash_watch(uint32_t addr) {
+    if (g_cw_n < CRASH_WATCH_MAX) {
+        g_cw[g_cw_n].addr = addr;
+        g_cw[g_cw_n].last = 0;
+        g_cw[g_cw_n].count = 0;
+        g_cw_n++;
+    }
+}
+
+/* The step name is a C string in a fixed buffer; the sequence machine compares
+ * it against literal stage names, so printing it turns a bare id into a name. */
+static void print_step_name(void) {
+    char buf[40];
+    unsigned i;
+    for (i = 0; i < sizeof buf - 1; i++) {
+        char c = (char)MEM8(0xE38A8C + i);
+        buf[i] = c;
+        if (!c) break;
+    }
+    buf[sizeof buf - 1] = 0;
+    fprintf(stderr, " name=\"%s\"", buf);
+}
+
+static void crash_site(const char *what, uint32_t va, int with_step, int with_name) {
+    fprintf(stderr, "[crash] %-13s va=0x%08X", what, va);
+    if (with_step) fprintf(stderr, " step=0x%08X", g_ecx);
+    fprintf(stderr, " player=0x%08X ui=0x%08X mode=%u phase=%u",
+            MEM32(0xCA3E58), MEM32(0xE381F8), MEM32(0xCA3AC0), MEM32(0xE562E4));
+    if (with_name) print_step_name();
+    fprintf(stderr, "\n");
+}
+
+static void crash_probe_hook(uint32_t va) {
+    unsigned i;
+
+    if (!g_crash_live) {
+        if (va < 0x00400000u) return;
+        g_crash_live = 1;
+        /* First live sample defines the baseline: a zero-initialised `last`
+         * would report a bogus transition for every address. */
+        for (i = 0; i < g_cw_n; i++) g_cw[i].last = MEM32(g_cw[i].addr);
+        fprintf(stderr, "[crash] baseline player=0x%08X ui=0x%08X mode=%u phase=%u step=0x%08X\n",
+                MEM32(0xCA3E58), MEM32(0xE381F8), MEM32(0xCA3AC0),
+                MEM32(0xE562E4), MEM32(0xE38A84));
+        return;
+    }
+
+    for (i = 0; i < g_cw_n; i++) {
+        uint32_t v = MEM32(g_cw[i].addr);
+        if (v == g_cw[i].last) continue;
+        if (g_cw[i].count++ < CRASH_LOG_MAX) {
+            fprintf(stderr, "[crash] 0x%08X: 0x%08X -> 0x%08X (entry 0x%08X)\n",
+                    g_cw[i].addr, g_cw[i].last, v, va);
+            if (g_cw[i].addr == 0xE38A84 || g_cw[i].addr == 0xE38AB0) print_step_name();
+            fprintf(stderr, "\n");
+        }
+        g_cw[i].last = v;
+    }
+
+    switch (va) {
+    case 0x0053BE60u:  /* app/sequence state machine */
+        if (crash_site_budget(0, 120)) crash_site("seq", va, 0, 1);
+        break;
+    case 0x0058DAB0u:  /* stage publish: writes 0xCA3E58 */
+        if (crash_site_budget(1, 120)) crash_site("publish", va, 1, 1);
+        break;
+    case 0x0058EE10u:  /* stage UI setup, returns early when player is null */
+        if (crash_site_budget(2, 40)) crash_site("stage-ui", va, 0, 0);
+        break;
+    case 0x0058E730u:  /* stage release: clears 0xCA3E58 */
+        if (crash_site_budget(3, 20)) crash_site("release", va, 0, 0);
+        break;
+    case 0x0058DC70u:  /* per-step UI visibility flags */
+        if (crash_site_budget(4, 120)) crash_site("ui-flags", va, 1, 0);
+        break;
+    case 0x00541FB0u:  /* queues a step id */
+        if (crash_site_budget(5, 80)) crash_site("queue-step", va, 1, 0);
+        break;
+    case 0x00541870u:  /* movie/cutscene machine */
+        if (crash_site_budget(6, 10)) crash_site("movie", va, 0, 0);
+        break;
+    case 0x00602D80u:  /* UIPlHpBendingIcon ctor */
+        if (crash_site_budget(7, 20)) crash_site("hud-ctor", va, 0, 0);
+        break;
+    case 0x00603C00u:  /* UIPlHpBendingIcon update: reads 0xCA3E58 */
+        if (crash_site_budget(8, 20)) crash_site("hud-update", va, 0, 0);
+        break;
+    case 0x00503BD0u:  /* player spawn request */
+        if (crash_site_budget(9, 20)) crash_site("player-spawn", va, 0, 0);
+        break;
+    default:
+        break;
+    }
+}
+
+/* A clean early quit is the one failure mode the fault report cannot explain:
+ * ExitProcess takes the process down with code 0 and no stack. The entry ring
+ * still holds the last calls, so print it on the way out. */
+static void crash_exit_hook(uint32_t target, uint32_t *args) {
+    const char *name = native32_name(target);
+    if (!name || !strstr(name, "ExitProcess")) return;
+    recomp_dump_trace("ExitProcess");
+    fprintf(stderr, "[exit] guest stack (esp=0x%08X):", g_esp);
+    for (int k = 0; k < 0x40; k += 4) fprintf(stderr, " %08X", MEM32(g_esp + k));
+    fprintf(stderr, "\n");
+}
+
+void korra_crash_probe_init(void) {
+    extern void (*recomp_trace_extra)(uint32_t va);
+    if (!getenv("KORRA_TRACE_CRASH")) return;
+    crash_watch(0xCA3E58);   /* published BehaviorPlayer */
+    crash_watch(0xE381F8);   /* UI visibility word */
+    crash_watch(0xCA3AC0);   /* stage/game mode */
+    crash_watch(0xE562E4);   /* app phase */
+    crash_watch(0xE38A84);   /* current step id */
+    crash_watch(0xE38AB0);   /* pending step id */
+    recomp_trace_extra = crash_probe_hook;
+    native32_pre_hook = crash_exit_hook;
+    fprintf(stderr, "[crash] new-game crash timeline on\n");
+}

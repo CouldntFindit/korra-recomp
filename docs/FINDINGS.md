@@ -740,3 +740,129 @@ This needs an RE pass, not more runs:
 3. For the text: find the glyph-draw function (it consumes the same message-box
    strings) and dump the quad it builds; a sane quad points at the texture, a
    degenerate one at the lifted per-glyph maths.
+
+## 2026-11-20 (night) - the new-game crash, mechanically
+
+The earlier entry reduced the crash to "step 0x710 is never dispatched". That was
+the right observation about the wrong mechanism. Reading the dispatcher and the
+state machine end to end (lifted C plus one instrumented run) gives the actual
+chain, and it is shorter than it looked.
+
+### What the step dispatcher actually is
+
+`sub_0053BE60` is the **cutscene/movie sequencer** (its only caller is
+`sub_00541870`, the USM player state machine, and its state 8 compares the
+current step name against `"Cutscene_01"`, `"Cutscene_02"`,
+`"Tree of Time - Part 2"` and fires the `se_stage_start` sound). Once per cycle
+its state 3 does:
+
+    sub_005C1AC0()                  ; rotate the step registers
+    sub_0058DAB0(0xE38AB0)          ; apply the step to the scene
+
+so `0xE38AB0` is the **pending step id**, `0xE38A84` the current one, `0xE38A8C`
+its name string, and `0xCA3838` the sequencer's own 0..9 state.
+
+`sub_0058DAB0(step)` then:
+
+- `0x710` only selects a *priority* by comparing the step name with `"Port"`,
+  `"Start"`, `"PBL"` (10 / 20 / 0) and stores it in a local that nothing reads
+  again. **It is not the branch that fills the player pointer.**
+- `0xF00..0xF02` **return immediately** - an explicit no-op family.
+- **Every other id** falls through to the common tail, which is the part that
+  matters:
+
+      sub_005201D0("Player", 0x10000 + mode, &s)  ; scene object for the Player
+      if (that == 0) return                       ; nothing published
+      iface = obj[0x48]                           ; the Player's behaviour slot
+      walk iface's type chain for 0x9DEE90        ; BehaviorPlayer's type token
+      0xCA3E58 = match or 0                       ; <- the global HUD reads
+      0xE381F8 &= ~0xC0                           ; clear the "hide HUD" bits
+      sub_0058EE10()                              ; build the stage UI
+
+`sub_0058EE10` opens with `if (0xCA3E58 == 0) return;`, so a *missing player*
+does not build the stage UI. The HUD that crashes is therefore built elsewhere,
+and `sub_0058DC70(step)` is how it becomes visible: for each step family it ORs
+bits into `0xE381F8` - `0x110`/`0xA10` set `0x80` (hide, cutscene), `0x210`/`0x310`
+set low bits, `0x410` `0x3`, `0x510` `0x7`, `0x610` `0xF`, **`0x710` `0x1F`**
+(the full HP / bending icon set), `0x810` `0x3F`.
+
+### Why the crash is exactly a null player
+
+`sub_00603C00` (the `UIPlHpBendingIcon` update, mode 0) is:
+
+    0x00603C23  eax = [0xCA3E58]
+    0x00603C2A  if (eax == 0) goto 0x00603C3C
+    0x00603C2C      ecx = eax + 0x2CD4 ; call [[ecx]+0x1C]
+    0x00603C3C  ecx = 0                 <- the "null" branch
+    0x00603C3E      eax = [ecx]         <- read of 0x00000000: the reported fault
+    0x00603C40      call [[eax]+0x1C]
+
+The shipped binary has the same null dereference, so this is a *state invariant*
+the game trusts, not a missing null check. The port reaches the HUD update with
+`0xCA3E58 == 0`.
+
+### What one instrumented run showed (`KORRA_TRACE_CRASH=1`)
+
+Menu phase, mode `0xCA3AC0 = 2`, current step `0xF00`, name `"START"`:
+
+    publish  step=0x00000F00   -> returns immediately (0xF00 is a no-op id)
+    ui-flags step=0x00000F00   -> falls through the tag chain
+    0xE381F8: 0 -> 0x40
+
+i.e. in the menu the scene is never re-published and `0xCA3E58` is never
+written. The earlier poison runs also saw `0xA10` dispatched once - that is the
+new-game cutscene step, and it takes the *common tail* above: it clears the
+"hide HUD" bits, publishes whatever `obj[0x48]` is, and that is null. The HUD
+becomes visible and the next `sub_00603C00` reads `0xCA3E58 == 0`.
+
+So the defect is one specific datum, not a dispatch gate:
+
+> when the new-game cutscene step is applied, the Player scene object's `+0x48`
+> is either null or is not a `BehaviorPlayer` (its type chain does not contain
+> `0x9DEE90`), so the publish stores 0 and the HUD still un-hides.
+
+That is the next instrument: the crash probe already prints the publish with its
+step id; the missing piece is `obj[0x48]` and the first two links of its type
+chain, which is a `--chase`-shaped read at `0x0058DAB0`.
+
+### Blocker hit while verifying: both binaries now quit during startup
+
+From ~03:24 every run - the port **and the original `LoK.exe`** - ends with
+`ExitProcess(0)` about 0.4 s in, before the audio device exists, and the guest
+CRT then runs its destructor table. `[exit] ExitProcess` now dumps the entry ring
+and the guest stack, which is how the shutdown table was identified.
+
+Facts collected before stopping:
+
+- it is **not** our code: the unmodified original fails identically, and the port
+  failed the same way with and without the new probe;
+- it started intermittently (~03:16, roughly 1 boot in 6) and became consistent
+  at ~03:24; two clean boots at 03:20 and 03:23:48 bracket the change;
+- not the save directory (removed `<Documents>\Korra`, no change), not the
+  shim count (174 native / 20 shimmed with `KORRA_PAD`, 177/17 without - that
+  difference is just the synthetic-pad shims), not windowed-vs-fullscreen;
+- the desktop moved from 1920x1080 to **1920x1200 on the Intel UHD iGPU**; the
+  machine is a hybrid laptop (RTX 5050 + Intel) and both engines pick their D3D9
+  adapter from the desktop's, so a display/GPU-mode change is the leading
+  suspect and is outside this repo;
+- audio endpoints still enumerate (Realtek/NVIDIA/Steam streaming/SteelSeries
+  virtual devices all `OK`).
+
+Dead ends: rebuilding the trace target, `KORRA_PAD` on/off, windowed/fullscreen,
+deleting the save directory, waiting 12 s between runs. None changed it.
+
+### Harness that came out of this (kept)
+
+- `src/host/quirk_probe.c`: `KORRA_TRACE_CRASH=1` - a timeline of the dwords that
+  decide this crash (`0xCA3E58`, `0xE381F8`, `0xCA3AC0`, `0xE562E4`, `0xE38A84`,
+  `0xE38AB0`), sampled at every function entry so an A->B->A round trip inside one
+  frame is visible (which `--poison` cannot see), plus named sites (publish,
+  stage-UI, release, ui-flags, step queue, HUD ctor/update, player spawn) that
+  print ECX, the step name and the surrounding globals.
+- `src/host/exit_probe.c`: `ExitProcess` now dumps the entry ring and the guest
+  stack. A clean `exit(0)` used to leave no evidence at all.
+- `scripts/run_until_crash.ps1`: boots, focuses, sends the one Escape that skips
+  the intro movies, and **retries boots that abort in the first second** - so an
+  unattended run does not spend its budget on a dead window.
+- `scripts/probe_input.ps1`: `-Exe` / `-Extra`, so the trace build can be driven
+  by the same harness.
