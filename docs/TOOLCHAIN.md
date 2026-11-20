@@ -9,6 +9,7 @@ its commit `b278e8a` is not fetchable — this pin supersedes it.
 | Repo | https://github.com/sp00nznet/pcrecomp (note: `sp00nznet`, not `sp00z`) |
 | Base commit | `35548b8` — *disasm32: straight-line code longer than the scan window is decoded to its end (#50)*, upstream HEAD on 2026-10-04 |
 | Branch used here | `korra-base` (local) |
+| Branch head | **`5cfccf3`** (2026-11-20) — `35548b8` + patches `0001…0014` + MP2-0001 + Korra-0001…0006 |
 | Patch series | `nfsu2-recompiled/patches/pcrecomp/0001…0014` — all apply cleanly, in order, on `35548b8` |
 | Extra patch | `maxpayne2/patches/pcrecomp/0001-seh-frames-and-or-xor-conditions.patch` — applies cleanly on top |
 | pcrecomp `main` @ 2026-11-18 | **not usable**: only patch 0001 applies, the rest conflict (the runtime was restructured: `native32` split, `difftest.py` moved). Do not "just upgrade". |
@@ -46,6 +47,8 @@ What the patch series buys us (from its own subjects):
 | **Korra-0002** (ours, `346a509`) | `lift32`: `cmpxchg` / `cmpxchg8b` (MSVC interlocked ops, 162 sites) and capstone's `fcomi`/`fcompi`/`fucomi`/`fucompi` names (430 sites) |
 | **Korra-0003** (ours, `d3f7803`) | `lift32` + `recomp_types.h`: `bsf` / `bsr` and portable `RECOMP_BSF/BSR` |
 | **Korra-0004** (ours, `b0b2ce2`) | `lift32` + `recomp_types.h`: `pcmpistri` carries **SF and OF** as well as ZF/CF, packed into `FK_EFLAGS` via `recomp_pcmp_eflags`. Without it every `ja`/`jae`/`jno`/`jns` after a `pcmpistri` was a constant, so MSVC's SSE4.2 `strstr` could never accept a match (6 sites in LoK; 0 lift failures) |
+| **Korra-0005** (ours, `dc18f83`) | `recomp_types.h`: portable `pcmpistri` rewritten — all four data formats (word mode `0x0D` included), the equal-ordered validity window (empty needle ⇒ index 0/CF=1; needle must fit before `b`'s null), the equal-each lane mask along the longer operand, masked-polarity XOR on `b`'s valid lanes, and hardware ZF/CF/SF/OF (SF = "any null in `a`", not IntRes2[15]). Word mode returns the element index; the lifted code applies its own `*2`. **No relift** — recompile only |
+| **Korra-0006** (ours, `5cfccf3`) | `lift32` + `recomp_types.h`: `FCOMI/FCOMIP/FUCOMI/FUCOMIP` publish their EFLAGS image via `recomp_fcomi_eflags`, so `LAHF`/`PUSHFD` after the compare report ZF/PF/CF instead of the flags of an earlier instruction (8 real `fucompi; fstp st(0); lahf` sites). **Codegen change — requires a relift** (37,029/37,029, 0 failures) |
 
 ## Local environment
 
