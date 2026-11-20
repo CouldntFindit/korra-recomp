@@ -80,6 +80,17 @@ static unsigned g_slow_ms = 50;
 static unsigned g_eip_ms = 8;
 static unsigned g_tops = 6;
 
+/* World-state watches (KORRA_PERF_WATCH=0xE38A84,0xE38A54): a dword whose change
+ * is printed with the elapsed time and the frame it happened in. That is how the
+ * frame-rate/logic question is answered - the same scene transition at cap 30
+ * and cap 60 either takes the same wall time (the sim is time-based) or twice
+ * the wall time for the same frame count (it is frame-stepped). */
+#define WATCH_MAX 4
+static uint32_t g_watch[WATCH_MAX];
+static uint32_t g_watch_last[WATCH_MAX];
+static int      g_watch_n;
+static int      g_watch_have;
+
 /* ------------------------------------------------------------ guest memory */
 static int readable(uint32_t va, size_t n) {
     MEMORY_BASIC_INFORMATION mbi;
@@ -513,6 +524,24 @@ static DWORD WINAPI perf_thread(LPVOID unused) {
             frames++;
             idle_seconds = 0;
 
+            /* Watched state, printed with the wall clock and the frame it
+             * changed in: the delta-timing evidence. */
+            if (g_watch_n) {
+                int w;
+                for (w = 0; w < g_watch_n; w++) {
+                    uint32_t now_v = rd32(g_watch[w]);
+                    if (!g_watch_have) g_watch_last[w] = now_v;
+                    else if (now_v != g_watch_last[w]) {
+                        fprintf(stderr, "[perf] watch@0x%08X t=%.1fs f=%u %u -> %u\n",
+                                (unsigned)g_watch[w], elapsed_s(), frame_no,
+                                (unsigned)g_watch_last[w], (unsigned)now_v);
+                        fflush(stderr);
+                        g_watch_last[w] = now_v;
+                    }
+                }
+                g_watch_have = 1;
+            }
+
             if (frame_no <= g_frame_budget || dt_ms >= (double)g_slow_ms) {
                 int k;
                 fprintf(stderr, "[perf] t=%.1fs f=%u dt=%.1fms cpu=%.1fms nat=%.1fms calls=%u present=%u int=%u mode=%u flags=0x%X",
@@ -703,6 +732,13 @@ void korra_perf_probe_init(void) {
     if ((v = getenv("KORRA_PERF_TOPS")) != NULL) {
         long n = strtol(v, NULL, 0);
         if (n > 0 && n <= EIP_MAX) g_tops = (unsigned)n;
+    }
+    if ((v = getenv("KORRA_PERF_WATCH")) != NULL) {
+        const char *p = v;
+        while (*p && g_watch_n < WATCH_MAX) {
+            g_watch[g_watch_n++] = (uint32_t)strtoul(p, (char **)&p, 0);
+            while (*p == ',' || *p == ' ') p++;
+        }
     }
 
     g_main_tid = GetCurrentThreadId();
