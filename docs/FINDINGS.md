@@ -1587,3 +1587,68 @@ Also measured: the 40<->57 fps oscillation is **not** a CPU power state - the
 per-second `mhz=` column alternates 1520/2400 with no correlation to the frame
 rate in either direction, including while pinned at 30 fps. The oscillation
 stays unexplained and harmless at this bar (it never goes below ~39 uncapped).
+
+## 2026-11-20 (later) - two correctness defects behind the perf work, both fixed and verified
+
+The perf pass left two things open that were *not* performance problems. Both are
+now closed, and both were found by looking at the log rather than by guessing.
+
+### 1. memcpy silently copied nothing (lifter catalog, `pcrecomp` Korra-0008)
+
+`sub_0077A440` is the CRT's SSE4.2 memcpy. Its remainder dispatch is
+`jmp dword ptr [ecx*4 + 0x77A8C4]` with `ecx` from **-7 to 0**, so seven of the
+table's eight arms sit *below* the displacement. `disasm32.table_entries` read a
+table only upward, so those arms never became block leaders, the lifted switch
+fell through to `RECOMP_ITAIL`, and the dispatch table has no entry for a
+mid-function address: the jump resolved to nothing and the call returned with
+**no copy performed**. The log line was `ITAIL: unresolved VA 0x0077A8E0 from
+0x0077A440`, seen twice in one gameplay run.
+
+Fix: `table_entries` now also reads the contiguous run of code addresses below
+the displacement (stop at the first non-code entry, refuse an entry that points
+into the table itself, keep every arm within 0x40000 of the table - the same
+extent cap the linear walk uses). `generate.py` already did this for extent
+discovery; the disassembler did not, and the catalog is built from the
+disassembler.
+
+Effect: catalog **37,029 -> 37,327** functions (+298 reachable only through those
+arms), lift **37,327/37,327, 0 failures**, 12,652,837 lines, 118.8 s.
+`sub_0077A440` now has 30 arms and 102 blocks. Verified in a 368 s run: **zero
+`ITAIL: unresolved` lines** (previously two, plus whatever was resolved to the
+wrong place silently).
+
+### 2. every long run died at ~5 minutes (Steam stub ABI, `src/host/steam_stub.c`)
+
+`sub_0076C1C0` enumerates the engine's own achievement table (`0x9CF92C`, stride
+`0x190`, entries `"ACHIEVEMENT_0"`, `"ACHIEVEMENT_1"`, ...) and calls
+
+    ISteamUserStats::GetAchievement(const char *name, bool *achieved)
+
+- slot 6, vtable offset 0x18, **two** stack arguments. The stub's
+  `ISteamUserStats` object answered every slot with the `ISteamUser`
+  **one-argument** body, so the call returned NULL *and* popped 4 bytes instead of
+  8. The guest's `esp` ended 4 short, and the next member read faulted at `[0x11]`
+  in `sub_0076C590` (guest `0x0076C590`, host `0x63D66xxx`), after
+  `[steam] ISteamUser: unimplemented slot reached`.
+
+Fix: the stats object now has the real 2014 `ISteamUserStats` shape, each slot
+its own thunk with the matching `ret N` - `GetAchievement` (slot 6) answers
+"query ok, not unlocked", `GetStat` zeroes its out parameter, `SetStat` /
+`SetAchievement` / `ClearAchievement` / `StoreStats` accept and ignore, the string
+getters return `""`. Unreachable slots keep a loud log and consume one argument.
+
+Verified: the same scripted run that died at 292-320 s every time now reaches
+**t=368 s** and is still playing (`build\shots\perf13_26_noop.png`, t=312 s).
+
+### Frame-rate cap and the logic-rate question
+
+`KORRA_FPS=40` for this run. First area (t >= 150 s, 218 one-second samples):
+**min 29, max 39, average 37.6** present/s - the cap holds.
+
+Not verified, stated so nobody assumes otherwise: whether the simulation is
+delta-timed. The engine ships a 30 fps mode of its own (`DAT_00e4d210`), so 30 is
+a supported rate, and the loop reads a QPC clock each iteration; if any subsystem
+instead runs one fixed step per frame, gameplay would be ~33 % slow at 40 fps.
+The one test that settles it is timing a known-duration event (an intro movie, or
+the auto-save notice) at cap 30 vs cap 60 - wall-clock identical means
+time-based.

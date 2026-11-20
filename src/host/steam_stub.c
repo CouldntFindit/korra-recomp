@@ -196,28 +196,171 @@ static steam_object g_user = { g_user_vtbl, 0x49535552u };  /* "ISUR" */
 static steam_object g_stats = { NULL, 0x49535354u };        /* "ISST" */
 
 /* ================================================== ISteamUserStats object
- * Never called by this binary. Every slot answers "0" and logs, so a future
- * call site is visible in the log instead of crashing. The arity is unknown by
- * construction, so an unimplemented_stats entry consumes one argument - the
- * shape of every plausible first call (RequestCurrentStats() takes none, so
- * even that one is only reached through a call site that does not exist). */
+ * This is the object that ended every long run, and the failure was an ABI one:
+ * the engine enumerates its own achievement table (0x9CF92C, stride 0x190,
+ * entries "ACHIEVEMENT_0", "ACHIEVEMENT_1", ...) in sub_0076C1C0 and calls
+ *
+ *     ISteamUserStats::GetAchievement(const char *name, bool *achieved)
+ *
+ * which is slot 6 (vtable offset 0x18) with TWO stack arguments. This object
+ * used to answer every slot with the ISteamUser 1-argument body, so the call
+ * returned NULL *and* popped 4 bytes instead of 8: the guest's esp ended up 4
+ * short and the next member read faulted at [0x11] (guest sub_0076C590). The
+ * arity must match per slot, so each slot below has its own thunk that returns
+ * with the right `ret N` - that is the whole bug.
+ *
+ * Slot order is the 2014 ISteamUserStats. Achievements are not persisted: every
+ * query answers "query ok, not unlocked", and Set/Clear accept and ignore.
+ * Slots past 15 are not reachable from this binary (the achievement loop is the
+ * only stats call site); they log and consume one argument so a future call
+ * site is visible instead of silently corrupting the stack. */
+static char kEmptyString[1];   /* "" for the string getters */
+
+static void __declspec(naked) stats_RequestCurrentStats(void) {
+    __asm { mov eax, 1 }
+    __asm { ret }
+}
+
+/* bool GetStat(const char *name, int32 *out) / GetStat(const char*, float*) */
+static void __declspec(naked) stats_GetStat(void) {
+    __asm {
+        mov  ecx, dword ptr [esp + 8]
+        test ecx, ecx
+        je   short getstat_done
+        mov  dword ptr [ecx], 0
+    getstat_done:
+        xor  eax, eax
+        ret  8
+    }
+}
+
+/* bool SetStat(const char *name, int32 value) / SetStat(const char*, float) */
+static void __declspec(naked) stats_SetStat(void) {
+    __asm { mov eax, 1 }
+    __asm { ret 8 }
+}
+
+/* bool UpdateAvgRateStat(const char *name, float, double) - 16 bytes of args */
+static void __declspec(naked) stats_UpdateAvgRateStat(void) {
+    __asm { mov eax, 1 }
+    __asm { ret 16 }
+}
+
+/* bool GetAchievement(const char *name, bool *achieved): the call succeeds, the
+ * achievement is simply not unlocked. */
+static void __declspec(naked) stats_GetAchievement(void) {
+    __asm {
+        mov  ecx, dword ptr [esp + 8]
+        test ecx, ecx
+        je   short getach_done
+        mov  byte ptr [ecx], 0
+    getach_done:
+        mov  eax, 1
+        ret  8
+    }
+}
+
+/* bool SetAchievement(const char *) / ClearAchievement(const char *) */
+static void __declspec(naked) stats_OneName(void) {
+    __asm { mov eax, 1 }
+    __asm { ret 4 }
+}
+
+/* bool GetAchievementAndUnlockTime(const char*, bool*, uint32*) */
+static void __declspec(naked) stats_AchievementAndTime(void) {
+    __asm {
+        mov  ecx, dword ptr [esp + 8]
+        test ecx, ecx
+        je   short gaut_b
+        mov  byte ptr [ecx], 0
+    gaut_b:
+        mov  ecx, dword ptr [esp + 12]
+        test ecx, ecx
+        je   short gaut_done
+        mov  dword ptr [ecx], 0
+    gaut_done:
+        xor  eax, eax
+        ret  12
+    }
+}
+
+/* bool StoreStats() */
+static void __declspec(naked) stats_StoreStats(void) {
+    __asm { mov eax, 1 }
+    __asm { ret }
+}
+
+/* int GetAchievementIcon(const char *) */
+static void __declspec(naked) stats_GetAchievementIcon(void) {
+    __asm { xor eax, eax }
+    __asm { ret 4 }
+}
+
+/* const char *GetAchievementDisplayAttribute(const char*, const char*) */
+static void __declspec(naked) stats_DisplayAttribute(void) {
+    __asm { mov eax, offset kEmptyString }
+    __asm { ret 8 }
+}
+
+/* bool IndicateAchievementProgress(const char*, uint32, uint32) */
+static void __declspec(naked) stats_IndicateProgress(void) {
+    __asm { mov eax, 1 }
+    __asm { ret 12 }
+}
+
+/* uint32 GetNumAchievements() - the engine drives its own table, so 0 is safe */
+static void __declspec(naked) stats_GetNumAchievements(void) {
+    __asm { xor eax, eax }
+    __asm { ret }
+}
+
+/* const char *GetAchievementName(uint32) */
+static void __declspec(naked) stats_GetAchievementName(void) {
+    __asm { mov eax, offset kEmptyString }
+    __asm { ret 4 }
+}
+
+/* Unreachable slots: name the object in the log, consume one argument. */
 static void *__fastcall stats_unimplemented(void *self, void *arg1, void *arg1_dup) {
     (void)self; (void)arg1; (void)arg1_dup;
     if (g_verbose)
-        steam_log("ISteamUserStats: method called but stubbed - returning 0. "
-                  "Add the real signature in steam_stub.c");
+        steam_log("ISteamUserStats: unreachable slot reached - returning 0. "
+                  "Add its real signature (and arity) in steam_stub.c");
     return NULL;
 }
 
 #define STATS_SLOTS 40
 static steam_vt_fn g_stats_vtbl[STATS_SLOTS];
 
+/* Slot order of the 2014 ISteamUserStats; every entry returns with the arity
+ * the guest pushed, which is what the old one-arg table got wrong. */
+static const steam_vt_fn g_stats_shape[16] = {
+    /* 0x00 RequestCurrentStats()                    */ (steam_vt_fn)stats_RequestCurrentStats,
+    /* 0x04 GetStat(const char*, int32*)             */ (steam_vt_fn)stats_GetStat,
+    /* 0x08 GetStat(const char*, float*)             */ (steam_vt_fn)stats_GetStat,
+    /* 0x0C SetStat(const char*, int32)              */ (steam_vt_fn)stats_SetStat,
+    /* 0x10 SetStat(const char*, float)              */ (steam_vt_fn)stats_SetStat,
+    /* 0x14 UpdateAvgRateStat(const char*, float, double) */ (steam_vt_fn)stats_UpdateAvgRateStat,
+    /* 0x18 GetAchievement(const char*, bool*)       */ (steam_vt_fn)stats_GetAchievement,
+    /* 0x1C SetAchievement(const char*)              */ (steam_vt_fn)stats_OneName,
+    /* 0x20 ClearAchievement(const char*)            */ (steam_vt_fn)stats_OneName,
+    /* 0x24 GetAchievementAndUnlockTime(name, bool*, uint32*) */ (steam_vt_fn)stats_AchievementAndTime,
+    /* 0x28 StoreStats()                             */ (steam_vt_fn)stats_StoreStats,
+    /* 0x2C GetAchievementIcon(const char*)          */ (steam_vt_fn)stats_GetAchievementIcon,
+    /* 0x30 GetAchievementDisplayAttribute(name, key) */ (steam_vt_fn)stats_DisplayAttribute,
+    /* 0x34 IndicateAchievementProgress(name, u32, u32) */ (steam_vt_fn)stats_IndicateProgress,
+    /* 0x38 GetNumAchievements()                     */ (steam_vt_fn)stats_GetNumAchievements,
+    /* 0x3C GetAchievementName(uint32)               */ (steam_vt_fn)stats_GetAchievementName,
+};
+
 void *steam_stub_user_object(void) { return &g_user; }
 
 void *steam_stub_stats_object(void) {
     int i;
     if (!g_stats.vtbl) {
-        for (i = 0; i < STATS_SLOTS; i++) g_stats_vtbl[i] = (steam_vt_fn)user_vt_unimpl;
+        for (i = 0; i < STATS_SLOTS; i++) g_stats_vtbl[i] = (steam_vt_fn)stats_unimplemented;
+        for (i = 0; i < (int)(sizeof g_stats_shape / sizeof g_stats_shape[0]); i++)
+            g_stats_vtbl[i] = g_stats_shape[i];
         g_stats.vtbl = g_stats_vtbl;
     }
     return &g_stats;
