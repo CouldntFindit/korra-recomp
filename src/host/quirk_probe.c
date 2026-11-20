@@ -467,6 +467,14 @@ static void crash_probe_hook(uint32_t va) {
     case 0x00503BD0u:  /* player spawn request */
         if (crash_site_budget(9, 20)) crash_site("player-spawn", va, 0, 0);
         break;
+    case 0x005201D0u:  /* the "Player" scene-object lookup itself */
+        if (crash_site_budget(10, 40))
+            fprintf(stderr, "[crash] scene-lookup va=0x005201D0 mode=%u\n", MEM32(0xCA3AC0));
+        break;
+    case 0x0040F6F0u:  /* publish tail: only reached when the object was non-null */
+        if (crash_site_budget(11, 40))
+            fprintf(stderr, "[crash] publish-tail va=0x0040F6F0 player=0x%08X\n", MEM32(0xCA3E58));
+        break;
     default:
         break;
     }
