@@ -12,10 +12,10 @@ No emulator, no interpreter for the game's own code: every function of the
 original binary is translated ahead of time, and this project supplies the host
 side (Win32, D3D9 surface, XInput, XAudio2, CRI/Wwise audio, Steam stubs).
 
-> **Work in progress — pre-alpha.** Nothing is playable yet and there are no
-> releases. The Windows host currently boots the engine and renders through the
-> intro movies; the main menu is not reached yet. The milestone table below is
-> the source of truth for what works today.
+> **Work in progress.** The Windows path now boots, renders and plays: no Steam,
+> text renders, and the first area runs at 39-58 fps (30 fps cap is the Android
+> default). The Android port is next; there are no releases and no playable
+> Android build yet. The milestone table below is the source of truth.
 
 > **This repository contains no game content.** You must own and supply your own
 > copy of the PC game. Builds are produced locally by each builder from their own
@@ -23,15 +23,14 @@ side (Win32, D3D9 surface, XInput, XAudio2, CRI/Wwise audio, Steam stubs).
 
 ## Status
 
-*Last updated 2026-11-19. Current focus: M2 — the movie-to-menu transition and
-the XAudio2 stub blocker.*
+*Last updated 2026-11-20. Current focus: M3 — first arm64 frame on a device.*
 
 | Milestone | What it means | State |
 |---|---|---|
 | M0 | Environment, toolchain pin, repo bootstrap, PE gate | **done** (2026-11-19) |
 | M1 | Seeds + function catalog + full lift to C | **done**: 37,327/37,327 functions, 0 lift failures — see [`docs/LIFT_REPORT.md`](docs/LIFT_REPORT.md) |
-| M2 | Boots to the main menu on Windows (no Steam, silent, movies skipped) | **intro movies, title screen and menus render; the pad drives them.** Open: menu text does not draw, and the new-game transition crashes on a null manager (`sub_00603C00`). Ladder state in [`docs/HOST.md`](docs/HOST.md), log in [`docs/FINDINGS.md`](docs/FINDINGS.md) |
-| M3 | Boots and plays the first area on an Android arm64 device | not started (NDK not installed) |
+| M2 | Boots to the main menu on Windows (no Steam, silent, movies skipped) | **done (2026-11-20)** — boots without Steam, text renders, new game runs into the first area at 39-58 fps uncapped; the crash and missing-text defects had one cause (the lifter's `pcmpistri` flag model). Log: [`docs/FINDINGS.md`](docs/FINDINGS.md) |
+| M3 | Boots and plays the first area on an Android arm64 device | **prepared** — NDK 28.2 + Gradle scaffold builds green, portable `pcmpistri`/`FCOMI` verified algorithmically; first device run pending ([`docs/ANDROID_BRINGUP.md`](docs/ANDROID_BRINGUP.md)) |
 | M4 | Audio: Wwise + CRI behind a host mixer | spec ready ([`docs/audio.md`](docs/audio.md)), implementation not started |
 | M5 | Gameplay validation, framerate hooks, full playthrough | not started |
 
