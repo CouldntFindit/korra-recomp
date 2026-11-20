@@ -165,6 +165,34 @@ Append only; newest last. Format: date — attempt — outcome — next idea.
   topmost. The engine's keyboard path is DirectInput and it does not see injected
   input in this build; the XInput pad does. Do not spend time on synthetic
   keyboard input until the DInput device path is wired (M2.11).
+- 2026-11-20 — "The device vtable lives in `d3d9.dll`, so an object whose first
+  dword is not in the module range is not a D3D9 interface" — **false for this
+  d3d9**. `IDirect3D9::CreateDevice` returns a device whose vtable is a
+  heap-allocated thunk table (`0x3880A8FC` in the measured run) whose *entries*
+  are d3d9 code. Requiring the table itself to be inside the module silently
+  classified the device as "not ours". Check the entries, not the table.
+- 2026-11-20 — Hand-typing COM IIDs from memory — **cost two hours**. The typed
+  `IID_IDirect3DDevice9` was wrong in its last four bytes (`A43B0D92B9E4` vs the
+  SDK's `A43B0D82B9EB`), so `QueryInterface` answered `E_NOINTERFACE` on a real
+  device and the conclusion "the engine never calls a device" looked measured.
+  Copy GUIDs out of `d3d9.h` (and remember `DEFINE_GUID` only declares them: use
+  local `static const GUID` values or link `guid.lib`).
+- 2026-11-20 — **`KORRA_WINDOWED` never worked.** `quirk_probe.c` rewrites
+  `D3DPRESENT_PARAMETERS` when the call target is named
+  `"d3d9.dll!CreateDevice"`, but the runtime names only bridged *imports*; COM
+  methods have no name (`native32_name` returns NULL). So the game stayed
+  exclusive-fullscreen and **a second instance of the game cannot create a
+  device** (`ExitProcess` right after `SteamAPI_Init`, no window, no fault), which
+  made two parallel debug sessions kill each other's runs. Until this is fixed,
+  serialise game runs between sessions. The draw probe identifies
+  `CreateDevice` structurally instead (BehaviorFlags in {0x44,0x24}, DeviceType
+  in {HAL,REF}, readable 0x38-byte params, interface written to `args[6]`).
+- 2026-11-20 — Reading a texture back with `IDirect3DTexture9::LockRect` from
+  inside the bridge post-hook (first-draw pixel survey) — **killed the process**
+  at the first draw with no fault report in the log (subsequent runs with the
+  survey off survived 175 s). It is behind `KORRA_DRAWPATH_TEX=1` now and off by
+  default; do not combine it with a long session until the mechanism is
+  understood.
 
 
 ## 7. Reporting

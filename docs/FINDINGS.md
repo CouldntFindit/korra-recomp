@@ -905,3 +905,100 @@ design), and why it never ran on the way into `Cutscene_01`. The tooling is in
 place: `KORRA_TRACE_CRASH=1` prints `scene-lookup`, `publish`, `publish-tail`,
 `stage-ui` and the step name, so a candidate fix is confirmed by `publish-tail`
 appearing with a non-zero player.
+
+## 2026-11-20 - text defect: the glyph chain breaks before the draw call
+
+The port draws every fixed-shape UI element and no glyphs. The question was
+where the chain breaks: font asset -> glyph rasterisation -> texture creation ->
+draw call. Runtime evidence now answers it: **no glyph-shaped draw is ever
+submitted, and no 2D font atlas texture is ever created**. The draw call, the
+alpha test, the texture format and texture locking are all ruled out.
+
+Tool: `src/host/draw_probe.c` (new, host-only, inert unless `KORRA_DRAWPATH` is
+set). It rides `native32_post_hook`, which the runtime calls after every bridged
+native call - imports and COM methods alike - so every IDirect3DDevice9 call the
+lifted engine makes is observed with its argument slots and result.
+
+| Knob | Output |
+|---|---|
+| `KORRA_DRAWPATH=1` | per-frame draws/state, one line per distinct draw shape |
+| `KORRA_DRAWPATH_FROM=<frame>` | per-frame texture histogram, printed only when it changes |
+| `KORRA_DRAWPATH_FRAME=<frame>` | every draw of one frame |
+| `KORRA_DRAWPATH_TEX=1` | first-draw pixel survey of each texture (see the warning below) |
+
+### Four things that had to be right before it could see anything
+
+Each of these produced a *plausible* but wrong answer, so they are recorded here
+rather than left in the tool:
+
+1. `d3d9.dll`'s `SizeOfImage` was read from `lfanew[0x18]` (SizeOfStackReserve)
+   instead of `lfanew[0x14]`. The range came out as 0x40000 instead of
+   0x170000, so every device method address fell outside it.
+2. The device this d3d9 returns has a **heap-allocated thunk table** (vtable
+   `0x3880A8FC`, entries in `d3d9.dll`). "The vtable is inside d3d9.dll" is
+   false, and rejecting it hides the device completely.
+3. `IID_IDirect3DDevice9` was hand-typed and wrong in its last four bytes
+   (`A43B0D92B9E4` instead of the SDK's `A43B0D82B9EB`), so every
+   `QueryInterface` answered `E_NOINTERFACE` and the device never matched. The
+   probe now takes the GUID from `d3d9.h` (copied; `DEFINE_GUID` only declares).
+4. **COM methods have no name in the runtime's table** - only bridged *imports*
+   are named. `quirk_probe.c`'s `KORRA_WINDOWED` rewrite looks for
+   `"d3d9.dll!CreateDevice"` by name, so it never fires; the window stays
+   fullscreen and a second game instance cannot create a device at all, which
+   makes two parallel debug sessions impossible unless the first one is windowed
+   by other means. The probe identifies the call structurally instead
+   (BehaviorFlags in {0x44,0x24}, DeviceType in {HAL,REF}, a readable
+   `D3DPRESENT_PARAMETERS`, interface written to `args[6]`).
+
+### What the census shows at the title screen (frame 6000, 60 fps)
+
+```
+[draw] DEVICE 0x365C0BC0 vtbl 0x365C3B1C (Present=69F802A0 EndScene=69F06670
+        SetRenderState=69FC4FC0 SetTexture=69FBF450 DrawPrimitiveUP=69FBA750 ...)
+[draw] frame 6000 draws=22 up=0 vb=22 prims=52 texs=8 rt=3E982B20/30
+        begins=1 ends=1 fvf=0x0 vs=0x56F5D7C0 ps=0x00000000
+        abl=1 src=5 dst=6 zen=0 atest=1 afunc=1
+```
+
+- 22 draws per frame, **all single quads** (`type=5`, `prims=2`), all from two
+  leaves: `sub_00757200` (`DrawPrimitive`) and `sub_00757240`
+  (`DrawIndexedPrimitive`). Those two are the engine's textured-quad leaves -
+  they draw the movies, the logo, the ornaments and the brush stroke alike, so
+  the caller does not separate text from art.
+- Distinct textures drawn per frame: three 1920x1080 UI layers, `320x176` x6,
+  `80x48` x3, `48x32` x5, plus DDS art loaded through
+  `D3DXCreateTextureFromFileInMemoryEx`. During the transitions a `256x1`
+  gradient strip appears.
+- **No small square atlas is ever drawn**, and no draw uses a texture that was
+  created blank. A glyph batch (many quads sharing one atlas, or one quad per
+  glyph sharing one atlas) is absent from every frame of a 175 s run.
+- Every 256x256/1024x1024/128x128 texture the engine creates is paired with
+  `CreateRenderTarget` and is `0x72` (A16B16G16R16) or a shadow/effect target -
+  not a font page.
+
+So the text path stops at one of the first two steps: the font asset read (the
+engine's `cStringDevice`/`createCharSetManager()` strings and the `fontshader`
+shader name are in the binary, and `core/coreui.dat`+`.dtt` are the UI tables),
+or the per-glyph layout that would emit those quads.
+
+### Not verified
+
+- Whether the *string* is empty. An empty or unformatted string produces zero
+  glyphs and exactly this picture, and it is the cheapest remaining hypothesis:
+  every UI label in the game would be affected, while panels, ornaments and art
+  (which are not string-driven) would not. The message box the original shows
+  ("Wrong SteamID. Failed to load data.") is a formatted string, so a failed
+  string lookup in the port would leave the panel and drop the text.
+- Which function builds the text run. That needs the `cStringDevice` /
+  `CharSetManager` call graph, i.e. the REA/Ghidra lock this session does not
+  hold.
+- The pixel survey (`KORRA_DRAWPATH_TEX=1`) was written and is *not* in the
+  reported runs: locking a texture from inside the bridge hook killed one run
+  (process gone, no fault report, at the first draw). Do not enable it together
+  with a long session until that is understood.
+
+### Knob note for the next session
+
+`sig#N` lines dedupe on (kind, prims, texture, FVF, caller) and print the first
+3 hits; use `KORRA_DRAWPATH_FROM` for the per-frame histogram, which is what
+shows a texture *appearing* (the change that a text layer would make).
