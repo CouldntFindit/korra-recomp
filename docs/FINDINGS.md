@@ -1103,3 +1103,105 @@ Next: find the insert side of that manager and the caller that should have run
 before the player is activated. The probe already prints the whole chain, so a
 candidate fix is confirmed by `asset-key` appearing *before* `asset-lookup` for
 the same path, then by `publish-tail` with a non-zero player.
+
+## 2026-11-20 (crash session) - the asset registry is full; gate 2 fails resolving a sub-resource
+
+The previous entry concluded that nothing ever offers the resource manager an
+asset, so the player's bundle is never registered. A memory probe now shows the
+opposite: the registry is complete at the moment the player is rejected, and the
+failure is one step further in. The earlier conclusion came from a probe that
+counted key builds and finds; it never read the pool itself.
+
+Tool: `src/host/scene_probe.c` (new, host-only, inert unless `KORRA_TRACE_SCENE`
+is set). It installs itself through a `.CRT$XIU` initializer, so it needs no
+edit to `main.c` and no build-script entry. It reads the guest directly from
+`native32_post_hook` and prints only on change:
+
+```
+[scene] flow=0x3 inst=0x1 list=0x00000001 gate=0x1 early=0xC7DE134
+        player=0x00000000 step=0xFFFFFFFF mode=0 pool=56
+[scene] pool 56: "core\core.dat" id=1 st=8 pl=0x1046D320 rc=1 typ=1 tmr=14914488 | ...
+[scene] bundle "pl\pl00f0.dat" rec=0x0B8520DC payload=0x10FD00E0
+        head= 00544144 00000242 00000020 00000928 ...
+```
+
+### What the pool actually holds when the crash happens
+
+A run to the crash (`KORRA_PAD=1 KORRA_PAD_AUTO=1`) leaves **56-62 records**:
+
+| key | id | state | payload |
+|---|---|---|---|
+| `core\core.dat`, `core\core.dtt`, `core\coreeff.*`, `core\coreui.*`, `core\coreph.dat` | 1-7 | 8 | non-NULL |
+| `pl\pl00f0.dat` | 8 | **8** | `0x10FD00E0` |
+| `it\it00*.dat/.dtt` | 9-17 | 8 | non-NULL |
+| `ui\ui_core.dat`, `ui\ui_hud.dat`, `ui\ui_title.dat`, ... | 18-32 | 8 | non-NULL |
+| `et\et*.dat/.dtt`, `et\eta*.dat` | 33-54 | 8 | non-NULL |
+| `pl\pl0000.*`, `pl\pl0001.dat`, `pl\pl0100.*` | 55-59 | 8 | non-NULL |
+| `pha\pa10.*`, `ui\ui_sub.dat`, ... | 60-67 | 8 | non-NULL |
+
+State 8 is the **only** state the find accepts, not a marker of "not ready":
+the byte table at `0x6AAB7C` maps every state 0-7,9-11 to the "return 0" case
+`0x6AAB62` and state 8 to `0x6AAB4F`, which returns `record+0x30`. So
+`sub_006AAB10("pl\pl00f0.dat")` cannot be the step that fails.
+
+The payload of `pl\pl00f0.dat` is the **raw DAT container**, not a parsed
+object: its header is `DAT\0`, `0x242` (578 sub-files), `0x20`, `0x928`, ...
+which is byte-identical to the file extracted from `data000.cpk`
+(3,543,040 B, CRILAYLA, entry `pl/pl00f0.dat`).
+
+### So gate 2 fails on its second step
+
+`sub_004E85A0(player)` has two exits to zero:
+
+1. `sub_006AAB10(player, "pl\pl00f0.dat")` - measured to succeed (above);
+2. `sub_00637BC0(&out, &payload)` with the literal at `0x941F7C`, which is the
+   suffix `_battleParameter.bin` (`0x941F70` is the separate string `No`, so the
+   two are adjacent, not one string).
+
+The shipped bundle **contains** `pl0000_battleParameter.bin` - one occurrence,
+at offset 20,246 of the extracted `pl00f0.dat`, in the container's name table. So
+the sub-resource exists on disk and in the loaded container; the *resolve* is
+what returns 0 in the port. `sub_00637BC0` builds a name with `sub_00746880`,
+whose only callee is `0x77A1D0` (string helper), then indexes a packed handle
+(`handle >> 28` selects a table, low 28 bits an entry) and returns 0 when the
+table index, the entry count or the slot is out of range.
+
+### The scene pipeline, for the record
+
+`--firsthit` over `0x53B000-0x540200` plus `--poison` on the two state words:
+
+- GameTask (`0x53F2B0`, registered as `"GameTask"` at `0x540D91` into the table
+  at `0xDC0A08`) runs once and never leaves `0x53F300`'s pump loop
+  (`0x53FBA0`/`0x53FCE0` are never entered), so the loop is still spinning at
+  the crash.
+- The scene flow `[0xE38A54]` cycles `0 -> 1 -> ... -> 0x11 -> 0` and starts a
+  second cycle: a retry loop, not a stall.
+- The installer state `[0xDBC02C]` only ever reaches 1. `0x53EB40` (build the
+  8 slot requests), `0x53EBB0` (run them) and `0x53DCC0` (per-slot request, the
+  insert side of the registry) are **never entered**. Flow `0x13`, the only
+  writer of installer state 2, is never dispatched: flow 9 (`0x5C15F0`) takes
+  its "nothing requested" branch (`[0xDC09F0]` is 1, not 0x100/0x101, and
+  `[0xE38A50]` bit 0x10 is clear) and resets through `0xE -> 0x15 -> 0x10 -> 9`.
+
+That is why the insert path is silent, but it is **not** the crash: the player's
+bundle is installed by the core/scene bundles at boot, long before the cutscene
+step runs. Treating the missing `0x53DCC0` as the crash's cause would send the
+next session at a stage slot that the crash does not need.
+
+### Not verified
+
+- Which branch inside `0x637BC0` returns 0: the container parse (`[edi]`,
+  `[edx+4]`, `[edx+8]`) or the name match in `0x746880`/`0x77A1D0`.
+- Whether the UI/font lookup uses the same resolver. It is the obvious
+  shared-root candidate for the missing-glyph defect (same registry, same
+  state 8, same resolver family), but that is a hypothesis, not a measurement.
+- Whether the original binary resolves the same sub-resource: it cannot be
+  probed with these tools.
+
+### Tool notes that cost time
+
+- `--poison` is **one** dword and `--firsthit` is **one** window: the last
+  instance wins, silently, so passing several narrows the trace without saying
+  so. Use one of each per run.
+- The host redirects stderr into `<game>\korra_host-*.log`, so `build\run.err`
+  stays empty and all runtime trace output is in that log.

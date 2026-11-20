@@ -199,6 +199,24 @@ Append only; newest last. Format: date — attempt — outcome — next idea.
   title screen: picture unchanged, text still absent, and `GetACP` is called
   exactly **once** (during CRT startup) — the engine's text path never asks for
   it. Do not re-try codepage forcing.
+- 2026-11-20 — "The resource manager is never given an asset, so the player's
+  bundle is never registered" — **disproved by reading the pool instead of its
+  call sites.** At the moment the player is rejected the pool holds 56-62
+  records, including `pl\pl00f0.dat` in state 8 (the *only* state the find
+  accepts) with a non-NULL payload that is the raw DAT container. Gate 2 fails
+  one step later, in `sub_00637BC0` resolving `_battleParameter.bin`, which the
+  shipped bundle does contain. Counting key builds and finds is not evidence
+  about what is registered: read `[0xE4563C]`/`[0xE45644]`, or use
+  `src/host/scene_probe.c` (`KORRA_TRACE_SCENE=1`).
+- 2026-11-20 — `--poison` takes **one** address and `--firsthit` **one** window;
+  the last one passed wins silently (`g_poison` is a single dword,
+  `g_fh_lo`/`g_fh_hi` a single pair, and `g_fh_seen` is re-`calloc`ed per
+  argument). A run with four `--firsthit` windows reports only the fourth, and
+  one with three `--poison` addresses only the third — which looks exactly like
+  "that function never ran". One of each per run.
+- 2026-11-20 — runtime trace output is **not** in `build\run.err`: the host
+  redirects stderr into `<game>\korra_host-*.log`, so an empty `run.err` does
+  not mean the trace was silent.
 
 
 ## 7. Reporting
