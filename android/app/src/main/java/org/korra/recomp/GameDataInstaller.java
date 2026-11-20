@@ -54,10 +54,11 @@ final class GameDataInstaller {
     private GameDataInstaller() {
     }
 
-    /** True when the marker and both CPKs are present. */
+    /** True when the marker, both CPKs and the image the lift needs are present. */
     static boolean isInstalled(File gameRoot) {
         File data = new File(gameRoot, "GameData");
         return new File(gameRoot, MainActivity.INSTALL_MARKER).isFile()
+                && new File(gameRoot, "LoK.exe").isFile()
                 && new File(data, "data000.cpk").isFile()
                 && new File(data, "data001.cpk").isFile();
     }
@@ -112,6 +113,17 @@ final class GameDataInstaller {
         long[] totals = new long[2];
         copyDir(resolver, tree, gameDataDocId, target, totals, progress);
 
+        /* The lifted program still reads its image's data sections (strings,
+         * vtables, resources), so LoK.exe is part of the install - 6.8 MB next
+         * to the 2 GB of GameData. It lives in the game root, which the picker
+         * may have been (case 1) or not (case 2). */
+        if (gameDataDocId.equals(rootDocId)) {
+            throw new IOException("pick the game folder that contains GameData, "
+                    + "not GameData itself: LoK.exe must be copied too");
+        }
+        copyRootFile(resolver, tree, rootDocId, "LoK.exe", new File(gameRoot, "LoK.exe"),
+                totals, progress);
+
         if (totals[0] == 0) {
             throw new IOException("the selection was empty");
         }
@@ -147,8 +159,7 @@ final class GameDataInstaller {
     }
 
     private static void copyFile(ContentResolver resolver, Uri tree, String docId, File target,
-                                 long[] totals, Progress progress) throws IOException {
-        Uri document = DocumentsContract.buildDocumentUriUsingTree(tree, docId);
+                                 long[] totals, Progress progress) throws IOException {        Uri document = DocumentsContract.buildDocumentUriUsingTree(tree, docId);
         try (InputStream in = new BufferedInputStream(resolver.openInputStream(document), BUFFER);
              OutputStream out = new BufferedOutputStream(new FileOutputStream(target), BUFFER)) {
             if (in == null) {
@@ -165,6 +176,24 @@ final class GameDataInstaller {
         if (progress != null && (totals[0] % 32) == 0) {
             progress.onProgress(totals[0], totals[1]);
         }
+    }
+
+    /** Copy one named file from the picked tree's root, if it exists. */
+    private static void copyRootFile(ContentResolver resolver, Uri tree, String rootDocId,
+                                     String name, File target, long[] totals,
+                                     Progress progress) throws IOException {
+        try (Cursor c = query(resolver, childUri(tree, rootDocId))) {
+            if (c == null) {
+                throw new IOException("cannot list the picked folder");
+            }
+            while (c.moveToNext()) {
+                if (name.equalsIgnoreCase(c.getString(1))) {
+                    copyFile(resolver, tree, c.getString(0), target, totals, progress);
+                    return;
+                }
+            }
+        }
+        throw new IOException("LoK.exe is not in the picked folder; pick the game root");
     }
 
     private static Uri childUri(Uri tree, String docId) {

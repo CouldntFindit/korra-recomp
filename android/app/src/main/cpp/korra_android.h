@@ -28,6 +28,7 @@ void korra_logv(const char* fmt, ...);
 void korra_install_set_gamedata(const char* path);
 int korra_install_ready(void);
 const char* korra_install_gamedata(void);
+int korra_install_probe(const char* external_files);
 
 /* ---- perf_android.c ------------------------------------------------------
  * Optional frame-pacing hints, resolved with dlsym so minSdk 29 builds run on

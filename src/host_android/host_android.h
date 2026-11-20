@@ -1,0 +1,170 @@
+/* host_android.h - the Android host's contract (M3).
+ *
+ * Windows runs the lifted guest on native32 (real Win32 imports, real PE
+ * mapping, x86 code entered through the VEH). None of that exists on arm64, so
+ * this tree answers the guest's 194 imports itself and maps only the image's
+ * *data*. The lifted C is the program; the guest never executes x86 bytes.
+ *
+ * Model, in one paragraph: every guest address is a uint32 VA inside a 4 GiB
+ * PROT_NONE window; g_mem_base = (window host address) - 0, so ADDR(va) is just
+ * the window plus the VA. The image's sections are committed at their VAs.
+ * Imports are recomp_func_t shims registered under synthetic guest VAs; the PE
+ * loader writes those VAs into the guest IAT, and RECOMP_CALL/RECOMP_ICALL
+ * resolves them through recomp_lookup_import(). A shim reads its stdcall
+ * arguments from g_esp with A32() and returns with RET(), which pops ret + argc.
+ * Guest -> host is therefore an ordinary C call, and native -> guest (WndProc,
+ * thread start) is hle_call_guest().
+ */
+#ifndef KORRA_HOST_ANDROID_H
+#define KORRA_HOST_ANDROID_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#include "recomp_types.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ---------------------------------------------------------------- memory */
+#define KA_WINDOW_SIZE   0x100000000ull   /* the whole 32-bit guest space */
+#define KA_IMAGE_BASE    0x00400000u
+#define KA_HEAP_BASE     0x20000000u
+#define KA_HEAP_END      0xE0000000u
+#define KA_SHIM_BASE     0xF0000000u
+#define KA_SHIM_STEP     16u
+#define KA_SHIM_MAX      4096
+
+int       ka_mem_init(void);
+void     *ka_host(uint32_t va);              /* host pointer, no checks */
+int       ka_commit(uint32_t va, uint32_t size, int prot_none); /* 0 ok */
+uint32_t  ka_guest_alloc(uint32_t size, uint32_t align);        /* 0 = out */
+void      ka_guest_free(uint32_t va);
+uint32_t  ka_guest_strdup(const char *s);
+uint32_t  ka_guest_size(uint32_t va);
+/* A fresh guest stack; returns the initial esp (top, 16-byte aligned). */
+uint32_t  ka_stack_new(uint32_t size, uint32_t *limit);
+
+/* ------------------------------------------------------------------- PE */
+int  ka_pe_map(const char *exe_path);     /* map sections at their VAs */
+uint32_t ka_pe_span(void);
+uint32_t ka_pe_entry(void);
+int  ka_pe_bind(void);                    /* IAT -> shim VAs; returns unresolved */
+
+/* --------------------------------------------------------------- shims */
+typedef struct { const char *name; recomp_func_t fn; } ka_shim;
+int      ka_shim_register(const ka_shim *shims);      /* NULL-name terminated */
+uint32_t ka_shim_va(const char *name);                /* 0 if unknown */
+uint32_t ka_shim_stub(const char *name);              /* register self-naming stub */
+const char *ka_shim_name(uint32_t va);
+uint32_t ka_shim_count(void);
+
+/* stdcall argument access from inside a shim: g_esp -> [ret][arg0][arg1]...
+ * g_esp is a GUEST VA, so the read must go through the guest window (MEM32),
+ * never through the host pointer the guest number would be. */
+static inline uint32_t ka_a32(int i) {
+    return MEM32(g_esp + 4u + 4u * (uint32_t)i);
+}
+static inline void *ka_host_or_null(uint32_t va) {
+    return va ? (void *)((uintptr_t)va + g_mem_base) : (void *)0;
+}
+#define A32(i)   ka_a32(i)
+#define APTR(i)  ka_host_or_null(ka_a32(i))
+#define ASTR(i)  ((char *)ka_host_or_null(ka_a32(i)))
+#define AWSTR(i) ((uint16_t *)ka_host_or_null(ka_a32(i)))
+/* Return from a stdcall shim: eax, then pop ret + argc args. */
+#define RET(eax, argc)  do { g_eax = (uint32_t)(eax); g_esp += 4u + 4u * (uint32_t)(argc); return; } while (0)
+#define RETV(argc)      RET(0, argc)
+#define RETP(p, argc)   RET((uint32_t)(uintptr_t)(p), argc)
+
+/* Native -> guest. Pushes nargs stdcall args, returns the guest's eax.
+ * Takes the machine lock; nests. */
+uint32_t hle_call_guest(uint32_t va, int nargs, const uint32_t *args);
+void     mach_enter(void);
+void     mach_leave(void);
+
+/* --------------------------------------------------------------- files */
+/* POSIX file layer over a fixed game root. Guest paths may be relative,
+ * backslash-separated, drive-qualified, or absolute under the root. */
+void ka_fs_set_root(const char *root);
+const char *ka_fs_root(void);
+const char *ka_fs_resolve(const char *guest_path, char *out, size_t cap);
+uint32_t ka_file_open(const char *guest_path);       /* token, 0 on failure */
+uint32_t ka_file_seek(uint32_t tok, int64_t delta, int method, int *ok);
+int      ka_file_read(uint32_t tok, void *buf, uint32_t n, uint32_t *got);
+int      ka_file_write(uint32_t tok, const void *buf, uint32_t n, uint32_t *put);
+uint64_t ka_file_size(uint32_t tok);
+int      ka_file_close(uint32_t tok);
+
+/* ------------------------------------------------------------ logging */
+void ka_log(const char *fmt, ...);
+extern int ka_trace_imports;    /* KORRA_TRACE_IMPORTS=1: one line per shim */
+extern int ka_trace_files;
+void ka_trace_init(void);
+
+/* ------------------------------------------------------------ services */
+void     ka_set_guest_module(const char *exe_path);
+uint32_t ka_last_error_get(void);
+void     ka_last_error_set(uint32_t e);
+uint32_t ka_tls_alloc(void);
+void     ka_tls_free(uint32_t idx);
+uint32_t ka_tls_get(uint32_t idx);
+void     ka_tls_set(uint32_t idx, uint32_t v);
+uint32_t ka_thread_attach(const char *why);   /* returns TIB VA for this thread */
+void     ka_thread_detach(void);
+uint32_t ka_thread_create(uint32_t start_va, uint32_t param);
+uint32_t ka_thread_wait(uint32_t token, uint32_t timeout_ms);
+uint32_t ka_thread_exit_code(uint32_t token);
+int      ka_spine_depth(void);
+uint32_t ka_mono_ms(void);
+uint32_t ka_hat_packet(void);
+void     ka_input_touch(int action, int id, float x, float y, int w, int h);
+
+/* Guest COM objects used by the shim tables. */
+uint32_t ka_steam_user_object(void);
+uint32_t ka_steam_stats_object(void);
+uint32_t ka_dinput_object(void);
+uint32_t ka_guest_empty_string(void);
+
+/* Window / surface hand-off from the shell (jni_bridge.cpp). */
+void ka_window_set(void *anativewindow);
+void *ka_window_get(void);
+
+/* Pad state read by XInputGetState (input_android.c owns it). */
+typedef struct {
+    uint32_t buttons;   /* XINPUT_GAMEPAD_* bits */
+    uint8_t  lt, rt;
+    int16_t  lx, ly, rx, ry;
+} ka_pad_state;
+void ka_pad_read(ka_pad_state *out);   /* zero when no pad */
+
+/* D3D9 bridge (d3d9_android.cpp). */
+int  ka_d3d9_init(void);               /* register interface thunks */
+void ka_d3d9_window_changed(void);
+int  ka_d3d9_frame_presented(void);
+void ka_d3d9_shutdown(void);
+
+/* The guest's entry: run the lifted CRT entry on a host thread. Returns when
+ * it returns (normally only through ExitProcess). */
+int ka_guest_run(const char *game_root);
+
+/* XAudio2 / steam / misc module tables registered at boot. */
+void ka_shims_register_all(void);
+
+/* --------------------------------------------------- module shim tables */
+extern const ka_shim ka_kernel32_shims[];
+extern const ka_shim ka_kernel32_file_shims[];
+extern const ka_shim ka_user32_shims[];
+extern const ka_shim ka_gdi32_shims[];
+extern const ka_shim ka_misc_shims[];      /* winmm, shell32, oleaut32, ole32 */
+extern const ka_shim ka_steam_shims[];
+extern const ka_shim ka_xaudio2_shims[];
+extern const ka_shim ka_input_shims[];     /* xinput, dinput8 */
+extern const ka_shim ka_d3dx_shims[];
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

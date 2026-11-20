@@ -81,19 +81,48 @@ if(KORRA_LINK_GUEST)
     target_include_directories(korra_guest PRIVATE
         "${KORRA_GEN_DIR}"
         "${KORRA_HOST_ANDROID_DIR}"
-        "${KORRA_PCRECOMP_DIR}/runtime/recomp32")
+        "${KORRA_PCRECOMP_DIR}/runtime/recomp32"
+        "${KORRA_PCRECOMP_DIR}/runtime/win32hle")
     # -fwrapv / -fno-strict-aliasing match the MSVC host's semantics: the lifted
     # C performs 32-bit wrapping arithmetic on one untyped guest memory array.
     target_compile_options(korra_guest PRIVATE
-        -O2 -fwrapv -fno-strict-aliasing -ffp-contract=off -w)
+        -O1 -fwrapv -fno-strict-aliasing -ffp-contract=off -w)
+    # recomp_0053.c is 142 MB of one translation unit. Clang at -O1 needs ~5 GB
+    # and >15 minutes for it alone (measured), which dominates every rebuild; -O0
+    # keeps bring-up honest and costs only that file's execution speed.
+    foreach(gen_src ${KORRA_GEN_SOURCES})
+        file(SIZE "${gen_src}" gen_size)
+        if(gen_size GREATER 100000000)
+            set_source_files_properties("${gen_src}" PROPERTIES COMPILE_OPTIONS "-O0")
+            message(STATUS "korra: ${gen_src} is ${gen_size} bytes - compiling at -O0")
+        endif()
+    endforeach()
+    target_compile_definitions(korra_guest PRIVATE KORRA_ANDROID=1)
     target_link_libraries(korra PRIVATE korra_guest)
+    target_compile_definitions(korra PRIVATE KORRA_LINK_GUEST=1)
+    find_package(Threads REQUIRED)
+    target_link_libraries(korra PRIVATE Threads::Threads)
 endif()
 
 if(KORRA_WITH_DXVK)
     if(NOT KORRA_DXVK_SOURCE)
         message(FATAL_ERROR "KORRA_WITH_DXVK=ON needs -DKORRA_DXVK_SOURCE=<prepared tree>")
     endif()
-    add_subdirectory("${KORRA_DXVK_SOURCE}" "${CMAKE_CURRENT_BINARY_DIR}/dxvk")
-    target_compile_definitions(korra PRIVATE VK_USE_PLATFORM_ANDROID_KHR)
-    target_link_libraries(korra PRIVATE dxvk_android vulkan)
+    # The build recipe lives in the repo (dxvk_android/); the prepared
+    # dxvk-native tree is a local clone and is never committed.
+    set(DXVK_SOURCE "${KORRA_DXVK_SOURCE}" CACHE PATH "prepared dxvk-native" FORCE)
+    add_subdirectory("${KORRA_REPO_ROOT}/dxvk_android" "${CMAKE_CURRENT_BINARY_DIR}/dxvk")
+    target_compile_definitions(korra PRIVATE KORRA_WITH_DXVK=1 VK_USE_PLATFORM_ANDROID_KHR)
+    target_link_libraries(korra PRIVATE dxvk_android)
+    if(TARGET korra_guest)
+        target_compile_definitions(korra_guest PRIVATE KORRA_WITH_DXVK=1)
+        target_compile_features(korra_guest PRIVATE cxx_std_17)
+        target_include_directories(korra_guest PRIVATE
+            "${KORRA_DXVK_SOURCE}"
+            "${KORRA_DXVK_SOURCE}/include"
+            "${KORRA_DXVK_SOURCE}/include/native"
+            "${KORRA_DXVK_SOURCE}/include/native/windows"
+            "${KORRA_DXVK_SOURCE}/include/native/directx"
+            "${KORRA_DXVK_SOURCE}/src/util")
+    endif()
 endif()
