@@ -197,7 +197,9 @@ static void module_range(const char *dll, uint32_t *lo, uint32_t *hi) {
     b = (const unsigned char *)h;
     if (b[0] != 'M' || b[1] != 'Z') return;
     lfanew = (const uint32_t *)(uintptr_t)(b + *(const uint32_t *)(uintptr_t)(b + 0x3C));
-    size = lfanew[0x18];                     /* OptionalHeader.SizeOfImage */
+    /* OptionalHeader.SizeOfImage: PE +4 signature, COFF header 20 bytes, then
+     * optional header offset 0x38; as dwords from the signature: 6 + 14. */
+    size = lfanew[0x14];
     *lo = (uint32_t)(uintptr_t)b;
     *hi = *lo + size;
 }
@@ -287,7 +289,19 @@ static void sniff_device(uint32_t candidate) {
     if (!in_range(vtbl, P.d3d9_lo, P.d3d9_hi)) return;
     d3d_vtbl = P.d3d ? rd32(P.d3d) : 0;
     if (vtbl == d3d_vtbl) return;
-    if (vtable_score(vtbl) < 40) return;   /* 48 slots: a device fills nearly all */
+    {
+        int score = vtable_score(vtbl);
+        if (score < 40) {
+            static int warned;
+            if (verbosity() >= 2 && !warned) {
+                warned = 1;
+                fprintf(stderr, "[draw] candidate 0x%08X vtable 0x%08X score=%d (rejected)\n",
+                        candidate, vtbl, score);
+                fflush(stderr);
+            }
+            return;
+        }
+    }
     P.dev = candidate;
     capture_methods(candidate);
 }
@@ -500,15 +514,22 @@ static void probe_post(uint32_t target, const uint32_t *a, uint32_t ret) {
              * interface is captured whatever the slot numbering is. */
             int k;
             uint32_t dev = 0;
+            static uint32_t last_factory_target;
+            static int factory_logs;
             for (k = 4; k <= 8 && !dev; k++)
                 if (iface_out(a[k], &dev)) { /* found */ }
             if (dev) {
                 P.dev = dev;
                 capture_methods(dev);
             }
-            if (verbosity() >= 2)
-                fprintf(stderr, "[draw] factory call target=0x%08X slot=%d ret=0x%08X\n",
-                        target, method_index(target), ret);
+            if (verbosity() >= 2 && factory_logs < 40 &&
+                target != last_factory_target) {
+                last_factory_target = target;
+                factory_logs++;
+                fprintf(stderr, "[draw] factory call target=0x%08X ret=0x%08X\n",
+                        target, ret);
+                fflush(stderr);
+            }
             if (P.have_dev) return;
         }
         sniff_device(a[0]);
