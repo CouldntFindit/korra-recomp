@@ -90,6 +90,7 @@ typedef struct {
     int      have_dev;
     /* per-frame counters */
     unsigned frame, draws, draws_up, draws_ib, prims;
+    unsigned texs_n[16];
     unsigned vbs, begins, ends, rt_changes;
     uint32_t rt, ds;
     unsigned tex_used[16];
@@ -475,8 +476,12 @@ static void report_draw(int kind, unsigned type, unsigned prims, unsigned stride
     else P.draws_ib++;
     {
         int known = 0;
-        for (i = 0; i < P.ntex_used; i++) if (P.tex_used[i] == tex) { known = 1; break; }
-        if (!known && P.ntex_used < 16) P.tex_used[P.ntex_used++] = tex;
+        for (i = 0; i < P.ntex_used; i++)
+            if (P.tex_used[i] == tex) { P.texs_n[i]++; known = 1; break; }
+        if (!known && P.ntex_used < 16) {
+            P.texs_n[P.ntex_used] = 1;
+            P.tex_used[P.ntex_used++] = tex;
+        }
     }
 
     /* Once per texture, read its pixels back. Off by default: LockRect from
@@ -545,7 +550,37 @@ static void report_draw(int kind, unsigned type, unsigned prims, unsigned stride
 }
 
 static void report_frame(void) {
+    static int dump_from = -2;
+    static uint32_t last[16];
+    static int last_n = -1;
+    int i;
+
     if (verbosity() < 1) return;
+    if (dump_from == -2) {
+        const char *f = getenv("KORRA_DRAWPATH_FROM");
+        dump_from = f ? atoi(f) : -1;
+    }
+    /* The per-frame texture histogram, printed only when it changes: a new
+     * texture appearing (a glyph atlas, a text layer) shows up as one line
+     * instead of a flood of per-draw lines. */
+    if (dump_from >= 0 && (int)P.frame >= dump_from) {
+        int same = (last_n == P.ntex_used);
+        for (i = 0; i < P.ntex_used && same; i++) if (last[i] != P.tex_used[i]) same = 0;
+        if (!same) {
+            last_n = P.ntex_used;
+            fprintf(stderr, "[draw] hist f%u draws=%u:", P.frame, P.draws);
+            for (i = 0; i < P.ntex_used; i++) {
+                const texrec_t *t = find_texture(P.tex_used[i]);
+                last[i] = P.tex_used[i];
+                fprintf(stderr, " %08X%s", P.tex_used[i],
+                        t ? "" : "?");
+                if (t) fprintf(stderr, "(%ux%u/0x%X)x%u", t->w, t->h, t->fmt, P.texs_n[i]);
+                else   fprintf(stderr, "x%u", P.texs_n[i]);
+            }
+            fprintf(stderr, "\n");
+            fflush(stderr);
+        }
+    }
     if ((P.frame % 60) != 0) return;
     fprintf(stderr, "[draw] frame %u draws=%u up=%u vb=%u prims=%u texs=%d"
                     " rt=%08X/%u begins=%u ends=%u"
