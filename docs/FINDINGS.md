@@ -1072,3 +1072,34 @@ with the object or path it is about, all off unless `KORRA_TRACE_CRASH` is set.
 One gotcha worth keeping: the first stack argument is at `esp+4`, not `esp+8`
 (the call has just pushed the return address); reading the wrong slot silently
 filters everything out as "not a pointer".
+### The resource registry is asked about one path in the whole run, and only to look it up
+
+Printing every key the resource manager is built for (`0x006AB310`, deduplicated)
+and every find (`0x006AAB10`) over a full run to the crash gives one line each:
+
+    asset-lookup "pl\pl00f0.dat"
+    asset-key    "pl\pl00f0.dat"
+
+So `pl\pl00f0.dat` is **the only path the manager is ever asked about**, and it is
+only ever a *find*. Nothing offers that manager an asset to install, which is why
+the find returns 0 and the whole chain above collapses:
+
+    no asset registered -> 0x4E85A0 (gate 2) returns 0 -> 0x492D90 reports failure
+    -> 0x4F9CE0 destroys the player -> [edi+0x48] stays 0 -> 0x51F4B0 rejects the
+    scene object -> 0x5201D0 returns 0 -> the publish stores nothing -> 0xCA3E58
+    stays 0 -> the HUD update dereferences NULL
+
+The file is in the container (`pl00f0.dat` sits in `data000.cpk` with
+`pl00f1..f3`), so the remaining defect is entirely on the install side: whatever
+registers a loaded asset under its logical path does not run for the player (and,
+by this measurement, for anything else that would have reached this manager).
+
+What this does **not** prove, stated plainly: the manager may not be the only
+registry in the engine, so "nothing is installed anywhere" is not concluded - only
+that `0x6AB310`/`0x6AAB10` see exactly one path. If the installer builds keys a
+different way, the next instrument is its insert call rather than this pair.
+
+Next: find the insert side of that manager and the caller that should have run
+before the player is activated. The probe already prints the whole chain, so a
+candidate fix is confirmed by `asset-key` appearing *before* `asset-lookup` for
+the same path, then by `publish-tail` with a non-zero player.
