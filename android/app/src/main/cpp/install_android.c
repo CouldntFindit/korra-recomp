@@ -6,7 +6,9 @@
  */
 #include "korra_android.h"
 
+#include <errno.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <string.h>
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -33,6 +35,26 @@ int korra_install_ready(void) {
 
 const char* korra_install_gamedata(void) {
     return g_gamedata;
+}
+
+/* adb-driven install: if the tree is already at <files>/game, use it without a
+ * picker. This is the loop the dev builds are tested with
+ * (scripts\android_push_game.ps1) and it cannot fake a real install: the same
+ * three paths are required. */
+int korra_install_probe(const char* external_files) {
+    char path[640];
+    FILE* f;
+    if (!external_files || !*external_files) return 0;
+    snprintf(path, sizeof path, "%s/game/LoK.exe", external_files);
+    f = fopen(path, "rb");
+    if (!f) {
+        korra_logv("install: probe %s failed (%s)", path, strerror(errno));
+        return 0;
+    }
+    fclose(f);
+    snprintf(g_gamedata, sizeof g_gamedata, "%s/game/GameData", external_files);
+    g_ready = 1;
+    return 1;
 }
 
 /* ---------------------------------------------------------------------------

@@ -18,6 +18,18 @@
 
 #include "korra_android.h"
 
+/* These live in src/host_android/ (C linkage) and are declared at file scope:
+ * a declaration inside the anonymous namespace below would give it internal
+ * linkage and the link would fail with "undefined symbol ::name". */
+#if KORRA_WITH_DXVK
+extern "C" void dxvkAndroidSetWindow(ANativeWindow * window);
+#elif KORRA_LINK_GUEST
+extern "C" void ka_window_set(void *window);
+#endif
+#if KORRA_LINK_GUEST
+extern "C" void ka_input_touch(int action, int id, float x, float y, int w, int h);
+#endif
+
 namespace {
 
 constexpr long long kTargetFrameNs = 16666667LL; /* 60 Hz */
@@ -51,10 +63,19 @@ void handle_cmd(android_app* app, int32_t cmd) {
                            ANativeWindow_getWidth(state->window),
                            ANativeWindow_getHeight(state->window),
                            ANativeWindow_getFormat(state->window));
+#if KORRA_WITH_DXVK
+                /* DXVK's WSI binds its VkSurface to this window. */
+                dxvkAndroidSetWindow(state->window);
+#elif KORRA_LINK_GUEST
+                ka_window_set(state->window);
+#endif
             }
             break;
         case APP_CMD_TERM_WINDOW:
             korra_logv("window: destroyed");
+#if KORRA_WITH_DXVK
+            dxvkAndroidSetWindow(nullptr);
+#endif
             state->window = nullptr;
             break;
         case APP_CMD_WINDOW_RESIZED:
@@ -99,6 +120,7 @@ extern "C" void android_main(android_app* app) {
      * paths the Java side sees, so the Java -> JNI hand-off only carries the
      * install result. */
     const char* external = app->activity ? app->activity->externalDataPath : nullptr;
+    const char* internal = app->activity ? app->activity->internalDataPath : nullptr;
     korra_log_init(external);
     korra_logv("shell: android_main started (API %d, abi %s)",
                android_get_device_api_level(),
@@ -109,6 +131,15 @@ extern "C" void android_main(android_app* app) {
 #endif
     );
     korra_logv("shell: external files %s", external ? external : "(null)");
+    /* Internal first: on Android 16+ only the app may write into its own
+     * external files dir (adb-pushed files there are EACCES), so a dev install
+     * lives in internal storage and is copied in with `run-as`. The SAF flow
+     * remains the user path. */
+    if (internal && korra_install_probe(internal)) {
+        korra_logv("install: probed %s/game/LoK.exe - ready (internal)", internal);
+    } else if (external && korra_install_probe(external)) {
+        korra_logv("install: probed %s/game/LoK.exe - ready (external)", external);
+    }
     korra_perf_init();
     state.last_report_ns = now_ns();
 
@@ -133,6 +164,38 @@ extern "C" void android_main(android_app* app) {
         if (android_input_buffer* input = android_app_swap_input_buffers(app)) {
             state.touch_events += input->motionEventsCount;
             state.key_events += input->keyEventsCount;
+#if KORRA_LINK_GUEST
+            /* Touch becomes the virtual pad at the import boundary
+             * (input_android.c); the engine's own XInput remap and edge
+             * detection then work unchanged. */
+            if (state.window) {
+                const int w = ANativeWindow_getWidth(state.window);
+                const int h = ANativeWindow_getHeight(state.window);
+                for (uint32_t i = 0; i < input->motionEventsCount; i++) {
+                    const GameActivityMotionEvent& ev = input->motionEvents[i];
+                    const int32_t masked = ev.action & AMOTION_EVENT_ACTION_MASK;
+                    const int32_t idx =
+                        (ev.action & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >>
+                        AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;
+                    int act;
+                    if (masked == AMOTION_EVENT_ACTION_DOWN ||
+                        masked == AMOTION_EVENT_ACTION_POINTER_DOWN) act = 0;
+                    else if (masked == AMOTION_EVENT_ACTION_MOVE) act = 1;
+                    else if (masked == AMOTION_EVENT_ACTION_UP ||
+                             masked == AMOTION_EVENT_ACTION_POINTER_UP ||
+                             masked == AMOTION_EVENT_ACTION_CANCEL) act = 2;
+                    else act = 1;
+                    for (uint32_t p = 0; p < ev.pointerCount; p++) {
+                        const GameActivityPointerAxes& pt = ev.pointers[p];
+                        int pointer_id = (int)pt.id;
+                        if (masked != AMOTION_EVENT_ACTION_MOVE && (int32_t)p != idx)
+                            continue;
+                        ka_input_touch(act, pointer_id, pt.axisValues[AMOTION_EVENT_AXIS_X],
+                                       pt.axisValues[AMOTION_EVENT_AXIS_Y], w, h);
+                    }
+                }
+            }
+#endif
             if (input->motionEventsCount) {
                 android_app_clear_motion_events(input);
             }
@@ -176,6 +239,8 @@ extern "C" void android_main(android_app* app) {
  * docs/ANDROID_BRINGUP.md section 4) and flips -DKORRA_LINK_GUEST=ON.
  * ------------------------------------------------------------------------ */
 
+#if !KORRA_LINK_GUEST
+
 int korra_guest_start(const char* game_data_dir, void* native_window) {
     korra_logv("guest: STUB - nothing linked. GameData=%s window=%p",
                game_data_dir ? game_data_dir : "(none)", native_window);
@@ -189,3 +254,6 @@ void korra_guest_frame(void* native_window) {
 
 void korra_guest_stop(void) {
 }
+
+#endif /* !KORRA_LINK_GUEST */
+
