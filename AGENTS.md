@@ -268,6 +268,25 @@ Append only; newest last. Format: date — attempt — outcome — next idea.
   before, same min/max. The frame is not limited by the hand-over. Kept as
   unconditionally cheaper code (`pcrecomp` Korra-0007), and it is a reminder to
   measure a "obviously faster" change before writing it up as a win.
+- 2026-11-20 — "the catalog is already correct, so a re-catalog will not change
+  anything" — **wrong**. `disasm32.table_entries` read a jump table only
+  *upward* from the displacement, so a table indexed by a negative register (CRT
+  memcpy: `jmp [ecx*4 + 0x77A8C4]`, ecx -7..0) yielded one arm or none. The
+  arms that never entered the catalog are not block leaders, so their switch
+  lifted to `RECOMP_ITAIL`, the dispatch table cannot resolve a mid-function
+  address, and the memcpy remainder **returned without copying**. Re-cataloguing
+  with the downward scan (`pcrecomp` Korra-0008) found 298 more functions
+  (37,029 -> 37,327) and removed the unresolved dispatches. A re-catalog is
+  cheap (528 s) and its diff is a real signal: read it before assuming the
+  cataloger version does not matter.
+- 2026-11-20 — answering a stubbed COM vtable with **one** body for every slot —
+  **cost every long run**. `ISteamUserStats::GetAchievement(name, bool*)` takes
+  two stack arguments, but the stats object answered with the one-argument
+  `ISteamUser` body: it returned NULL *and* popped 4 bytes instead of 8, leaving
+  the guest `esp` 4 short and faulting the next member read at `[0x11]` (guest
+  `0x0076C590`) about 5 minutes into every run. A COM vtable needs a per-slot
+  entry whose `ret N` matches that method's arity; a generic "return 0" body is
+  only safe for slots you know are unreachable.
 
 
 ## 7. Reporting

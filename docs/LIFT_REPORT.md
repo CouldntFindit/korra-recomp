@@ -54,3 +54,27 @@ codegen profile — MSVC 2012-era x87 + SSE2, no MMX-only loops were reported.
 - The catalog (`work/catalog.json`, 27 MB) is regenerable and stays out of the
   repo; the seed set is committed as `config/seeds_all.json` so anyone with the
   same binary reproduces the same 37k functions.
+
+## Re-catalog 2026-11-20 (pcrecomp Korra-0008) - 37,327 functions
+
+The numbers above are the M1 report and stay as the record of that day. The
+catalog was rebuilt on 2026-11-20 after `disasm32.table_entries` learned to read
+a jump table **below** its displacement (negative index - CRT memcpy dispatches
+that way). Function count and lift result now:
+
+| Stage | Result |
+|---|---|
+| Functions disassembled | **37,327** (+298; reachable only through arms that the upward-only table read never produced) |
+| Extent clamps | 2,050 |
+| Branch targets given a dispatchable body | 2,573 + 604 + 94 |
+| Functions lifted | **37,327 / 37,327** |
+| **Failures** | **0** |
+| Lines of C | 12,652,837 |
+| Catalog wall time | 528.0 s |
+
+Why it mattered: `sub_0077A440` (CRT memcpy) tail-jumps through a table at
+`0x77A8C4` whose eight arms include `0x77A8E0`/`0x77A8E8`. They were not block
+leaders, so the lifted switch fell through to `RECOMP_ITAIL`, which the dispatch
+table cannot resolve - the memcpy remainder returned without copying anything
+(log line: `ITAIL: unresolved VA 0x0077A8E0 from 0x0077A440`). The table now has
+30 arms and 102 blocks, and the switch is complete.

@@ -9,7 +9,7 @@ its commit `b278e8a` is not fetchable — this pin supersedes it.
 | Repo | https://github.com/sp00nznet/pcrecomp (note: `sp00nznet`, not `sp00z`) |
 | Base commit | `35548b8` — *disasm32: straight-line code longer than the scan window is decoded to its end (#50)*, upstream HEAD on 2026-10-04 |
 | Branch used here | `korra-base` (local) |
-| Branch head | **`82495cb`** (2026-11-20) - `35548b8` + patches `0001-0014` + MP2-0001 + Korra-0001-0007 |
+| Branch head | **`9459f22`** (2026-11-20) - `35548b8` + patches `0001-0014` + MP2-0001 + Korra-0001-0008 |
 | Patch series | `nfsu2-recompiled/patches/pcrecomp/0001…0014` — all apply cleanly, in order, on `35548b8` |
 | Extra patch | `maxpayne2/patches/pcrecomp/0001-seh-frames-and-or-xor-conditions.patch` — applies cleanly on top |
 | pcrecomp `main` @ 2026-11-18 | **not usable**: only patch 0001 applies, the rest conflict (the runtime was restructured: `native32` split, `difftest.py` moved). Do not "just upgrade". |
@@ -50,6 +50,7 @@ What the patch series buys us (from its own subjects):
 | **Korra-0005** (ours, `dc18f83`) | `recomp_types.h`: portable `pcmpistri` rewritten — all four data formats (word mode `0x0D` included), the equal-ordered validity window (empty needle ⇒ index 0/CF=1; needle must fit before `b`'s null), the equal-each lane mask along the longer operand, masked-polarity XOR on `b`'s valid lanes, and hardware ZF/CF/SF/OF (SF = "any null in `a`", not IntRes2[15]). Word mode returns the element index; the lifted code applies its own `*2`. **No relift** — recompile only |
 | **Korra-0006** (ours, `5cfccf3`) | `lift32` + `recomp_types.h`: `FCOMI/FCOMIP/FUCOMI/FUCOMIP` publish their EFLAGS image via `recomp_fcomi_eflags`, so `LAHF`/`PUSHFD` after the compare report ZF/PF/CF instead of the flags of an earlier instruction (8 real `fucompi; fstp st(0); lahf` sites). **Codegen change - requires a relift** (37,029/37,029, 0 failures) |
 | **Korra-0007** (ours, `82495cb`) | `native32.c` runtime only: the per-thread machine state is a `__declspec(thread)` pointer instead of a `TlsGetValue` slot (three API calls and a LastError clobber per bridge crossing), `mach_unlock` wakes only when a ticket is actually queued, and a waiter spins 4096 times before sleeping. **No relift** - recompile only. Measured neutral in Korra's first area (45.3 fps avg vs 44.9) |
+| **Korra-0008** (ours, `9459f22`) | `disasm32.py`: `table_entries` reads a jump table **below** its displacement as well as above it. A negative index (CRT memcpy: `jmp [ecx*4 + 0x77A8C4]`, ecx -7..0) keeps every arm below, so those switches lifted to `RECOMP_ITAIL` and resolved to nothing at runtime - Korra's memcpy remainder silently copied nothing. Guards: contiguous code run only, no entry pointing into the table itself, every arm within 0x40000 of the table. **Re-catalog + relift**: 37,029 -> **37,327** functions (+298 reachable only through those arms), 37,327/37,327 lifted, 0 failures |
 
 ## Local environment
 
