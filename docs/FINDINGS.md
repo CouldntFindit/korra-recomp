@@ -1002,3 +1002,12 @@ or the per-glyph layout that would emit those quads.
 `sig#N` lines dedupe on (kind, prims, texture, FVF, caller) and print the first
 3 hits; use `KORRA_DRAWPATH_FROM` for the per-frame histogram, which is what
 shows a texture *appearing* (the change that a text layer would make).
+
+### One disproved hypothesis (recorded so it is not retried)
+
+A Turkish Windows reports ANSI codepage 1254, and the engine imports
+`GetACP`/`GetOEMCP`/`IsValidCodePage`. Forcing `GetACP` to 1252 for a whole
+session (`KORRA_FORCE_ACP=1252`, a host-side rewrite of the guest's return
+value) changed nothing on screen, and the log shows **`GetACP` is called exactly
+once**, during CRT startup - the text path never asks for the codepage. Not the
+cause.
