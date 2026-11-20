@@ -45,6 +45,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <d3d9.h>
 #include "native32.h"
 
 /* ---------------------------------------------------------------- D3D9 vtable
@@ -173,6 +174,25 @@ static sig_t g_sig[MAX_SIG];
 static int g_nsig;
 
 static native32_post_hook_t g_other_post;
+static native32_pre_hook_t  g_other_pre;
+
+/* call census: every bridged call, and the ones that land in d3d9 but are not
+ * a method of the captured device (a wrong vtable slot or an object we never
+ * captured would show up here). */
+static volatile long g_calls, g_d3d_calls;
+static uint32_t g_unmatched[48];
+static int      g_nunmatched;
+static int verbosity(void);
+
+static void note_unmatched(uint32_t target, const uint32_t *a) {
+    int i;
+    for (i = 0; i < g_nunmatched; i++) if (g_unmatched[i] == target) return;
+    if (g_nunmatched >= (int)(sizeof g_unmatched / sizeof g_unmatched[0])) return;
+    g_unmatched[g_nunmatched++] = target;
+    if (verbosity() >= 2)
+        fprintf(stderr, "[draw] unclaimed d3d9 call 0x%08X a0=0x%08X a1=0x%08X a2=0x%08X a3=0x%08X dev=%d\n",
+                target, a[0], a[1], a[2], a[3], P.have_dev && a[0] == P.dev);
+}
 
 static int verbosity(void) {
     static int v = -1;
@@ -244,79 +264,116 @@ static const texrec_t *find_texture(uint32_t tex) {
     return NULL;
 }
 
-/* ---------------------------------------------------------- method capture */
-
-/* Number of the first 48 vtable slots that point into d3d9.dll: a real COM
- * interface of the device family fills them, a random object does not. */
-static int vtable_score(uint32_t vtbl) {
-    int i, n = 0;
-    for (i = 0; i < 48; i++)
-        if (in_range(rd32(vtbl + 4u * (uint32_t)i), P.d3d9_lo, P.d3d9_hi)) n++;
-    return n;
-}
-
-static void capture_methods(uint32_t obj) {
-    uint32_t vtbl = rd32(obj);
-    if (!vtbl) return;
-    for (int i = 0; i < 128; i++) {
-        uint32_t fn = rd32(vtbl + 4u * (uint32_t)i);
-        if (!in_range(fn, P.d3d9_lo, P.d3d9_hi)) { P.m[i] = 0; continue; }
-        P.m[i] = fn;
-    }
-    P.have_dev = 1;
-    if (verbosity() >= 1)
-        fprintf(stderr, "[draw] device 0x%08X vtable 0x%08X captured "
-                        "(Present=0x%08X DrawPrimitiveUP=0x%08X)\n",
-                obj, vtbl, P.m[D3DDEV_PRESENT], P.m[D3DDEV_DRAWPRIMITIVEUP]);
-}
-
-static int method_index(uint32_t target) {
-    int i;
-    if (!P.have_dev) return -1;
-    for (i = 0; i < 128; i++) if (P.m[i] == target) return i;
-    return -1;
-}
-
-/* A COM object whose vtable is inside d3d9.dll is one of ours. Called with
- * args[0] (the `this` slot of every COM method) so the device is captured even
- * if CreateDevice itself was missed. The IDirect3D9 factory has its own vtable
- * and is not a device, so it is excluded. */
-static void sniff_device(uint32_t candidate) {
-    uint32_t vtbl, d3d_vtbl;
-    if (P.have_dev || !candidate || (candidate & 3)) return;
-    if (!readable(candidate, 4)) return;
-    vtbl = rd32(candidate);
-    if (!in_range(vtbl, P.d3d9_lo, P.d3d9_hi)) return;
-    d3d_vtbl = P.d3d ? rd32(P.d3d) : 0;
-    if (vtbl == d3d_vtbl) return;
-    {
-        int score = vtable_score(vtbl);
-        if (score < 40) {
-            static int warned;
-            if (verbosity() >= 2 && !warned) {
-                warned = 1;
-                fprintf(stderr, "[draw] candidate 0x%08X vtable 0x%08X score=%d (rejected)\n",
-                        candidate, vtbl, score);
-                fflush(stderr);
-            }
-            return;
-        }
-    }
-    P.dev = candidate;
-    capture_methods(candidate);
-}
-
-/* An interface out-parameter: a pointer to a slot holding an object whose
- * vtable is d3d9 code (CreateDevice's ppDevice is the one that matters). */
-static int iface_out(uint32_t outptr, uint32_t *obj_out) {
+/* ------------------------------------------------------------- COM objects
+ * Every bridged COM call carries its `this` in args[0]. An object whose vtable
+ * lives in d3d9.dll is a D3D9 interface; one whose vtable fills 100+ slots is
+ * an IDirect3DDevice9 (that interface has 119 methods). Identity is kept per
+ * object because the engine also calls surfaces, swapchains, vertex buffers and
+ * shaders - all in d3d9.dll - and one global "the device" guess binds to
+ * whichever interface happens to be called first (measured: it bound to the
+ * swapchain-like object and every device call went unmatched). */
+#define MAX_OBJ 64
+typedef struct {
     uint32_t obj, vtbl;
-    if (!outptr || !readable(outptr, 4)) return 0;
-    obj = rd32(outptr);
-    if (!obj || (obj & 3) || !readable(obj, 4)) return 0;
-    vtbl = rd32(obj);
-    if (!in_range(vtbl, P.d3d9_lo, P.d3d9_hi)) return 0;
-    *obj_out = obj;
+    int      nslots;
+    int      is_device;
+    uint32_t m[128];
+} objrec_t;
+static objrec_t g_obj[MAX_OBJ];
+static int g_nobj;
+static int g_devices;
+
+/* IDirect3DDevice9. Asking the object beats guessing from the vtable: every
+ * d3d9 COM vtable is a contiguous run of d3d9 code pointers, so "how many slots
+ * are d3d9 code" scores 128 for textures and swapchains too (measured: the
+ * first version classified five different interfaces as devices).
+ *
+ * The GUID comes from the SDK's d3d9.h, not from memory: the hand-typed one was
+ * wrong in the last four bytes (A43B0D92B9E4 vs A43B0D82B9EB) and every QI
+ * returned E_NOINTERFACE, which read as "the engine never calls a device". */
+/* Copied from the SDK's d3d9.h (10.0.26100): DEFINE_GUID only declares the
+ * symbol, and linking guid.lib for two constants is not worth it. */
+static const GUID IID_D3D9_LOCAL =
+    { 0x81bdcbca, 0x64d4, 0x426d, { 0xae, 0x8d, 0xad, 0x01, 0x47, 0xf4, 0x27, 0x5c } };
+static const GUID IID_D3DDEV9_LOCAL =
+    { 0xd0223b96, 0xbf7a, 0x43fd, { 0x92, 0xbd, 0xa4, 0x3b, 0x0d, 0x82, 0xb9, 0xeb } };
+
+static int obj_is_device(uint32_t candidate, uint32_t vtbl) {
+    uint32_t qi = rd32(vtbl);
+    void *out = NULL;
+    long hr;
+    static int logged;
+    int verbose = verbosity() >= 2 && logged < 10;
+    if (!in_range(qi, P.d3d9_lo, P.d3d9_hi)) {
+        if (verbose) { logged++; fprintf(stderr, "[draw] qi 0x%08X: vtable[0]=0x%08X outside d3d9\n", candidate, qi); }
+        return 0;
+    }
+    hr = ((long(__stdcall *)(void *, const GUID *, void **))qi)
+            ((void *)(uintptr_t)candidate, &IID_D3DDEV9_LOCAL, &out);
+    if (verbose) {
+        logged++;
+        fprintf(stderr, "[draw] qi 0x%08X (qi=0x%08X) -> hr=0x%08lX out=0x%08X\n",
+                candidate, qi, hr, (uint32_t)(uintptr_t)out);
+        fflush(stderr);
+    }
+    if (hr != 0 || !out) return 0;
+    if (out != (void *)(uintptr_t)candidate) {
+        uint32_t ovt = rd32((uint32_t)(uintptr_t)out);
+        uint32_t rel = rd32(ovt + 8);
+        if (in_range(rel, P.d3d9_lo, P.d3d9_hi))
+            ((unsigned long(__stdcall *)(void *))rel)(out);
+    } else {
+        uint32_t rel = rd32(vtbl + 8);
+        if (in_range(rel, P.d3d9_lo, P.d3d9_hi))
+            ((unsigned long(__stdcall *)(void *))rel)(out);
+    }
     return 1;
+}
+
+static objrec_t *obj_for(uint32_t candidate) {
+    int i, nslots = 0;
+    uint32_t vtbl;
+    objrec_t *o;
+    if (!candidate || (candidate & 3) || !readable(candidate, 4)) return NULL;
+    for (i = 0; i < g_nobj; i++) if (g_obj[i].obj == candidate) return &g_obj[i];
+    if (g_nobj >= MAX_OBJ) return NULL;
+    vtbl = rd32(candidate);
+    /* The vtable itself does not have to live in d3d9.dll: this d3d9 (and the
+     * engine's Hw wrapper around it) allocates per-object thunk tables on the
+     * heap whose *entries* are d3d9 code. Requiring the table to be inside the
+     * module rejected the device the factory returned. */
+    if (!vtbl || !readable(vtbl, 0x40)) return NULL;
+    {
+        int k, score = 0;
+        for (k = 0; k < 16; k++)
+            if (in_range(rd32(vtbl + 4u * (uint32_t)k), P.d3d9_lo, P.d3d9_hi)) score++;
+        if (score < 8) return NULL;
+    }
+    o = &g_obj[g_nobj];
+    memset(o, 0, sizeof *o);
+    o->obj = candidate;
+    o->vtbl = vtbl;
+    o->is_device = obj_is_device(candidate, vtbl);
+    g_nobj++;
+    if (!o->is_device) return o;          /* cached negative: not worth a map */
+    for (i = 0; i < 128; i++) {
+        uint32_t fn = rd32(vtbl + 4u * (uint32_t)i);
+        if (in_range(fn, P.d3d9_lo, P.d3d9_hi)) { o->m[i] = fn; nslots++; }
+    }
+    o->nslots = nslots;
+    g_devices++;
+    P.dev = candidate;
+    P.have_dev = 1;
+    memcpy(P.m, o->m, sizeof P.m);     /* dispatch by target address only */
+    if (verbosity() >= 1) {
+        fprintf(stderr, "[draw] DEVICE 0x%08X vtbl 0x%08X (Present=%08X EndScene=%08X "
+                        "SetRenderState=%08X SetTexture=%08X DrawPrimitiveUP=%08X "
+                        "SetFVF=%08X SetVS=%08X SetPS=%08X)\n",
+                candidate, vtbl, o->m[17], o->m[42], o->m[57], o->m[65],
+                o->m[83], o->m[89], o->m[92], o->m[94]);
+        fflush(stderr);
+    }
+    return o;
 }
 
 /* ------------------------------------------------------------- primitives */
@@ -363,9 +420,8 @@ static void vertex_bbox(const unsigned char *v, unsigned n, unsigned stride,
 
 /* --------------------------------------------------------------- reporting */
 
-static void report_draw(int kind, const uint32_t *a, uint32_t caller) {
-    unsigned prims = a[2];
-    unsigned stride = 0;
+static void report_draw(int kind, unsigned type, unsigned prims, unsigned stride,
+                        uint32_t pverts, uint32_t caller) {
     uint32_t tex = P.tex0;
     const texrec_t *tr;
     int i, slot = -1;
@@ -396,16 +452,22 @@ static void report_draw(int kind, const uint32_t *a, uint32_t caller) {
         if (!known && P.ntex_used < 16) P.tex_used[P.ntex_used++] = tex;
     }
 
-    /* Once per texture, read its pixels back. Run with KORRA_DRAWPATH=2. */
-    if (verbosity() >= 2 && tex) {
-        for (i = 0; i < g_ntex; i++) {
-            if (g_tex[i].tex == tex && !g_tex[i].sampled) {
-                char buf[256];
-                g_tex[i].sampled = 1;
-                if (sample_texture(tex, buf, sizeof buf))
-                    fprintf(stderr, "[draw] contents tex=0x%08X %s (draw from sub_%08X)\n",
-                            tex, buf, caller);
-                break;
+    /* Once per texture, read its pixels back. Off by default: LockRect from
+     * inside the bridge hook is the one operation that has killed a run, so it
+     * needs its own switch (KORRA_DRAWPATH_TEX=1) while the census runs. */
+    {
+        static int tex_on = -1;
+        if (tex_on < 0) tex_on = getenv("KORRA_DRAWPATH_TEX") != NULL;
+        if (tex_on && tex) {
+            for (i = 0; i < g_ntex; i++) {
+                if (g_tex[i].tex == tex && !g_tex[i].sampled) {
+                    char buf[256];
+                    g_tex[i].sampled = 1;
+                    if (sample_texture(tex, buf, sizeof buf))
+                        fprintf(stderr, "[draw] contents tex=0x%08X %s (draw from sub_%08X)\n",
+                                tex, buf, caller);
+                    break;
+                }
             }
         }
     }
@@ -420,10 +482,9 @@ static void report_draw(int kind, const uint32_t *a, uint32_t caller) {
                          : kind == 2 ? "DrawIndexedPrimitive"
                          : kind == 3 ? "DrawPrimitiveUP"
                                      : "DrawIndexedPrimitiveUP";
-        fprintf(stderr, "[draw] sig#%d #%u %s prims=%u type=%u", slot,
-                g_sig[slot].hits, name, prims, a[1]);
-        if (kind == 3) fprintf(stderr, " stride=%u", a[4]);
-        if (kind == 4) fprintf(stderr, " stride=%u", a[8]);
+        fprintf(stderr, "[draw] sig#%d #%u %s type=%u prims=%u", slot,
+                g_sig[slot].hits, name, type, prims);
+        if (stride) fprintf(stderr, " stride=%u", stride);
         fprintf(stderr, " fvf=0x%X vs=0x%08X ps=0x%08X",
                 P.fvf, P.vs, P.ps);
         if (tex) {
@@ -437,22 +498,21 @@ static void report_draw(int kind, const uint32_t *a, uint32_t caller) {
     }
 
     /* Vertex data: only the UP forms carry it in an argument. */
-    if (kind == 3) {
-        uint32_t pv = a[3];
-        unsigned n = vertex_count(a[1], prims);
-        stride = a[4];
-        if (pv && stride && n && readable(pv, (size_t)stride * (n < 64 ? n : 64))) {
+    if ((kind == 3 || kind == 4) && pverts) {
+        unsigned n = vertex_count(type, prims);
+        if (stride && n && readable(pverts, (size_t)stride * (n < 64 ? n : 64))) {
             unsigned pos = (P.fvf & 0x004) ? 4 : (P.fvf & 0x002) ? 3 : 0;
             float bb[4]; unsigned nan = 0; uint32_t first8[8];
-            vertex_bbox((const unsigned char *)(uintptr_t)pv, n < 64 ? n : 64,
+            vertex_bbox((const unsigned char *)(uintptr_t)pverts, n < 64 ? n : 64,
                         stride, pos, 0, 0, bb, &nan, first8);
             fprintf(stderr, "[draw]   verts=%u x=[%.2f..%.2f] y=[%.2f..%.2f]"
                             " nan=%u v0=%08X %08X %08X %08X %08X %08X %08X %08X\n",
                     n, bb[0], bb[1], bb[2], bb[3], nan,
                     first8[0], first8[1], first8[2], first8[3],
                     first8[4], first8[5], first8[6], first8[7]);
-        } else if (pv) {
-            fprintf(stderr, "[draw]   vertex data 0x%08X not readable\n", pv);
+        } else {
+            fprintf(stderr, "[draw]   vertex data 0x%08X not readable (stride %u n %u)\n",
+                    pverts, stride, n);
         }
     }
 }
@@ -473,15 +533,87 @@ static void report_frame(void) {
             P.rs_seen[24] ? P.rs[24] : 0);         /* ALPHAFUNC */
 }
 
+/* ------------------------------------------------- windowed device creation
+ * The engine asks for an exclusive-fullscreen device when the machine has a
+ * display mode it likes. Two consequences: the desktop is hijacked (a capture
+ * cannot be relied on), and a second instance of the game cannot create a
+ * device at all, which makes a parallel debug session impossible.
+ *
+ * KORRA_WINDOWED is meant to rewrite the presentation parameters, but the hook
+ * that does it (quirk_probe.c) looks the call up by name, and the runtime has
+ * no names for COM methods - only bridged *imports* carry one. So it never
+ * fires. Here the factory object's identity comes from the vtable instead: any
+ * call on IDirect3D9 whose 7th slot is a plausible D3DPRESENT_PARAMETERS with a
+ * real window handle is CreateDevice (or CreateDeviceEx, same layout), and the
+ * struct is rewritten in place before the call.
+ *
+ * D3DPRESENT_PARAMETERS: Windowed +0x20, FullScreen_RefreshRateInHz +0x30,
+ * PresentationInterval +0x34; size 0x38 (the engine memsets exactly that). */
+#define D3DPP_WINDOWED   0x20u
+#define D3DPP_REFRESH_HZ 0x30u
+#define D3DPP_INTERVAL   0x34u
+
+static int plausible_present_params(uint32_t p, uint32_t hfocus, uint32_t *w,
+                                    uint32_t *h, uint32_t *windowed) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!p || (p & 3)) return 0;
+    if (!VirtualQuery((const void *)(uintptr_t)p, &mbi, sizeof mbi)) return 0;
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return 0;
+    if ((size_t)((const char *)mbi.BaseAddress + mbi.RegionSize -
+                 (const char *)(uintptr_t)p) < 0x38) return 0;
+    *w = rd32(p);
+    *h = rd32(p + 4);
+    *windowed = rd32(p + D3DPP_WINDOWED);
+    if (*windowed > 1) return 0;
+    if (rd32(p + 0x0C) > 8) return 0;                    /* BackBufferCount */
+    if (rd32(p + 0x10) > 16) return 0;                   /* MultiSampleType */
+    if (rd32(p + 0x18) > 8) return 0;                    /* SwapEffect */
+    /* hDeviceWindow may legitimately be NULL on a fullscreen device (D3D then
+     * uses CreateDevice's hFocusWindow), so either handle must be a window. */
+    if (!IsWindow((HWND)(uintptr_t)rd32(p + 0x1C)) &&
+        !IsWindow((HWND)(uintptr_t)hfocus))
+        return 0;
+    return 1;
+}
+
+static void probe_pre(uint32_t target, uint32_t *a) {
+    static int on = -1;
+    static int done;
+    if (on < 0) on = getenv("KORRA_WINDOWED") != NULL;
+    if (g_other_pre && g_other_pre != probe_pre) g_other_pre(target, a);
+    if (!on || done || !P.d3d9_lo) return;
+    if (a[0] != P.d3d) return;
+    {
+        static int tries;
+        uint32_t w, h, windowed;
+        int ok = plausible_present_params(a[5], a[3], &w, &h, &windowed);
+        if (verbosity() >= 2 && tries < 8) {
+            tries++;
+            fprintf(stderr, "[draw] pre: factory call 0x%08X a3=0x%08X a5=0x%08X params=%d\n",
+                    target, a[3], a[5], ok);
+            fflush(stderr);
+        }
+        if (!ok) return;
+        if (windowed) { done = 1; return; }
+        *(uint32_t *)(uintptr_t)(a[5] + D3DPP_WINDOWED) = 1;
+        *(uint32_t *)(uintptr_t)(a[5] + D3DPP_REFRESH_HZ) = 0;
+        *(uint32_t *)(uintptr_t)(a[5] + D3DPP_INTERVAL) = D3DPRESENT_INTERVAL_IMMEDIATE;
+        done = 1;
+        fprintf(stderr, "[draw] device creation forced windowed (was %ux%u), "
+                        "caller=sub_%08X\n", w, h, g_cur_func);
+        fflush(stderr);
+    }
+}
+
 /* -------------------------------------------------------------- the hook */
 
 static void probe_post(uint32_t target, const uint32_t *a, uint32_t ret) {
-    int mi;
     if (g_other_post && g_other_post != probe_post) g_other_post(target, a, ret);
     if (!P.on) return;
 
     /* d3d9.dll is loaded by native32_bind, after main() starts, so the module
      * range cannot be resolved at init time. */
+    InterlockedIncrement(&g_calls);
     if (!P.d3d9_lo) {
         module_range("d3d9.dll", &P.d3d9_lo, &P.d3d9_hi);
         module_range("d3dx9_43.dll", &P.d3dx_lo, &P.d3dx_hi);
@@ -499,93 +631,27 @@ static void probe_post(uint32_t target, const uint32_t *a, uint32_t ret) {
         if (!P.d3d && n && strstr(n, "d3d9.dll!Direct3DCreate9")) {
             P.d3d = ret;
             if (verbosity() >= 1) {
-                fprintf(stderr, "[draw] IDirect3D9* 0x%08X vtable 0x%08X\n",
-                        ret, rd32(ret));
+                static const GUID iid_unk =
+                    { 0x00000000, 0x0000, 0x0000, { 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
+                uint32_t qi = rd32(rd32(ret));
+                void *o = NULL, *u = NULL;
+                long hr = -1, hru = -1;
+                if (in_range(qi, P.d3d9_lo, P.d3d9_hi)) {
+                    hr = ((long(__stdcall *)(void *, const GUID *, void **))qi)
+                            ((void *)(uintptr_t)ret, &IID_D3D9_LOCAL, &o);
+                    hru = ((long(__stdcall *)(void *, const GUID *, void **))qi)
+                            ((void *)(uintptr_t)ret, &iid_unk, &u);
+                }
+                fprintf(stderr, "[draw] IDirect3D9* 0x%08X vtable 0x%08X"
+                                " (QI self-test d3d9=0x%08lX/%08X unknown=0x%08lX/%08X)\n",
+                        ret, rd32(ret), hr, (uint32_t)(uintptr_t)o,
+                        hru, (uint32_t)(uintptr_t)u);
                 fflush(stderr);
             }
             return;
         }
-    }
-
-    if (!P.have_dev) {
-        if (P.d3d && a[0] == P.d3d) {
-            /* IDirect3D9::CreateDevice(this, adapter, type, hwnd, flags,
-             * ppPresentParams, ppDevice) - scan the pointer slots so the
-             * interface is captured whatever the slot numbering is. */
-            int k;
-            uint32_t dev = 0;
-            static uint32_t last_factory_target;
-            static int factory_logs;
-            for (k = 4; k <= 8 && !dev; k++)
-                if (iface_out(a[k], &dev)) { /* found */ }
-            if (dev) {
-                P.dev = dev;
-                capture_methods(dev);
-            }
-            if (verbosity() >= 2 && factory_logs < 40 &&
-                target != last_factory_target) {
-                last_factory_target = target;
-                factory_logs++;
-                fprintf(stderr, "[draw] factory call target=0x%08X ret=0x%08X\n",
-                        target, ret);
-                fflush(stderr);
-            }
-            if (P.have_dev) return;
-        }
-        sniff_device(a[0]);
-        if (P.have_dev && verbosity() >= 1) {
-            fprintf(stderr, "[draw] device from first COM call, caller=sub_%08X\n", g_cur_func);
-            fflush(stderr);
-        }
-    }
-
-    mi = method_index(target);
-    if (mi < 0) return;
-
-    switch (mi) {
-    case D3DDEV_PRESENT:
-        report_frame();
-        P.frame++;
-        P.draws = P.draws_up = P.draws_ib = P.prims = 0;
-        P.ntex_used = 0;
-        break;
-    case D3DDEV_SETRENDERSTATE:
-        if (a[1] < 256) { P.rs[a[1]] = a[2]; P.rs_seen[a[1]] = 1; }
-        break;
-    case D3DDEV_SETTEXTURE:
-        if (a[1] == 0) {
-            if (a[2] != P.tex0 && verbosity() >= 2) {
-                const texrec_t *tr = find_texture(a[2]);
-                fprintf(stderr, "[draw] tex0 0x%08X -> 0x%08X%s%ux%u caller=sub_%08X\n",
-                        P.tex0, a[2], tr ? " dims=" : "",
-                        tr ? tr->w : 0, tr ? tr->h : 0, g_cur_func);
-            }
-            P.tex0 = a[2];
-        }
-        break;
-    case D3DDEV_SETFVF:                P.fvf = a[1]; break;
-    case D3DDEV_SETVERTEXSHADER:       P.vs = a[1]; break;
-    case D3DDEV_SETPIXELSHADER:        P.ps = a[1]; break;
-    case D3DDEV_SETVERTEXDECLARATION: P.vdecl = a[1]; break;
-    case D3DDEV_SETSTREAMSOURCE:       if (a[1] == 0) { P.stream0 = a[2]; P.stream0_stride = a[3]; } break;
-    case D3DDEV_SETINDICES:            P.indices = a[1]; break;
-    case D3DDEV_DRAWPRIMITIVE:         report_draw(1, a, g_cur_func); break;
-    case D3DDEV_DRAWINDEXEDPRIMITIVE:  report_draw(2, a, g_cur_func); break;
-    case D3DDEV_DRAWPRIMITIVEUP:       report_draw(3, a, g_cur_func); break;
-    case D3DDEV_DRAWINDEXEDPRIMITIVEUP: report_draw(4, a, g_cur_func); break;
-    case D3DDEV_CREATETEXTURE:
-        /* (this, Width, Height, Levels, Usage, Format, Pool, ppTexture) */
-        note_texture(rd32(a[7]), a[1], a[2], a[5], a[6], a[3], "device CreateTexture");
-        break;
-    default:
-        /* D3DX lives in its own DLL and is reached through the same bridge. */
-        break;
-    }
-
-    /* D3DXCreate*: name is available because the four imports are bound by
-     * name; log each creation so a draw's texture pointer can be identified. */
-    {
-        const char *n = native32_name(target);
+        /* D3DXCreate*: the four imports are bound by name, so each texture can
+         * be identified later from the draw's texture pointer. */
         if (n && strstr(n, "d3dx9_43.dll!")) {
             if (strstr(n, "D3DXCreateTextureFromFileInMemoryEx")) {
                 /* (dev, data, size, W, H, mips, usage, fmt, pool, filter,
@@ -597,7 +663,111 @@ static void probe_post(uint32_t target, const uint32_t *a, uint32_t ret) {
                 note_texture(rd32(a[7]), a[1], a[2], a[5], a[6], a[3],
                              ret == 0 ? "D3DXCreateTexture" : "D3DXCreateTexture(FAILED)");
             }
+            return;
         }
+    }
+
+    if (!P.have_dev) {
+        if (P.d3d && a[0] == P.d3d) {
+            /* The factory's own calls, for reference: which call is
+             * CreateDevice is decided from the object the call returns, not
+             * from the slot number. */
+            static uint32_t seen[16];
+            static int nseen;
+            int i, known = 0;
+            for (i = 0; i < nseen; i++) if (seen[i] == target) known = 1;
+            if (!known && nseen < 16) {
+                seen[nseen++] = target;
+                fprintf(stderr, "[draw] factory 0x%08X args %08X %08X %08X %08X %08X %08X %08X %08X ret=%08X\n",
+                        target, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], ret);
+                fflush(stderr);
+            }
+            /* CreateDevice is recognisable by its argument shape:
+             * (adapter, DeviceType in {HAL,REF}, hFocusWindow,
+             *  BehaviorFlags containing MULTITHREADED, ppPresentParams,
+             *  ppDevice)  and it is the factory call that returns S_OK with an
+             *  interface written to args[6]. */
+            if (!P.have_dev && ret == 0 && (a[4] == 0x44u || a[4] == 0x24u) &&
+                (a[2] == 1u || a[2] == 2u) && readable(a[5], 0x38) && readable(a[6], 4)) {
+                uint32_t dev = rd32(a[6]);
+                static int tries;
+                if (tries++ < 4)
+                    fprintf(stderr, "[draw] CreateDevice? ppdev=0x%08X -> 0x%08X params{%08X %08X %08X %08X %08X %08X %08X %08X}\n",
+                            a[6], dev, rd32(a[5]), rd32(a[5] + 4), rd32(a[5] + 8),
+                            rd32(a[5] + 12), rd32(a[5] + 16), rd32(a[5] + 20),
+                            rd32(a[5] + 24), rd32(a[5] + 28));
+                if (dev) {
+                    objrec_t *d = obj_for(dev);
+                    if (P.have_dev) {
+                        if (verbosity() >= 1)
+                            fprintf(stderr, "[draw] device 0x%08X confirmed by QueryInterface\n",
+                                    dev);
+                        return;
+                    }
+                    if (tries <= 4) {
+                        fprintf(stderr, "[draw] candidate 0x%08X vtbl 0x%08X QI refused\n",
+                                dev, rd32(dev));
+                        fflush(stderr);
+                    }
+                }
+            }
+        }
+    }
+
+    {
+        /* Dispatch by method address, not by object: the device pointer the
+         * factory returns is authoritative, and every method call lands on one
+         * of its vtable entries whatever `this` the engine passes. */
+        int mi = -1, k;
+        if (P.have_dev)
+            for (k = 0; k < 128; k++) if (P.m[k] == target) { mi = k; break; }
+        if (mi >= 0) {
+            InterlockedIncrement(&g_d3d_calls);
+            switch (mi) {
+            case D3DDEV_PRESENT:
+                report_frame();
+                P.frame++;
+                P.draws = P.draws_up = P.draws_ib = P.prims = 0;
+                P.ntex_used = 0;
+                break;
+            case D3DDEV_SETRENDERSTATE:
+                if (a[1] < 256) { P.rs[a[1]] = a[2]; P.rs_seen[a[1]] = 1; }
+                break;
+            case D3DDEV_SETTEXTURE:
+                if (a[1] == 0) {
+                    if (a[2] != P.tex0 && verbosity() >= 2) {
+                        const texrec_t *tr = find_texture(a[2]);
+                        fprintf(stderr, "[draw] tex0 0x%08X -> 0x%08X%s%ux%u caller=sub_%08X\n",
+                                P.tex0, a[2], tr ? " dims=" : "",
+                                tr ? tr->w : 0, tr ? tr->h : 0, g_cur_func);
+                    }
+                    P.tex0 = a[2];
+                }
+                break;
+            case D3DDEV_SETFVF:                P.fvf = a[1]; break;
+            case D3DDEV_SETVERTEXSHADER:       P.vs = a[1]; break;
+            case D3DDEV_SETPIXELSHADER:        P.ps = a[1]; break;
+            case D3DDEV_SETVERTEXDECLARATION:  P.vdecl = a[1]; break;
+            case D3DDEV_SETSTREAMSOURCE:       if (a[1] == 0) { P.stream0 = a[2]; P.stream0_stride = a[3]; } break;
+            case D3DDEV_SETINDICES:            P.indices = a[1]; break;
+            case D3DDEV_DRAWPRIMITIVE:         report_draw(1, a[1], a[3], 0, 0, g_cur_func); break;
+            case D3DDEV_DRAWINDEXEDPRIMITIVE:  report_draw(2, a[1], a[6], 0, 0, g_cur_func); break;
+            case D3DDEV_DRAWPRIMITIVEUP:       report_draw(3, a[1], a[2], a[4], a[3], g_cur_func); break;
+            case D3DDEV_DRAWINDEXEDPRIMITIVEUP: report_draw(4, a[1], a[4], a[8], a[7], g_cur_func); break;
+            case D3DDEV_CREATETEXTURE:
+                /* (this, Width, Height, Levels, Usage, Format, Pool, ppTexture) */
+                note_texture(rd32(a[7]), a[1], a[2], a[5], a[6], a[3], "device CreateTexture");
+                break;
+            default:
+                break;
+            }
+            return;
+        }
+        if (in_range(target, P.d3d9_lo, P.d3d9_hi)) {
+            InterlockedIncrement(&g_d3d_calls);
+            note_unmatched(target, a);
+        }
+        return;
     }
 }
 
@@ -607,9 +777,21 @@ static DWORD WINAPI watchdog(LPVOID unused) {
     (void)unused;
     for (;;) {
         Sleep(500);
-        if (native32_post_hook != probe_post) {
+        if (P.on && native32_post_hook != probe_post) {
             if (native32_post_hook) g_other_post = native32_post_hook;
             native32_post_hook = probe_post;
+        }
+        if (getenv("KORRA_WINDOWED") && native32_pre_hook != probe_pre) {
+            if (native32_pre_hook) g_other_pre = native32_pre_hook;
+            native32_pre_hook = probe_pre;
+        }
+        if (P.on) {
+            static unsigned tick;
+            if (++tick % 10 == 0) {      /* every ~5 s */
+                fprintf(stderr, "[draw] alive frames=%u calls=%ld d3d=%ld draws=%u unmatched=%d\n",
+                        P.frame, g_calls, g_d3d_calls, P.draws, g_nunmatched);
+                fflush(stderr);
+            }
         }
     }
     return 0;
@@ -617,11 +799,18 @@ static DWORD WINAPI watchdog(LPVOID unused) {
 
 static void probe_start(void) {
     P.on = verbosity();
-    if (!P.on) return;
-    if (native32_post_hook && native32_post_hook != probe_post)
-        g_other_post = native32_post_hook;
-    native32_post_hook = probe_post;
-    CreateThread(NULL, 0, watchdog, NULL, 0, NULL);
+    if (P.on) {
+        if (native32_post_hook && native32_post_hook != probe_post)
+            g_other_post = native32_post_hook;
+        native32_post_hook = probe_post;
+    }
+    if (getenv("KORRA_WINDOWED")) {
+        if (native32_pre_hook && native32_pre_hook != probe_pre)
+            g_other_pre = native32_pre_hook;
+        native32_pre_hook = probe_pre;
+    }
+    if (P.on || getenv("KORRA_WINDOWED"))
+        CreateThread(NULL, 0, watchdog, NULL, 0, NULL);
     /* No log line here: this runs at CRT init, before main() has pointed stderr
      * at the per-run log file. The first hook call reports the settings. */
 }
