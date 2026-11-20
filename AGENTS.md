@@ -235,6 +235,26 @@ Append only; newest last. Format: date — attempt — outcome — next idea.
 - 2026-11-20 — a `.CRT$XIU` initializer that calls `CreateThread` faults before
   `main` (exit `0xC0000005`, no log file). Initializers may install hooks; start
   threads later.
+- 2026-11-20 — a thread census that suspends every thread from
+  `CreateToolhelp32Snapshot` **hangs the probe** when it reaches its own thread:
+  `SuspendThread(me)` never returns, so the sampler stops silently and the game
+  keeps running. The run then looks like "the game stalled" instead of "the probe
+  died". Skip `GetCurrentThreadId()` before suspending anything.
+- 2026-11-20 — identifying `IDirect3D9::CreateDevice` as "BehaviorFlags has
+  vertex-processing bits plus a plausible `D3DPRESENT_PARAMETERS`" — **too
+  loose**. It matched unrelated COM calls on the 4600th frame, rewrote a guest
+  structure whose slot 4 held `0xDEAD0000` (the runtime's dummy return address),
+  and crashed the boot with a write to `0xFFFFFFF4`. Match the engine's exact
+  BehaviorFlags (`0x44`, then `0x24`), require `DeviceType` HAL/REF, validate
+  every field of the parameter block, and act on the **first** match only.
+- 2026-11-20 — reading first-area fps from an On-Screen-Display overlay — **the
+  overlay is part of the measurement**. With MSI Afterburner/RTSS attached,
+  `IDirect3DDevice9::Present` blocks 52-581 ms (median 301 ms, always `S_OK`) on
+  ~1.2 % of frames; with the stack detached the same build holds 40-58 fps and no
+  Present exceeds 50 ms. The 298 ms "3 fps" reading was that stall. Count presents
+  at the device call (`src/host/perf_probe.c`, `KORRA_PERF=1`) before trusting an
+  OSD number. `D3DPRESENTFLAG_LOCKABLE_BACKBUFFER` is **not** the mechanism
+  (clearing it changed nothing).
 
 
 ## 7. Reporting

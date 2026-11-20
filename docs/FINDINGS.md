@@ -1408,3 +1408,101 @@ shift count > 1 OF) are deliberately not modelled and are not defects.
   further profiling (the generated tree changed).
 - `tools/scan_pcmpistri.py` counts static sites only; the 28 lifted instances
   are catalog aliases.
+
+## 2026-11-20 (later) - first-area performance: where the 298 ms goes, and why it is not the game
+
+Owner report: menus ~59 fps, first area ~3 fps / 298 ms, cause unknown, M2 gate held
+until it is explained. This session owns that defect. Runs use `build\run_perf.exe`
+(copy of the 470ab9e build); `run_text.exe` was never touched.
+
+New instruments (host-only, inert unless their env var is set):
+
+| file | knob | what it measures |
+|---|---|---|
+| `src/host/perf_probe.c` | `KORRA_PERF=1` | per frame: wall time from `[frameMgr+0x5c]`, process CPU, time inside every bridged Win32 call with the lifted caller, d3d9 device Present count, main-thread EIP samples; per second: present/s, CPU%, top callees of the main thread *and of every other guest thread*, and a census of all 24 guest threads |
+| `src/host/present_tune.c` | `KORRA_PRESENT=1` | reads (and can rewrite) the `D3DPRESENT_PARAMETERS` block of the first `IDirect3D9::CreateDevice`, identified structurally because COM methods have no name in the runtime's table |
+
+### The limiter is not the cause, and the numbers say so per frame
+
+Every run, every frame, from boot to the first area:
+
+    [perf] cfg int=50 mode=0 flags=0x0
+
+`[frameMgr+0x58]` = 50 (1/3-ms units = 60 fps), `DAT_00e4d210` = 0 (60 fps branch),
+`0xE4D01C` bit 2 clear (limiter enabled). The value never changes, so the guest is
+never asking for a 300 ms frame. The limiter also cannot produce one: it exits its
+`Sleep` loop as soon as the elapsed time reaches the interval, so its worst case is
+one 15.6 ms timer tick.
+
+### What a first-area frame actually is
+
+Steady first area (overlay detached): 17.5-25 ms/frame, 40-58 fps, ~2,200 bridged
+calls per frame, process CPU 1.5-1.9 cores across 24 guest threads. The main
+thread's own breakdown for a 25 ms frame:
+
+    dt=25ms  nat=22ms   WaitForSingleObject 16-21ms in 34 calls (caller 0x740CC0)
+                        InterlockedCompareExchange 9-14ms in 400-670 calls
+                        Enter/LeaveCriticalSection ~2-4ms in ~400 calls
+                        PeekMessageA/DispatchMessageA ~1ms
+
+So the frame is the main thread **waiting for the engine's own job threads** (34
+waits, worst single 17.7 ms) while those threads finish the frame's work. That is
+the port's structural cost, not the GPU: the runtime runs all lifted guest code
+under one machine lock, so the frame is bounded by the *sum* of every thread's
+guest work rather than by the slowest one. `InterlockedCompareExchange` at
+caller `0x741410`/`0x74F7D0` is the engine's own spinlock, and each spin iteration
+crosses the bridge (machine lock released and re-taken), which is why 650 of them
+cost 9-14 ms.
+
+### The 298 ms is one Present call, and it belongs to the overlay
+
+`IDirect3DDevice9::Present` (device vtable slot 17, caller `0x759E70`) blocks for
+**52-581 ms, median 301 ms, always returning S_OK**, on ~1.2 % of frames. That is
+exactly the number the owner's overlay reported (298.3 ms), and it is the whole
+"3 fps": a frame whose Present takes 300 ms is a frame at 3 fps.
+
+Three configurations, same build, same scenario:
+
+| overlay stack | Present > 50 ms | first-area fps |
+|---|---|---|
+| MSI Afterburner + RTSS attached | 100-570 ms stalls, every few seconds | 22-48, drops to ~3 fps while stalled |
+| RTSS alone (Afterburner not running) | **0** | 41-58 |
+| neither | **0** | 40-58 |
+
+Clearing `D3DPRESENTFLAG_LOCKABLE_BACKBUFFER` (137 stalls in 290 s with it
+cleared) changed nothing, so it is not a backbuffer-lock path in the driver. The
+stall is inside the overlay's in-process Present hook: the port's call itself
+succeeds, and nothing else in the process is holding the device at that moment
+(the "other threads" accounting shows no d3d9 call of any length during a stall).
+
+The engine's own present path is sane and was measured, not assumed:
+`1280x720, X8R8G8B8, BackBufferCount 0, MSAA 0, SwapEffect DISCARD, Windowed 1,
+AutoDepth 0, D24S8, flags 0x1, refresh 0, PresentationInterval IMMEDIATE` - i.e.
+windowed, no vsync, so neither vsync nor exclusive fullscreen is involved.
+
+### Consequences for the gate
+
+- The M2-critical claim "the first area runs at 3 fps" is **wrong as stated**: with
+  the measuring overlay detached the same build holds 40-58 fps in the first area,
+  with no frame over 50 ms except the engine's own job-thread waits.
+- The remaining headroom question is the port's, not the machine's: one machine
+  lock for all guest threads, ~2,200 bridged calls per frame, and a spinlock whose
+  every iteration pays a full bridge round trip. Fixing that belongs to the
+  runtime/lifter layer (`pcrecomp`), not to a host shim.
+- A separate, unrelated crash ends long runs: the scripted pad walks into a menu
+  that calls an unimplemented `ISteamUser` slot, the stub returns 0, and the engine
+  dereferences `[0x11]` (guest `0x0076C590`). Not on the performance path.
+
+### Traps found here (also in AGENTS.md section 6)
+
+- A thread census that iterates `CreateToolhelp32Snapshot` **must skip its own
+  thread**: `SuspendThread(me)` never returns, and the sampler dies silently while
+  the game keeps running - a whole run's data lost to a dead probe.
+- `IDirect3D9::CreateDevice` detection by "BehaviorFlags has vertex-processing
+  bits + a plausible parameter block" is **too loose**: it matched unrelated COM
+  calls, rewrote a guest structure whose slot 4 read `0xDEAD0000` (the runtime's
+  dummy return address), and crashed the boot. Match the engine's exact values
+  (0x44 then 0x24, DeviceType HAL/REF) and act only on the first match.
+- The first-area fps depends on the *measuring tool*: an overlay that hooks
+  Present can add 300 ms per frame. Measure with `KORRA_PERF=1` (present/s is
+  counted at the real device call) before believing an OSD number.
