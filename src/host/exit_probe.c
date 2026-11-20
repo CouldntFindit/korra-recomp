@@ -26,6 +26,17 @@ static void shim_ExitProcess(void) {
     fprintf(stderr, "\n[exit] ExitProcess(%u) called from guest function 0x%08X (import %s)\n",
             code, g_cur_func, import ? import : "(none)");
     native32_dump_icalls(16);
+    /* A clean quit takes the call stack with it. The entry ring still holds the
+     * last RECOMP_ENTER calls, which is the only record of who decided to stop. */
+    recomp_dump_trace("ExitProcess");
+    recomp_trace_flush();
+    fprintf(stderr, "[exit] guest stack:");
+    for (int k = 0; k < 0x80; k += 4) {
+        uint32_t v = MEM32(g_esp + k);
+        fprintf(stderr, " %08X", v);
+        if (k % 0x20 == 0x1C) fprintf(stderr, "\n[exit]            ");
+    }
+    fprintf(stderr, "\n");
     fflush(stderr);
     ExitProcess(code);
 }

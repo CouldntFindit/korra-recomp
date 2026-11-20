@@ -10,7 +10,9 @@ param(
     [string]$Steps = "enter,enter,enter",
     [int]$StepWait = 6,
     [string]$Prefix = "input",
-    [string]$Game = ""
+    [string]$Game = "",
+    [string]$Exe = "build\korra_recomp.exe",
+    [string]$Extra = ""
 )
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Drawing
@@ -79,7 +81,7 @@ public class F {
 }
 "@
 $root = Split-Path -Parent $PSScriptRoot
-$exe = Join-Path $root "build\korra_recomp.exe"
+$exe = Join-Path $root $Exe
 if (-not $Game) { $Game = Join-Path (Split-Path -Parent (Split-Path -Parent $root)) "The Legend of Korra" }
 
 $script:h = [IntPtr]::Zero
@@ -116,7 +118,9 @@ function Shot([string]$name) {
     Write-Host ("saved {0} ({1}x{2})" -f $path, $b.Width, $b.Height)
 }
 
-$p = Start-Process -FilePath $exe -ArgumentList "`"$Game`"" -PassThru `
+$args = "`"$Game`""
+if ($Extra) { $args = "$args $Extra" }
+$p = Start-Process -FilePath $exe -ArgumentList $args -PassThru `
      -RedirectStandardOutput (Join-Path $root "build\run.out") -RedirectStandardError (Join-Path $root "build\run.err")
 # Wait for the window to exist (polling, not a fixed sleep): the engine creates
 # it once the CRT and D3D9 are up, which is fast but not instant.

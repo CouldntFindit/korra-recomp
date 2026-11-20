@@ -35,6 +35,7 @@ void korra_install_fault_handlers(void);
 void korra_quirk_probe_init(void);
 void korra_file_probe_init(void);
 void korra_msg_probe_init(void);
+void korra_crash_probe_init(void);
 void korra_windowed_init(void);
 /* No hand-written function overrides yet. This is where a specific guest VA
  * gets a host body (a debug hook, a stubbed subsystem), keyed by address. */
@@ -128,6 +129,7 @@ int main(int argc, char **argv) {
     korra_file_probe_init();
     korra_windowed_init();
     korra_msg_probe_init();
+    korra_crash_probe_init();
     if (getenv("KORRA_TRACE")) native32_trace_native = 1;
 
     uint32_t base = 0x400000;
