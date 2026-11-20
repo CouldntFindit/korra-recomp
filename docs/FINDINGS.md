@@ -1205,3 +1205,103 @@ next session at a stage slot that the crash does not need.
   so. Use one of each per run.
 - The host redirects stderr into `<game>\korra_host-*.log`, so `build\run.err`
   stays empty and all runtime trace output is in that log.
+
+## 2026-11-20 (crash session, second round) - FIXED: the crash was a lifter defect in pcmpistri
+
+The player's asset gate was not a data problem and not a missing install. `strstr`
+(0x77A1D0) could never return a match, so `sub_00637BC0`'s sub-resource resolve
+returned -1 and gate 2 rejected every player. The cause is in the lifter, and it
+is now fixed: new game starts, the cutscene plays, and the first area is
+playable.
+
+### What the original code does
+
+`strstr` dispatches on `__isa_available` (`cmp dword ptr [0x9f4d20], 1` at
+0x77A1DB). This CPU reports 2, so the SSE4.2 path at 0x77A2EB runs. It decides
+with **four** flags:
+
+| site | instruction | branch | meaning |
+|---|---|---|---|
+| 0x77A34F | `pcmpistri xmm0, [eax-0x10], 0x0C` | `ja` | CF=0 and ZF=0: no match, no NUL in the block -> next block |
+| 0x77A358 | (same flags) | `jae` | CF=0: no match and the block ended -> return NULL |
+| 0x77A38B | `pcmpistri xmm1, [esi-0x10], 0x0C` | `jno` | OF = IntRes2[0]: a match starts at this position |
+| 0x77A392 | (same flags) | `jns` | SF = IntRes2[15] |
+
+`PCMPISTRI` defines CF, ZF, SF and OF (SF = IntRes2[15], OF = IntRes2[0]; AF and
+PF are undefined). The lifter carried only ZF and CF, and emitted the following
+branches through a synthetic compare with `_flag_a = ZF?0:1, _flag_b = 0`, which
+evaluates to `ja -> (ZF==0)`, `jae -> 1`, `jno -> 1`, `jns -> 1`
+(`CMP_NO` is literally `1`). So:
+
+- `jae` was always taken: the scan returned NULL as soon as a 16-byte block
+  contained a NUL character;
+- `jno` was always taken: the needle-verify loop always rejected its candidate.
+
+Either one alone makes a positive result impossible on this CPU. The engine's
+other string work did not notice because those callers only need "not found".
+
+### Why it surfaced as the new-game crash
+
+`sub_00637BC0` hardcodes the needle (`push 0x941F7C` = `_battleParameter.bin`)
+and resolves it inside the loaded DAT container. All 11 of its call sites are
+`find asset -> resolve battle parameters`, so every character's battle data was
+missing. `sub_004E85A0` (gate 2 of player activation) treats a failed resolve as
+a rejected player, the player object is destroyed, `0xCA3E58` stays 0 and the HUD
+update dereferences NULL.
+
+### The fix (pcrecomp `b0b2ce2`, Korra-0004)
+
+- `recomp_pcmpistri` reports all four defined flags: hardware `_mm_cmpistrs` /
+  `_mm_cmpistro` on x86, and SF = IntRes2[15], OF = IntRes2[0] in the portable
+  body.
+- New `recomp_pcmp_eflags()` packs them into a packed EFLAGS.
+- `lift32.py` emits that packed state after `pcmpistri` (`_flag_k = FK_EFLAGS`),
+  so every following `jcc` compiles to `recomp_cond(FK_EFLAGS, ...)` and reads
+  the instruction's real flags.
+
+On x86 this is exact by construction: the instruction runs on the host CPU and
+the branch reads its actual flags. Relift: 37,029/37,029, 0 failures, 246 s, 6
+`pcmpistri` sites (the `strncmp` family in `recomp_0042.c` included). Full
+rebuild 472 s.
+
+### Verification (one run, `KORRA_PAD=1 KORRA_PAD_AUTO=1 KORRA_TRACE_SCENE=1`)
+
+- No crash for 321 s (the defect used to fault at ~70 s, always at
+  `0x00603C00`).
+- `0xCA3E58` becomes **non-zero** (`player=0x0D3EAB60`): the player was accepted,
+  so gate 2 passed and the resolve worked.
+- Scene flow now reaches values that were unreachable before: `0x12` (stage
+  request) -> `0x14` -> `0x16`. `0x14` only advances when the installer state is
+  **4**, i.e. the slot installer (`0x53EB40` -> `0x53EBB0` -> `0x53DCC0`) ran to
+  completion. The registry grows from 58 to 94 records while the stage loads.
+- **Gameplay reached**: `build\shots\newgame-312s.png` shows Korra in the first
+  area with two enemies and the tutorial prompts ("Light Attack X", "Heavy
+  Attack Y", "Jump A").
+- **Text renders**, including the same message box the pre-fix build drew as a
+  black rectangle (`build\shots\acp1252.png` at 04:32 vs `newgame-101s.png` for
+  the panel and its text). See the shared-root note below.
+
+### Shared root with the text defect - confirmed
+
+The text session's chain (font asset / string lookup -> glyph layout -> draw)
+runs through the same CRT string routines. With `strstr` fixed, the title
+screen's message box and the in-game tutorial prompts draw their strings, so the
+missing-glyph defect and the missing battle parameters have **one** cause: the
+`pcmpistri` flag model. That is measured, not inferred: no draw-path or font
+change was made in this session.
+
+### Open, measured, not explained
+
+- The in-game frame rate in that run was **3 fps (298 ms/frame)** according to
+  the machine's overlay, while the menus measured ~59 fps earlier. Not
+  investigated here; the quirk probe (`KORRA_QUIRK_PROBE=1`) logs frames/s and
+  the frame interval, and is the first thing to run next.
+- The stray `--poison`/`--firsthit` traps from the previous entry still apply.
+
+### Not verified
+
+- A New Game played past the tutorial prompts (the pad script only taps A and
+  START).
+- Behaviour on a CPU where `__isa_available` is 2 but the ambient `strstr` path
+  differs (arm64 uses the portable body, which now also carries SF/OF but is
+  still unverified against hardware).

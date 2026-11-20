@@ -217,6 +217,24 @@ Append only; newest last. Format: date — attempt — outcome — next idea.
 - 2026-11-20 — runtime trace output is **not** in `build\run.err`: the host
   redirects stderr into `<game>\korra_host-*.log`, so an empty `run.err` does
   not mean the trace was silent.
+- 2026-11-20 — "SF and OF from `pcmpistri` are not carried because no generated
+  site branches on them" (the comment in `lift32.py`) — **wrong, and it cost the
+  new-game crash**. Site `0x77A38B` in the CRT's SSE4.2 `strstr` branches
+  `jno`/`jns` on exactly those, and with `_flag_a/_flag_b` synthesized from
+  ZF/CF they became constants: `jno` always taken, so the needle-verify loop
+  always rejected its candidate. `CMP_NO` is literally `1` and `jno`/`jns` read
+  bits the model never had. Fixed by packing CF/ZF/SF/OF into `FK_EFLAGS`
+  (`recomp_pcmp_eflags`, pcrecomp `b0b2ce2`). Before adding "no site branches on
+  X", grep the *original* disassembly for the jcc form, not the lifted text.
+- 2026-11-20 — calling guest code inline from `native32_post_hook` on a private
+  stack (to read a function's return value) **hangs the process** before `main`
+  flushes, and starting the same experiment from a worker thread starves on the
+  machine lock (the guest only yields at depth 1, which the game loop never
+  reaches). Do not re-try either; read the *original instructions* with capstone
+  instead, which settled this defect in one pass.
+- 2026-11-20 — a `.CRT$XIU` initializer that calls `CreateThread` faults before
+  `main` (exit `0xC0000005`, no log file). Initializers may install hooks; start
+  threads later.
 
 
 ## 7. Reporting

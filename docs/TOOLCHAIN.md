@@ -45,6 +45,7 @@ What the patch series buys us (from its own subjects):
 | **Korra-0001** (ours, `1a8cb93`) | `lift32`: REP/REPNE prefix on RET is a hint, not an unimplemented instruction (`F3 C3` in LoK's CRT startup) |
 | **Korra-0002** (ours, `346a509`) | `lift32`: `cmpxchg` / `cmpxchg8b` (MSVC interlocked ops, 162 sites) and capstone's `fcomi`/`fcompi`/`fucomi`/`fucompi` names (430 sites) |
 | **Korra-0003** (ours, `d3f7803`) | `lift32` + `recomp_types.h`: `bsf` / `bsr` and portable `RECOMP_BSF/BSR` |
+| **Korra-0004** (ours, `b0b2ce2`) | `lift32` + `recomp_types.h`: `pcmpistri` carries **SF and OF** as well as ZF/CF, packed into `FK_EFLAGS` via `recomp_pcmp_eflags`. Without it every `ja`/`jae`/`jno`/`jns` after a `pcmpistri` was a constant, so MSVC's SSE4.2 `strstr` could never accept a match (6 sites in LoK; 0 lift failures) |
 
 ## Local environment
 
