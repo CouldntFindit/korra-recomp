@@ -370,7 +370,7 @@ static unsigned g_cw_n;
  * nothing is sampled until a real image address is entered. */
 static int g_crash_live;
 
-static unsigned g_site_calls[28];
+static unsigned g_site_calls[32];
 
 static int crash_site_budget(int slot, unsigned cap) {
     if (g_site_calls[slot]++ >= cap) return 0;
@@ -527,7 +527,7 @@ static void crash_probe_hook(uint32_t va) {
     case 0x006AAB10u: {
         /* first stack argument is at esp+4: the call pushed the return address */
         uint32_t p = MEM32(g_esp + 4);
-        if (crash_site_budget(21, 120) && p >= 0x00400000u && p < 0x01000000u) {
+        if (crash_site_budget(21, 200) && p >= 0x00400000u && p < 0x01000000u) {
             char buf[80];
             unsigned k;
             for (k = 0; k < sizeof buf - 1; k++) {
@@ -537,6 +537,28 @@ static void crash_probe_hook(uint32_t va) {
             }
             buf[sizeof buf - 1] = 0;
             fprintf(stderr, "[crash] asset-lookup \"%s\"\n", buf);
+        }
+        break;
+    }
+    /* 0x6AB310 builds the resource-manager key from a path. Every install and
+     * every lookup goes through it, so printing distinct paths shows whether
+     * "pl\pl00f0.dat" was ever *offered* to the manager or only asked for. */
+    case 0x006AB310u: {
+        static char last[80];
+        uint32_t p = MEM32(g_esp + 4);
+        if (p >= 0x00400000u && p < 0x01000000u) {
+            char buf[80];
+            unsigned k;
+            for (k = 0; k < sizeof buf - 1; k++) {
+                char c = (char)MEM8(p + k);
+                buf[k] = c;
+                if (!c) break;
+            }
+            buf[sizeof buf - 1] = 0;
+            if (strcmp(buf, last) != 0 && crash_site_budget(22, 200)) {
+                memcpy(last, buf, sizeof last);
+                fprintf(stderr, "[crash] asset-key \"%s\"\n", buf);
+            }
         }
         break;
     }
