@@ -1011,3 +1011,64 @@ session (`KORRA_FORCE_ACP=1252`, a host-side rewrite of the guest's return
 value) changed nothing on screen, and the log shows **`GetACP` is called exactly
 once**, during CRT startup - the text path never asks for the codepage. Not the
 cause.
+## 2026-11-20 (later) - the crash is a missing asset, and the chain is closed
+
+Following the ordering gap back to the lookup found the actual cause. The
+publish is not fighting the sequencer; the Player object is **rejected**.
+
+The whole chain, each step verified by a probe line in one run:
+
+    005201D0  lookup-body  name="Player"  id=0x00010000
+    0073E700  factory      -> allocated
+    0051F460  obj-init      obj=0x0E220D80
+    0051F4B0  obj-fill      obj=0x0E220D80
+      00503BD0  player-spawn            <- the BehaviourPlayer is constructed here
+      00492D90  activate     obj=0x0E461B60   <- BehaviorPlayer vtable slot 8
+        004FB4C0  gate1   -> ok
+        004E85A0  gate2   -> 0
+    0051F8B0  obj-reject    obj=0x0E220D80   <- destroyed, +0x48 stays 0
+
+`sub_0051F4B0` sets the field the publish searches (`[edi+0x48]`) from
+`sub_004F9CE0`, and `sub_004F9CE0` throws the freshly created player away when
+`vtable[0x20]()` returns 0. That slot is `0x00492D90` (BehaviorPlayer vtable
+`0x94B284` slot 8), whose second gate is:
+
+    sub_004E85A0(player):
+        eax = sub_006AAB10(player, "pl\\pl00f0.dat")   ; find the loaded asset
+        if (!eax) return 0                              <- this is what returns 0
+        ...
+
+`0x94AC4C` is the literal **`pl\pl00f0.dat`**, the player's asset bundle, and
+`sub_006AAB10` is "find the loaded asset by path" (`sub_006AB310` builds the key,
+`sub_006AB250` does the lookup). Gate 2 fails because that bundle is not in the
+resource registry when the player is activated.
+
+**The file is not missing from the install.** `pl00f0.dat` (and `pl00f1..f3`) is
+in `data000.cpk`, so this is a load-side failure, not a packaging one. Note also
+that `sub_006AAB10` with this path is called from exactly two places, both inside
+the player's own setup (`0x004E3460`, `0x004E85A0`) - nothing else ever asks for
+it, so the load has to be registered by the generic scene/manifest path rather
+than by a dedicated player-asset load.
+
+So the defect chain is:
+
+> the player's asset bundle is never registered -> `sub_004E85A0` returns 0 ->
+> `sub_00492D90` reports failure -> `sub_004F9CE0` destroys the player ->
+> `[edi+0x48]` stays 0 -> `sub_0051F4B0` rejects the scene object ->
+> `sub_005201D0` returns 0 -> the publish stores nothing -> `0xCA3E58` stays 0 ->
+> the HUD update dereferences null.
+
+Next step, and it is a different subsystem: who is supposed to register
+`pl\pl00f0.dat` (the scene/level asset install path), and why that registration
+never happens in the port. `KORRA_TRACE_CRASH=1` now prints `asset-lookup` lines
+for every `sub_006AAB10` call, so the same run will show which assets *are*
+requested next to the one that is not.
+
+### Probe additions
+
+`scene-lookup`, `publish-tail`, `lookup-body`, `factory`, `obj-init`, `obj-fill`,
+`cache-link`, `obj-reject`, `activate`, `gate1`, `gate2`, `asset-lookup` - each
+with the object or path it is about, all off unless `KORRA_TRACE_CRASH` is set.
+One gotcha worth keeping: the first stack argument is at `esp+4`, not `esp+8`
+(the call has just pushed the return address); reading the wrong slot silently
+filters everything out as "not a pointer".
