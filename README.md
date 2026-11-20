@@ -30,7 +30,7 @@ side (Win32, D3D9 surface, XInput, XAudio2, CRI/Wwise audio, Steam stubs).
 | M0 | Environment, toolchain pin, repo bootstrap, PE gate | **done** (2026-11-19) |
 | M1 | Seeds + function catalog + full lift to C | **done**: 37,327/37,327 functions, 0 lift failures — see [`docs/LIFT_REPORT.md`](docs/LIFT_REPORT.md) |
 | M2 | Boots to the main menu on Windows (no Steam, silent, movies skipped) | **done (2026-11-20)** — boots without Steam, text renders, new game runs into the first area at 39-58 fps uncapped; the crash and missing-text defects had one cause (the lifter's `pcmpistri` flag model). Log: [`docs/FINDINGS.md`](docs/FINDINGS.md) |
-| M3 | Boots and plays the first area on an Android arm64 device | **prepared** — NDK 28.2 + Gradle scaffold builds green, portable `pcmpistri`/`FCOMI` verified algorithmically; first device run pending ([`docs/ANDROID_BRINGUP.md`](docs/ANDROID_BRINGUP.md)) |
+| M3 | Boots and plays the first area on an Android arm64 device | **in progress** - device + Vulkan probe measured on the S24 (Xclipse 940, Vulkan 1.3.304; BC feature absent, D24S8 unsupported), `pcmpistri`/`FCOMI` proven on arm64 silicon, Android host + D3D9→DXVK bridge written and compiling; the first device boot is pending ([`docs/ANDROID_BRINGUP.md`](docs/ANDROID_BRINGUP.md)) |
 | M4 | Audio: Wwise + CRI behind a host mixer | spec ready ([`docs/audio.md`](docs/audio.md)), implementation not started |
 | M5 | Gameplay validation, framerate hooks, full playthrough | not started |
 

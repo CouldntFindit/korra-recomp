@@ -662,3 +662,129 @@ Ordered, each with a gate. Nothing here touches `work/`, `src/recomp/gen/`, or
   inference.
 - The SF/OF analysis is static; the claim that the byte-wise fallback makes the
   Windows build correct is an explanation, not a test.
+
+---
+
+## 10. What the M3 session actually added (2026-11-20)
+
+This section is the implementation map. Everything above it is still the plan;
+this is the code that exists, with the device measurements that shaped it.
+
+### 10.1 The device, measured
+
+`tools/android/vk_probe.c`, run by `scripts/android_probe.ps1` (NDK clang,
+arm64 API 29, pushed to `/data/local/tmp`, no APK):
+
+- Galaxy S24 `SM-S921B` / Exynos 2400 / Android 17 (SDK 37);
+- Vulkan **1.3.304**, driver `Samsung Xclipse 940`, **SPAL 25.3.3** (driverID 21);
+- **`textureCompressionBC = 0`**, while BC1/BC2/BC3 are sampled/blit in both
+  tiling modes. DXVK's stock `VK_TRUE` for that feature fails `vkCreateDevice`,
+  so `tools/dxvk_prepare.py` gates it (and the other optional bits) on
+  `supported.*`;
+- **`D24S8` has no format features** on this driver; `D32F` is depth-attach but
+  not stencil. Depth format selection is the first thing to read in the DXVK log
+  if the first frame is black;
+- everything else DXVK asks for is present: geometryShader, multiview,
+  clip/cull distances, depthClamp, fillModeNonSolid, descriptorIndexing,
+  timelineSemaphore, dynamicRendering, synchronization2, transform feedback.
+
+### 10.2 Files
+
+| Path | What it is |
+|---|---|
+| `tools/android/vk_probe.c` | standalone device probe (features, formats, memory, queues) |
+| `scripts/android_probe.ps1` | build one C probe with the NDK, push, run, pull artefacts |
+| `src/host_android/host_android.h` | the host contract (memory, shims, files, services) |
+| `src/host_android/memory_android.c` | 4 GiB PROT_NONE guest window, guest heap, stacks, logging |
+| `src/host_android/spine_android.c` | register file, machine lock, dispatch, shim registry, threads, TLS |
+| `src/host_android/pe_android.c` | map the image's data at its VAs, bind the IAT to shim VAs |
+| `src/host_android/fs_android.c` | POSIX file layer behind `CreateFileA` (root + guest cwd) |
+| `src/host_android/kernel32_android.c` | 121 KERNEL32 imports, exact stdcall purges |
+| `src/host_android/user32_android.c` | window tokens, message queue, WndProc dispatch |
+| `src/host_android/misc_android.c` | gdi32, shell32, winmm, ole32/oleaut32, steam, XInput, DirectInput, D3DX table |
+| `src/host_android/input_android.c` | touch → `XINPUT_GAMEPAD` zones and packet counter |
+| `src/host_android/main_android.c` | boot order and the shell's three entry points |
+| `src/host_android/d3d9_android.cpp` | guest-COM → DXVK bridge, vtable thunks, lock staging |
+| `src/host_android/d3d9_stub.cpp` | the no-DXVK build (rung 2: stops at `Direct3DCreate9`) |
+| `dxvk_android/CMakeLists.txt` | DXVK-native build recipe (D3D9-only source set) |
+| `dxvk_android/android_wsi.cpp` | `VK_KHR_android_surface` WSI, 1280x720 buffer geometry, token HWND |
+| `tools/dxvk_prepare.py` | arm64/Android replacements, shader headers, `vulkan_android.h` |
+| `scripts/android_run.ps1` | one-command device loop: install, `run-as` copy of the game tree into internal storage, start, wait, pull `log.txt`/logcat/exit-info |
+
+### 10.3 Build
+
+```powershell
+# once per dxvk-native clone
+python tools\dxvk_prepare.py ..\reference\dxvk-native
+
+cd android
+.\gradlew.bat --no-daemon -PkorraLinkGuest=ON -PkorraWithDxvk=ON `
+  -PkorraDxvkSource="..\..\reference\dxvk-native" :app:assembleDebug
+```
+
+`KORRA_LINK_GUEST` without `KORRA_WITH_DXVK` is the bring-up rung that must stop
+at `Direct3DCreate9` with an explicit log line; it is not a playable build.
+
+### 10.4 Design decisions worth not re-deriving
+
+- **Guest tokens, never pointers.** Every D3D9/steam/DInput object the guest holds
+  is a guest VA whose first dword is a guest vtable of shim VAs. `recomp_lookup_import`
+  resolves the slot; the thunk reads `this` from ECX.
+- **Lock staging.** `LockRect`/`Lock` cannot return DXVK's host pointer in 32 bits,
+  so the bridge keeps DXVK's lock open, hands the guest a staging buffer inside
+  the guest window, and copies it back on unlock. This is the only way vertex and
+  texture upload work on a 64-bit host.
+- **Per-slot arity.** Every COM thunk ends with its own `RET(eax, argc)`. A shared
+  "return 0" body is what corrupted `g_esp` in the Windows host (AGENTS.md ledger);
+  the same rule applies here.
+- **Window size.** The WSI sets `ANativeWindow_setBuffersGeometry(1280, 720)` and
+  reports 1280x720 to DXVK; the compositor scales. Full-panel swapchains are four
+  times the blit cost for no visible gain on this title.
+- **Installer.** `LoK.exe` is part of the install (its data sections are the
+  image the lift reads), so the picker must be the game root, not `GameData`
+  itself. The Java installer now says so and copies both.
+
+### 10.5 The first device boots (2026-11-21)
+
+`LoK.exe` loads, all 191 named imports bind, the CRT initialises, and the engine
+reaches its own code. Getting there took four host bugs, each found from a
+symbolised tombstone or from the exe itself:
+
+1. **`A32()` read guest addresses as host pointers.** Every shim argument lives
+   on the guest stack (a VA), so `*(uint32_t *)addr` faulted at `0xc03fff94`
+   (`g_esp=0xC03FFFC0`). It now goes through `MEM32`, with `APTR`/`ASTR`/`AWSTR`
+   for host pointers.
+2. **The shim registry kept `const char *` to caller stack buffers**, so vtable
+   names turned into garbage and an unimplemented import logged as
+   `FATAL: unimplemented import  (0xF0000C50)`. `shim_add()` now `strdup`s.
+3. **`GetStringTypeW` popped 5 arguments for a 4-argument API**, turning a
+   character count into a pointer and faulting in `memset(ptr, 0, 0x807FF3D0*2)`.
+   `tools/check_shim_arity.py` now compares every shared symbol against
+   pcrecomp's `win32hle`.
+4. **The CRT reported R6009 and exited 255.** Not an environment problem: the
+   `_setenvp` path queries `WideCharToMultiByte` with an explicit count of 1 for
+   the empty (double-NUL) environment block, and our shim stopped at the NUL and
+   answered 0. See `docs/FINDINGS.md` for the `_NMSG_WRITE` table walk and the
+   four functions involved.
+
+Install detection moved to **internal** storage: Android 17 refuses to let the
+app `fopen` files that adb pushed into its own external files dir (`EACCES`), so
+the dev install is `/data/user/0/org.korra.recomp/files/game`, copied there with
+`run-as`. `scripts/android_run.ps1` does install, `run-as` copy, start, pull and
+exit-info in one command. The SAF picker is unchanged as the user path.
+
+### 10.6 Still open
+
+- No frame yet. The next boot should reach D3D9 device creation; the log lines to
+  read are `Direct3DCreate9`, DXVK's adapter/feature log, and the chosen depth
+  format (`D24S8` has no features on this driver, so a `D32F` fallback is
+  expected).
+- `GameData` (2.7 GB) still has to be in the app's internal tree before asset
+  loading can proceed; `scripts/android_run.ps1` will copy it on first run.
+- `D3DXGetShaderConstantTable` and the cube-texture path are stubs that return
+  `D3DERR_INVALIDCALL`; `D3DXCreateTextureFromFileInMemoryEx` implements the DDS
+  top level only.
+- Audio is the documented CRI silent fallback on Android (the XAudio2 2.7 COM
+  object is M4).
+- Present-mode order (IMMEDIATE -> MAILBOX -> FIFO) is DXVK's choice; the probe
+  of what the surface actually grants is logged at swapchain creation.

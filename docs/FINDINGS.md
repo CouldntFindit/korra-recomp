@@ -1697,3 +1697,136 @@ What would settle the *gameplay* sim beyond doubt: watch a monotonic game-time
 float and compare its advance per wall second at cap 30 vs 60. That needs the
 address, which this pass did not hunt; the boot-chain result above is the evidence
 the decision rests on.
+
+## 2026-11-20 - M3 session: Step 0 device confirmation and Step 1 silicon differential
+
+Both steps are device-measured, not planned.
+
+### Step 0 - the device
+
+| Item | Value |
+|---|---|
+| `adb devices` | `RFCYA0VVJKH  device  product:e1sxtur model:SM_S921B device:e1s transport_id:1` |
+| Model / SoC | Galaxy S24 (SM-S921B, `e1s`), Exynos 2400 (`s5e9945`) |
+| Android | 17, SDK 37, build `CP2A.260605.016.S921BXXSIEZJ1`, patch 2026-10-05 |
+| ABI | arm64-v8a |
+| Vulkan | **1.3.304** (`VK_KHR_android_surface` + `VK_EXT_debug_utils` in the instance) |
+| Driver | `Samsung Xclipse 940`, vendor `0x144D`, device `0x2600200`, `driverID 21`, **SPAL 25.3.3** (`git 9d9e5e5dc2`) |
+| SurfaceFlinger | `(Samsung Xclipse 940) on Vulkan 1.3.304`, GLES 3.2 driver 25.6.4 |
+
+Probe: `tools/android/vk_probe.c`, built and run by `scripts/android_probe.ps1`
+(NDK clang, arm64 API 29, pushed to `/data/local/tmp`, no APK). Full output is in
+§ "Vulkan feature probe" below.
+
+**The feature that changes the plan: `textureCompressionBC` is 0 on this driver.**
+BC1/BC2/BC3 are *sampled* and *blit-src* (both tiling modes) but never a colour
+attachment. Everything else DXVK wants is present: geometryShader, tessellation,
+multiview, shaderClipDistance/shaderCullDistance, depthClamp, fillModeNonSolid,
+samplerAnisotropy, samplerYcbcr, timelineSemaphore, bufferDeviceAddress,
+descriptorIndexing, drawIndirectCount, dynamicRendering, synchronization2,
+maintenance4, transform feedback, vertex divisor, depth clip enable,
+robustness2, custom border colour, pipeline library. Limits: 16384 max 2D/FB,
+8 colour attachments, 16 viewports, 8 clip/cull distances, 2 heaps (5.3 GB +
+64 MB MTL), 165 device extensions.
+
+Also probed and **unsupported**: `D24S8` has *no* format features; `D32F` is
+depth-attach + sampled, `D32S8` was not in this run's list. This is the
+`D3DFMT_NULL`/depth path to watch in the DXVK log - it fails as a black/no-depth
+frame, not as a shader error (same class as `docs/quirks.md` §3 warns about).
+
+#### Vulkan feature probe (verbatim, trimmed to the rows that gate DXVK)
+
+```
+instance api=1.1.0 / physical 1.3.304
+[device 0] Samsung Xclipse 940
+  driverID=21 driverInfo=SPAL Driver version: 25.3.3, git hash: 9d9e5e5dc2
+  feature textureCompressionBC              0
+  feature textureCompressionETC2            1
+  feature textureCompressionASTC_LDR        1
+  feature geometryShader                    1
+  feature depthClamp                        1
+  feature fillModeNonSolid                  1
+  feature shaderClipDistance                1 / shaderCullDistance 1
+  feature multiViewport 1 / independentBlend 1 / sampleRateShading 1
+  vk11 multiview=1 shaderDrawParameters=1
+  vk12 timelineSemaphore=1 bufferDeviceAddress=1 descriptorIndexing=1
+       drawIndirectCount=1 scalarBlockLayout=1 hostQueryReset=1
+  vk13 dynamicRendering=1 synchronization2=1 maintenance4=1
+  fmt X8R8G8B8/A8R8G8B8   SAMPLED STORAGE COLOR_ATTACH BLIT_SRC BLIT_DST LINEAR
+  fmt D24S8               (none)
+  fmt D32F                SAMPLED DEPTH_ATTACH BLIT_SRC BLIT_DST
+  fmt DXT1/3/5 (BC1/2/3)  SAMPLED BLIT_SRC (optimal), SAMPLED BLIT_SRC (linear)
+```
+
+### Step 1 - `pcmpistri` and `FCOMI` on arm64 silicon
+
+The x86 oracle is the hardware run from `tests/run_pcmpistri_diff.ps1` (Win32
+intrinsics). The arm64 run is the same source compiled with the NDK and executed
+on the S24 (`scripts/android_probe.ps1`), so the portable body is compared
+against the *instruction itself*, not against the x64 build of the same body.
+
+| Harness | Inputs | arm64 result |
+|---|---|---|
+| `tests/pcmpistri_diff.c` | 470,000 tuples x 16 imm8 = **7,520,000** | **0 differences**, index + ZF/CF/SF/OF, byte-identical 60,160,000-byte result files |
+| `tests/pcmpistri_sites.c` | the six sites' shapes (0x0C strstr, 0x0D wide, 0x40 strrchr) | **21/21 identical** to the x86 hardware table |
+| `tests/fcomi_diff.c` | 200,576 cases (24 fixed values cross product incl. NaN/inf/denormals + LCG bits) | `model_eflags_hash=E92A81FC`, `model_ah_hash=077DC5FC` = the x86 hardware hashes; the LAHF/`test ah,0x44`/`jnp` idiom agrees on every case |
+
+The three site imm8 values the binary uses are covered with the same inputs that
+the game's CRT path feeds them, and the FCOMI harness compares the exact
+EFLAGS image the lifter publishes. Step 1 is green on the target silicon; nothing
+was patched in the runtime as a result.
+
+## The CRT's R6009 is a `WideCharToMultiByte` contract bug, not an environment problem (2026-11-21)
+
+The first Android boots reached the lifted CRT and then printed
+
+```
+[msgbox] Microsoft Visual C++ Runtime Library: Runtime Error!
+Program: /data/user/0/org.korra.recomp/files/game/LoK.exe
+```
+
+and exited 255. The message text is the CRT's own `_NMSG_WRITE` table, and the
+table is in the exe, so the failing code can be read rather than guessed:
+
+| Address | What it is |
+|---|---|
+| VA `0x8FF8F8` | CRT message table: 0x17 entries of `{int code; wchar_t *text}`, 8 bytes each |
+| RVA `0x4FF0C8` | `R6009`: "not enough space for environment" |
+| `sub_0077EA5E` | table lookup (`recomp_0042.c:54139`) |
+| `sub_0077EA82` | `_NMSG_WRITE(code)` (`recomp_0042.c:54196`) |
+| `sub_0077E425` | message then `_exit(code)` - the `_amsg_exit` shape |
+| `0x77C490` | `push 9` + `_amsg_exit` inside the entry function at `0x77C3B7` |
+| `sub_00782B48` | `_setenvp` count/walk; returns -1 when the env pointer is NULL |
+| `sub_00782D50` | `GetEnvironmentStringsW` -> `WideCharToMultiByte` -> heap block |
+
+`sub_00782D50` queries the ANSI size with `cchWideChar = 1` for the empty
+environment (the block is a single NUL, plus the terminator). Our shim stopped
+at the first NUL and answered **0**, then refused to write into the zero-byte
+allocation, so the env pointer became NULL, `__setenvp` returned -1, and the CRT
+reported R6009.
+
+Windows converts **exactly** `cch` units when the count is explicit, including
+embedded NULs, and converts up to and including the terminator when it is
+negative; a size query therefore returns at least 1 for an empty string. Both
+`WideCharToMultiByte` and `MultiByteToWideChar` now do that, and CP1252 mapping
+replaced the `& 0x7F` mask.
+
+Two other startup defects were found with the same evidence and fixed:
+
+- `GetCPInfo` wrote `MaxCharSize = 2` as a DWORD for CP1252 (it is a BYTE at +0
+  and must be 1), which puts the CRT on its DBCS path.
+- `GetSystemInfo` wrote `dwAllocationGranularity` at +24 and `wProcessorLevel` at
+  +28; `SYSTEM_INFO` has them at +28 and +32.
+
+An audit of every stdcall shim against the SDK also produced these fixes before
+the next boot: `RegisterClassExA` now reads `lpfnWndProc` at `WNDCLASSEXA + 8`
+(was +12, i.e. `cbClsExtra`, so no WndProc was ever registered),
+`LCMapStringW`/`CompareStringW` read their arguments in the documented order,
+`IDirectInput8` has per-slot arities instead of one shared thunk (QueryInterface
+pops 2, GetDeviceStatus 1, RunControlPanel/Initialize 2), `DrawRectPatch` pops 3,
+and `IDirect3DSurface9::LockRect` takes `(Flags, pLockedRect, pRect)` - the
+staging implementation had flags and the out-structure swapped.
+
+`tools/check_shim_arity.py` (own tool, compares against pcrecomp's win32hle)
+found the earlier `GetStringTypeW` over-pop; the audit above covers the symbols
+that have no reference counterpart.
