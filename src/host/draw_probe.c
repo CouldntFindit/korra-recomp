@@ -54,6 +54,11 @@
 #define D3D9_CREATEDEVICE           13
 #define D3DDEV_PRESENT              17
 #define D3DDEV_CREATETEXTURE        23
+#define D3DDEV_CREATEVERTEXBUFFER   26
+#define D3DDEV_CREATERENDERTARGET   28
+#define D3DDEV_CREATEDEPTHSTENCIL   29
+#define D3DDEV_SETRENDERTARGET      37
+#define D3DDEV_SETDEPTHSTENCIL      39
 #define D3DDEV_BEGINSCENE           41
 #define D3DDEV_ENDSCENE             42
 #define D3DDEV_SETTRANSFORM         44
@@ -85,6 +90,8 @@ typedef struct {
     int      have_dev;
     /* per-frame counters */
     unsigned frame, draws, draws_up, draws_ib, prims;
+    unsigned vbs, begins, ends, rt_changes;
+    uint32_t rt, ds;
     unsigned tex_used[16];
     int      ntex_used;
     /* current state */
@@ -425,6 +432,26 @@ static void report_draw(int kind, unsigned type, unsigned prims, unsigned stride
     uint32_t tex = P.tex0;
     const texrec_t *tr;
     int i, slot = -1;
+    static int dump_frame = -2;
+    static int dumped;
+    static int dump_from = -2;
+
+    if (dump_frame == -2) {
+        const char *s = getenv("KORRA_DRAWPATH_FRAME");
+        const char *f = getenv("KORRA_DRAWPATH_FROM");
+        dump_frame = s ? atoi(s) : -1;
+        dump_from = f ? atoi(f) : -1;
+    }
+    if ((dump_from >= 0 ? (int)P.frame >= dump_from : (dump_frame >= 0 && (int)P.frame == dump_frame))
+        && dumped < 400) {
+        const texrec_t *t = find_texture(tex);
+        dumped++;
+        fprintf(stderr, "[draw] dump f%u %s type=%u prims=%u stride=%u tex=0x%08X %s "
+                        "vs=%08X ps=%08X rt=%08X caller=sub_%08X\n",
+                P.frame, kind == 1 ? "DP" : kind == 2 ? "DIP" : kind == 3 ? "DPUP" : "DIPUP",
+                type, prims, stride, tex,
+                t ? "known" : "?", P.vs, P.ps, P.rt, caller);
+    }
 
     /* Deduplicate on the shape of the call, not on the vertex data. */
     for (i = 0; i < g_nsig; i++) {
@@ -521,9 +548,11 @@ static void report_frame(void) {
     if (verbosity() < 1) return;
     if ((P.frame % 60) != 0) return;
     fprintf(stderr, "[draw] frame %u draws=%u up=%u vb=%u prims=%u texs=%d"
+                    " rt=%08X/%u begins=%u ends=%u"
                     " fvf=0x%X vs=0x%08X ps=0x%08X"
                     " abl=%u src=%u dst=%u zen=%u atest=%u afunc=%u\n",
             P.frame, P.draws, P.draws_up, P.draws_ib, P.prims, P.ntex_used,
+            P.rt, P.rt_changes, P.begins, P.ends,
             P.fvf, P.vs, P.ps,
             P.rs_seen[27] ? P.rs[27] : 0,          /* ALPHABLENDENABLE */
             P.rs_seen[19] ? P.rs[19] : 0,          /* SRCBLEND */
@@ -729,6 +758,7 @@ static void probe_post(uint32_t target, const uint32_t *a, uint32_t ret) {
                 P.frame++;
                 P.draws = P.draws_up = P.draws_ib = P.prims = 0;
                 P.ntex_used = 0;
+                P.begins = P.ends = P.rt_changes = 0;
                 break;
             case D3DDEV_SETRENDERSTATE:
                 if (a[1] < 256) { P.rs[a[1]] = a[2]; P.rs_seen[a[1]] = 1; }
@@ -757,6 +787,35 @@ static void probe_post(uint32_t target, const uint32_t *a, uint32_t ret) {
             case D3DDEV_CREATETEXTURE:
                 /* (this, Width, Height, Levels, Usage, Format, Pool, ppTexture) */
                 note_texture(rd32(a[7]), a[1], a[2], a[5], a[6], a[3], "device CreateTexture");
+                break;
+            case D3DDEV_CREATEVERTEXBUFFER:
+                P.vbs++;
+                break;
+            case D3DDEV_CREATERENDERTARGET:
+                /* (this, Width, Height, Format, MultiSample, Quality, Lockable,
+                 *  ppSurface) */
+                if (verbosity() >= 1)
+                    fprintf(stderr, "[draw] render target %ux%u fmt=0x%X -> 0x%08X\n",
+                            a[1], a[2], a[3], rd32(a[7]));
+                break;
+            case D3DDEV_CREATEDEPTHSTENCIL:
+                if (verbosity() >= 1)
+                    fprintf(stderr, "[draw] depth surface %ux%u fmt=0x%X\n", a[1], a[2], a[3]);
+                break;
+            case D3DDEV_SETRENDERTARGET:
+                if (a[1] == 0) {
+                    P.rt = a[2];
+                    P.rt_changes++;
+                }
+                break;
+            case D3DDEV_SETDEPTHSTENCIL:
+                P.ds = a[1];
+                break;
+            case D3DDEV_BEGINSCENE:
+                P.begins++;
+                break;
+            case D3DDEV_ENDSCENE:
+                P.ends++;
                 break;
             default:
                 break;
