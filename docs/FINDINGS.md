@@ -1561,3 +1561,29 @@ them.
   24 threads run on 24 cores instead of one at a time. That is a runtime
   redesign affecting every pcrecomp host, not a host fix, and it does not block
   M3.
+
+### Frame-rate cap: 30 / 40 / 60, switchable at runtime (`src/host/fps_cap.c`)
+
+The engine has no 40 fps setting, but its limiter interval is just a field:
+`[frameMgr+0x58]` in 1/3-ms units (50 = 60 fps, 100 = 30 fps, docs/quirks.md
+section 4). The host now writes that field at the requested rate and re-applies
+it whenever the engine recomputes it (which happens when `DAT_00e4d210`
+changes): `interval = round(3000 / fps)`.
+
+`F9` cycles 30 -> 40 -> 60 -> engine default during play; `KORRA_FPS=30|40|60`
+sets the starting rate, unset means the engine's own. No cap is baked in: the
+cap is a comfort/measurement knob, not a fix, and it is off unless asked for.
+
+Verified in a single run (probe log, per-second `present/s`):
+
+| cap | measured | notes |
+|---|---|---|
+| 30 | 28-29/s, never above 30 | rock solid; CPU clock drops to 1520 MHz in the idle tail of the sleep and it still holds |
+| 40 | 31-39/s, average 37.5 | cannot exceed 40; dips only where the uncapped game itself drops below 40 |
+| 60 | 40-57/s, average 45.4 | the engine's own target, same as uncapped |
+| engine default | 40-57/s, average 45.3 | `DAT_00e4d210` = 0, so 60 |
+
+Also measured: the 40<->57 fps oscillation is **not** a CPU power state - the
+per-second `mhz=` column alternates 1520/2400 with no correlation to the frame
+rate in either direction, including while pinned at 30 fps. The oscillation
+stays unexplained and harmless at this bar (it never goes below ~39 uncapped).
