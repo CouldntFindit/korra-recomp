@@ -370,7 +370,7 @@ static unsigned g_cw_n;
  * nothing is sampled until a real image address is entered. */
 static int g_crash_live;
 
-static unsigned g_site_calls[12];
+static unsigned g_site_calls[28];
 
 static int crash_site_budget(int slot, unsigned cap) {
     if (g_site_calls[slot]++ >= cap) return 0;
@@ -475,6 +475,71 @@ static void crash_probe_hook(uint32_t va) {
         if (crash_site_budget(11, 40))
             fprintf(stderr, "[crash] publish-tail va=0x0040F6F0 player=0x%08X\n", MEM32(0xCA3E58));
         break;
+    /* The lookup is create-if-missing: 0x520230 is its body, 0x73E700 the pool
+     * factory it calls, 0x51F460 the new object's field init, 0x51F4B0 fills it
+     * from the resource and returns 0 to reject, and 0x521C80 links it into the
+     * cache. Printing them in order says which step gives up. */
+    case 0x00520230u: {
+        uint32_t req = MEM32(g_esp + 4);
+        if (crash_site_budget(12, 40))
+            fprintf(stderr, "[crash] lookup-body req=0x%08X name=0x%08X id=0x%08X\n",
+                    req, req ? MEM32(req) : 0, req ? MEM32(req + 4) : 0);
+        break;
+    }
+    case 0x0073E700u:
+        if (crash_site_budget(13, 40))
+            fprintf(stderr, "[crash] factory va=0x0073E700 pool=0x%08X\n", g_ecx);
+        break;
+    case 0x0051F460u:
+        if (crash_site_budget(14, 40))
+            fprintf(stderr, "[crash] obj-init va=0x0051F460 obj=0x%08X\n", g_ecx);
+        break;
+    case 0x0051F4B0u:
+        if (crash_site_budget(15, 40))
+            fprintf(stderr, "[crash] obj-fill va=0x0051F4B0 obj=0x%08X\n", g_ecx);
+        break;
+    case 0x00521C80u:
+        if (crash_site_budget(16, 40))
+            fprintf(stderr, "[crash] cache-link va=0x00521C80\n");
+        break;
+    case 0x0051F8B0u:
+        if (crash_site_budget(17, 40))
+            fprintf(stderr, "[crash] obj-reject va=0x0051F8B0 obj=0x%08X\n", g_ecx);
+        break;
+    /* The activation that rejects the player: 0x492D90 is BehaviorPlayer vtable
+     * slot 8, and its first two gates are 0x4FB4C0 then 0x4E85A0. Whichever of
+     * those is the last one entered names the failing subsystem. */
+    case 0x00492D90u:
+        if (crash_site_budget(18, 30))
+            fprintf(stderr, "[crash] activate va=0x00492D90 obj=0x%08X\n", g_ecx);
+        break;
+    case 0x004FB4C0u:
+        if (crash_site_budget(19, 30))
+            fprintf(stderr, "[crash] gate1 va=0x004FB4C0 obj=0x%08X\n", g_ecx);
+        break;
+    case 0x004E85A0u:
+        if (crash_site_budget(20, 30))
+            fprintf(stderr, "[crash] gate2 va=0x004E85A0 obj=0x%08X\n", g_ecx);
+        break;
+    /* gate2 is Find loaded asset "pl\pl00f0.dat" -> 0. Print every path it is
+     * asked for, so the log shows whether the asset was ever requested (and so
+     * whether a load failed) or only looked up at activation time. */
+    case 0x006AAB10u: {
+        /* first stack argument is at esp+4: the call pushed the return address */
+        uint32_t p = MEM32(g_esp + 4);
+        if (crash_site_budget(21, 120) && p >= 0x00400000u && p < 0x01000000u) {
+            char buf[80];
+            unsigned k;
+            for (k = 0; k < sizeof buf - 1; k++) {
+                char c = (char)MEM8(p + k);
+                buf[k] = c;
+                if (!c) break;
+            }
+            buf[sizeof buf - 1] = 0;
+            fprintf(stderr, "[crash] asset-lookup \"%s\"\n", buf);
+        }
+        break;
+    }
     default:
         break;
     }
