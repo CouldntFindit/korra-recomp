@@ -10,8 +10,8 @@
  * closes that gap without relifting and without touching the pinned pcrecomp
  * tree: build the same source twice - Win32 (intrinsics) and x64 (the guard
  * requires _M_IX86, so x64 falls through to the portable body) - and compare
- * every (index, ZF, CF) triple. Both builds run on the same CPU, and the code
- * is integer-only, so a difference is a difference between the two
+ * every (index, ZF, CF, SF, OF) tuple. Both builds run on the same CPU, and the
+ * code is integer-only, so a difference is a difference between the two
  * implementations rather than between two machines.
  *
  * Usage:
@@ -132,14 +132,14 @@ int main(int argc, char **argv) {
             uint8_t rec[8];
             rec[0] = (uint8_t)idx;
             rec[1] = (uint8_t)(idx >> 8);
-            rec[2] = (uint8_t)(flags & 3u);
+            rec[2] = (uint8_t)(flags & 0xFu);   /* ZF CF SF OF */
             rec[3] = (uint8_t)kImm[k];
             rec[4] = (uint8_t)n;
             rec[5] = (uint8_t)(n >> 8);
             rec[6] = (uint8_t)(n >> 16);
             rec[7] = 0;
             if (fwrite(rec, 1, 8, out) != 8) { perror("write"); fclose(out); return 2; }
-            per_imm_hash[k] ^= (uint32_t)(idx | ((flags & 3u) << 8));
+            per_imm_hash[k] ^= (uint32_t)(idx | ((flags & 0xFu) << 8));
             per_imm_hash[k] *= 16777619u;
             per_imm_cases[k]++;
             tuples++;
