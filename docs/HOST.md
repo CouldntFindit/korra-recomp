@@ -69,6 +69,8 @@ Everything below is opt-in and off by default.
 | `KORRA_PAD=1` [`KORRA_PAD_BITS=0x1000`] [`KORRA_PAD_AUTO=1`] | synthetic pad 0 |
 | `KORRA_TRACE_FILE=1` / `KORRA_TRACE_D3D=1` | `CreateFileA` arguments + result; failed d3d9 results and every d3dx call |
 | `KORRA_TRACE=1` | one line per bridged native call |
+| `KORRA_DRAWPATH=1` | D3D9 draw census: per-frame draws/state + one line per distinct draw shape (`_FROM=<frame>` adds a per-frame texture histogram, `_FRAME=<frame>` dumps one frame's draws, `_TEX=1` adds a pixel survey that is known to kill a run) |
+| `KORRA_FORCE_ACP=<n>` | rewrites the guest's `GetACP`/`GetOEMCP` result (codepage experiments) |
 | `build_host.ps1 -Trace` | separate `build\obj-trace` with `-DRECOMP_TRACE` (`--calltrace`, `--firsthit`, `--argtrace`, `--watch`, `--poison`) |
 
 Logs are per run (`korra_host-YYYYMMDD-HHMMSS.log` in the game folder), so a

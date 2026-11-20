@@ -193,6 +193,12 @@ Append only; newest last. Format: date — attempt — outcome — next idea.
   survey off survived 175 s). It is behind `KORRA_DRAWPATH_TEX=1` now and off by
   default; do not combine it with a long session until the mechanism is
   understood.
+- 2026-11-20 — "The Turkish system codepage (1254) is why the engine draws no
+  text" — **disproved**. `KORRA_FORCE_ACP=1252` (new knob in `draw_probe.c`,
+  rewrites the guest's `GetACP`/`GetOEMCP` result) ran a full session to the
+  title screen: picture unchanged, text still absent, and `GetACP` is called
+  exactly **once** (during CRT startup) — the engine's text path never asks for
+  it. Do not re-try codepage forcing.
 
 
 ## 7. Reporting

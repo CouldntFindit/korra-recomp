@@ -187,7 +187,7 @@ static native32_pre_hook_t  g_other_pre;
 /* call census: every bridged call, and the ones that land in d3d9 but are not
  * a method of the captured device (a wrong vtable slot or an object we never
  * captured would show up here). */
-static volatile long g_calls, g_d3d_calls;
+static volatile long g_calls, g_d3d_calls, g_cp_calls;
 static uint32_t g_unmatched[48];
 static int      g_nunmatched;
 static int verbosity(void);
@@ -687,6 +687,33 @@ static void probe_post(uint32_t target, const uint32_t *a, uint32_t ret) {
             fflush(stderr);
         }
         if (!P.d3d9_lo) return;   /* not loaded yet: nothing to observe */
+    }
+
+    /* --------------------------------------------------- codepage experiment
+     * The text path is the only UI path that needs a character set, and the
+     * engine imports GetACP/GetOEMCP/IsValidCodePage/MultiByteToWideChar. On a
+     * Turkish Windows the ANSI codepage is 1254, which is not a codepage a
+     * 2014 Japanese engine would ship a charset table for. KORRA_FORCE_ACP
+     * rewrites the guest's return value for GetACP/GetOEMCP so the experiment
+     * costs one env var instead of a code change. */
+    {
+        static int forced = -1;
+        if (forced == -1) {
+            const char *s = getenv("KORRA_FORCE_ACP");
+            forced = s ? atoi(s) : 0;
+        }
+        if (forced > 0) {
+            const char *n = native32_name(target);
+            if (n && (strstr(n, "GetACP") || strstr(n, "GetOEMCP"))) {
+                if (verbosity() >= 1) {
+                    fprintf(stderr, "[draw] %s -> %d (forced, was %u)\n",
+                            n, forced, ret);
+                    fflush(stderr);
+                }
+                g_eax = (uint32_t)forced;
+                InterlockedIncrement(&g_cp_calls);
+            }
+        }
     }
 
     /* Imports we do know by name. */
