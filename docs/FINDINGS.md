@@ -2255,3 +2255,98 @@ the fill code never ran before because framework start aborted.
 - The new crash at `0x756840` has no diagnosis yet: the unresolved VA is 0, so
   either a vtable slot was never lifted, an out-parameter our texture shims
   leave NULL is being called, or a stage object was never constructed.
+
+## 2026-11-21 — M3: the phone renders; a two-slot texture vtable and a machine-lock deadlock
+
+Device: SM-S921B (Xclipse 940), phone serial RFCYA0VVJKH, APK built from
+`9d00ec8` plus the fixes below. Three separate defects, each proven by a run
+that reached one step further.
+
+### 1. Texture vtable was two slots short (commit `809fb5c`)
+
+`d3d9: vtable tex has 20 slots` before the fix. `IDirect3DBaseTexture9` in
+`d3d9.h` begins with `SetLOD`/`GetLOD`; the host table went straight from
+`IDirect3DResource9` to `GetLevelCount`, so every texture slot from
+`GetLevelCount` up was two low. The engine locks a texture through slot 19:
+
+    [import] tex:19 esp=0xC03FFECC ebp=0xC03FFEEC f=0x007567A0
+    ICALL: unresolved VA 0x00000000 from 0x00756840
+    [crash] signal 11 code=2 addr=0x6c2f902000 guest_func=0x00737970 ...
+
+`0x007567A0` is `call [eax+0x4c]` = `LockRect`, `0x00756840` is
+`call [eax+0x50]` = `UnlockRect`; with a 20-entry table slot 19 answered with
+`AddDirtyRect` and slot 20 was past the end, i.e. a NULL function pointer. The
+crash followed the fourth Present by 13 ms.
+
+Fix: `bt_SetLOD`/`bt_GetLOD` shims, table now 22 entries
+(`d3d9: vtable tex has 22 slots`), and `build_vtable` logs its count so the
+next mismatch is visible in the log instead of only in a crash. Device run
+after it: `dev:17` x3, `tex:19` dispatched, 0 ICALL, 0 crash, no ExitProcess.
+
+### 2. A guest thread deadlocked while holding the machine lock (commit `e83ea41`)
+
+After the vtable fix the run froze after three Presents:
+
+    wd: stalled fs=34645840 depth=1 func=00867E90 imports=40961 back=23356 esp=C3BFFF90
+
+forty times over 150 s, `dev:17` stuck at 3. The stall probe had been
+signalling the *main* thread (idle, blocked) and naming nothing; pointed at the
+machine holder it captured the real stack, resolved against the unstripped
+`libkorra.so` (`llvm-addr2line -f -C -e <so> <pc-base>`):
+
+    ka_host_bt             spine_android.c:264
+    k_EnterCriticalSection  kernel32_android.c:397      <- pthread_mutex_lock
+    sub_00867E90            recomp_0058.c:47829        <- frame tick
+    sub_0087EEE0
+    hle_call_guest
+    thread_trampoline
+
+Guest stack at the same moment: `[esp]=0xDEAD0000` (bridge return address),
+`[esp+4]=0x00CA2034` — the frame tick's critical section, pushed just before
+the `call [0x8FD02C]` at `0x867E9A`. So the shim blocked inside
+`pthread_mutex_lock` while holding the machine lock, and the thread that owns
+that critical section could not run to release it. This is the same class of
+bug as the H2a teardown race: a shim that blocks must not hold the machine.
+
+Fix: `k_EnterCriticalSection` trylocks (uncontended and recursive calls keep
+the old cost), and only when the lock is held elsewhere unwinds the whole
+recursion depth with `mach_leave()`, waits, and re-enters. Proof: the 40
+watchdog lines disappear (`wd: stalled = 0`), `cs: contended slot=...` shows
+the new path is taken, and the same run reaches `dev:17` x5 with
+`tex:19` x2 and no crash.
+
+### 3. Critical-section table: recycle, and 256 was too small
+
+Two limits in the same table surfaced while the frame loop ran:
+`DeleteCriticalSection` was a no-op (slots never freed), and a measured run
+made 239 `InitializeCriticalSection` plus 18
+`InitializeCriticalSectionAndSpinCount` calls — 257 into 256 slots — then
+`FATAL: out of critical sections` right after the frame loop started. The
+delete path now destroys the mutex and clears the guest's slot word; `MAX_CS`
+is 4096. The 256 -> 4096 change is proven (the abort is gone); the recycle
+path is not exercised yet, because that same run made **zero** delete calls.
+
+### Evidence of rendering
+
+| run | presents | unique colours in the screencap |
+|---|---|---|
+| black baseline (before these fixes) | 3 | 1 (pure black) |
+| vtable + deadlock fix | 5 | 104,334 |
+| plus CS table 4096 | 13 | 132,003 |
+
+The screencap of the 13-present run is 2340x1080 landscape, mean luminance
+172 — a near-uniform light grey frame with a dark band at both edges, so
+frames are being presented but the picture is not yet identifiable game
+content. No title screen has been captured.
+
+### Not verified
+
+- What the presented frame actually contains, and whether the render thread
+  keeps up: 13 presents in ~45 s is far from a frame rate, and the run then
+  logged `lifecycle: pause` / `lifecycle: low memory` and lost its window. The
+  cause of the pause is not established.
+- The `DeleteCriticalSection` recycle path (no delete calls in the measured
+  run).
+- Cube and volume textures still have no host vtable; they would dispatch to
+  VA 0 exactly as the 2D texture did. No cube/volume texture has been created
+  on the phone so far.
