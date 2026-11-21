@@ -90,8 +90,9 @@ struct Obj {
     uint32_t lock_pitch = 0;
 };
 
-Obj g_objs[4096];
+Obj *g_objs;
 uint32_t g_obj_count;
+uint32_t g_obj_cap;
 uint32_t g_vt[32][192];          /* per kind: guest vtable VAs */
 int g_vt_built[32];
 uint32_t g_d3d_token;
@@ -121,9 +122,41 @@ extern "C" void ka_vtable_note_import(const char *name) {
         g_d9_stack_this = 0;
 }
 
+/* Grow the table instead of walking off its end. Nothing ever frees a slot
+ * (Release is a no-op), so without this the 4097th token wrote straight
+ * through the neighbouring BSS: kind/manual/signaled of the kernel object
+ * table came back as 0xB400006E... host pointers and a pool worker's
+ * blocking wait turned into a 700k/s spin (docs/FINDINGS.md 2026-11-21). */
+static void objs_ensure(uint32_t need) {
+    uint32_t cap;
+    Obj *grown;
+    if (need <= g_obj_cap) return;
+    cap = g_obj_cap ? g_obj_cap : 4096;
+    while (cap < need) cap *= 2;
+    grown = (Obj *)calloc(cap, sizeof(Obj));
+    if (!grown) {
+        ka_log("d3d9: object table grow to %u failed", cap);
+        return;
+    }
+    if (g_objs) memcpy(grown, g_objs, (size_t)g_obj_count * sizeof(Obj));
+    free(g_objs);
+    g_objs = grown;
+    g_obj_cap = cap;
+    ka_log("d3d9: object table grew to %u entries", cap);
+}
+
 uint32_t new_token(Kind kind, void *p, uint32_t owner) {
-    uint32_t idx = g_obj_count++;
-    uint32_t obj = ka_guest_alloc(12, 4);
+    uint32_t i, idx, obj;
+    /* The same COM object is the same token. GetRenderTarget and
+     * GetDepthStencilSurface were minting a fresh one on every call, and the
+     * engine calls both every frame: 1-2 table slots and 12 bytes of guest
+     * heap per frame leaked, and the table filled in ~40 s. */
+    if (!p) return 0;
+    for (i = 0; i < g_obj_count; i++)
+        if (g_objs[i].kind == kind && g_objs[i].p == p) return g_objs[i].token;
+    objs_ensure(g_obj_count + 1);
+    idx = g_obj_count++;
+    obj = ka_guest_alloc(12, 4);
     g_objs[idx].kind = kind;
     g_objs[idx].p = p;
     g_objs[idx].owner = owner;

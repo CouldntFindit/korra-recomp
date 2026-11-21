@@ -66,6 +66,33 @@ static ka_obj *obj_get(uint32_t h) {
     if (h == 0 || i >= MAX_OBJ || !g_obj[i].used) return NULL;
     return &g_obj[i];
 }
+
+/* Integrity check (M3, 2026-11-21). g_obj[9]'s fields at +4..+16 are found
+ * overwritten with host-pointer halves during the render burst, which turns a
+ * worker's blocking wait into a 730k/s spin and freezes the frame loop. The
+ * wait that first notices it belongs to a different thread than the writer, so
+ * the ring of recent imports has to be captured as soon as the table goes bad:
+ * this runs from every import dispatch, covering the 256 entries in 32
+ * imports. Diagnostics only. */
+void ka_obj_check(void) {
+    static unsigned rot;
+    static int bad;
+    unsigned k;
+    if (bad) return;
+    for (k = 0; k < 8; k++) {
+        unsigned i = (rot + k) & (MAX_OBJ - 1);
+        ka_obj *e = &g_obj[i];
+        if (e->used && (e->kind < OBJ_EVENT || e->kind > OBJ_SEM)) {
+            bad = 1;
+            ka_log("obj: entry %u corrupt: %d %d %d %d %d %d %d (fs=%08X f=0x%08X)", i,
+                   e->used, e->kind, e->manual, e->signaled, e->count,
+                   e->maxcount, e->owned, g_fs_base, g_cur_func);
+            ka_ring_dump("imports just before the object table went bad");
+            return;
+        }
+    }
+    rot = (rot + 8) & (MAX_OBJ - 1);
+}
 static uint32_t obj_new(int kind, int manual, int initial) {
     pthread_mutex_lock(&g_obj_lock);
     for (uint32_t i = 0; i < MAX_OBJ; i++) {
@@ -901,6 +928,45 @@ uint32_t ka_thread_wait(uint32_t token, uint32_t timeout_ms);
 static void k_WaitForSingleObject(void) {
     uint32_t h = A32(0), ms = A32(1);
     ka_obj *o = obj_get(h);
+    /* Repeat-wait probe (M3, 2026-11-21). The pool worker sub_007414E0 spins
+     * at ~20k loop passes a second after the first thirteen presents, and the
+     * throttled logs cannot show which handle it is polling: a wait that
+     * returns at once is what a spin looks like from here. Count waits per
+     * handle and print the third, then every 200,000th, with what the handle
+     * resolves to *now* - a closed semaphore's slot is recycled by obj_new,
+     * so a stale handle can silently become an unrelated signaled event.
+     * Diagnostics only; nothing changes what the guest sees. */
+    {
+        static struct { uint32_t h, n; } rep[8];
+        static int rn;
+        int i, slot = -1;
+        for (i = 0; i < rn; i++)
+            if (rep[i].h == h) { slot = i; break; }
+        if (slot < 0 && rn < 8) { slot = rn++; rep[slot].h = h; rep[slot].n = 0; }
+        if (slot >= 0) {
+            uint32_t n = ++rep[slot].n;
+            if (n == 3 || (n % 200000u) == 0) {
+                if (o) {
+                    const int *raw = (const int *)o;
+                    ka_log("wait: rep h=%08X n=%u idx=%ld kind=%u manual=%u sig=%u cnt=%d caller=0x%08X fs=%08X",
+                           h, n, (long)(o - g_obj), o->kind, o->manual, o->signaled, o->count,
+                           g_cur_func, g_fs_base);
+                    ka_log("wait: raw h=%08X %d %d %d %d %d %d %d", h,
+                           raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6]);
+                    if (o->kind < OBJ_EVENT || o->kind > OBJ_SEM) {
+                        static int corrupt_logged;
+                        if (!corrupt_logged) {
+                            corrupt_logged = 1;
+                            ka_log("wait: obj entry %ld is corrupt (kind=%u)", (long)(o - g_obj), o->kind);
+                            ka_ring_dump("last imports before the corruption was noticed");
+                        }
+                    }
+                } else
+                    ka_log("wait: rep h=%08X n=%u NOOBJ caller=0x%08X fs=%08X",
+                           h, n, g_cur_func, g_fs_base);
+            }
+        }
+    }
     /* Worker waits: name the handle and its state. The five CRI data-line
      * threads end in this call and never move again, so either nothing ever
      * signals the object or it is not an object at all. */
