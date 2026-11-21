@@ -470,10 +470,11 @@ recomp_func_t recomp_lookup_import(uint32_t va) {
              * and the guest's next `pop ebp` turns into garbage. Seeing the
              * stack pair walk tells that apart from a real guest bug. */
             if (--g_trace_left == 0)
-                ka_log("[import] %s esp=0x%08X ebp=0x%08X (trace limit; set KORRA_TRACE_IMPORTS=0 to silence)",
-                       g_shim[i].name, g_esp, g_ebp);
+                ka_log("[import] %s esp=0x%08X ebp=0x%08X f=0x%08X (trace limit; set KORRA_TRACE_IMPORTS=0 to silence)",
+                       g_shim[i].name, g_esp, g_ebp, g_cur_func);
             else
-                ka_log("[import] %s esp=0x%08X ebp=0x%08X", g_shim[i].name, g_esp, g_ebp);
+                ka_log("[import] %s esp=0x%08X ebp=0x%08X f=0x%08X", g_shim[i].name, g_esp, g_ebp,
+                       g_cur_func);
         }
         if ((++g_import_calls & 0xFFFu) == 0)
             ka_machine_yield();
@@ -523,15 +524,27 @@ static ka_thread g_threads[MAX_THREADS];
 static pthread_mutex_t g_threads_lock = PTHREAD_MUTEX_INITIALIZER;
 /* CREATE_SUSPENDED parks the thread at its entry point until ResumeThread. */
 static pthread_cond_t g_resume_cond = PTHREAD_COND_INITIALIZER;
-static uint32_t g_next_token = 0x100;
+/* Thread ids start above the object-handle range (obj_new hands out 1..256)
+ * so a thread id can never be mistaken for a kernel-object handle. */
+static uint32_t g_next_token = 0x1000;
 
 typedef struct { uint32_t start_va, param, token; uint32_t *gate; } thread_start_t;
+
+/* The id GetCurrentThreadId() must report inside a guest thread. On Windows
+ * CreateThread's lpThreadId IS that id: the engine stores the lpThreadId it was
+ * given in its own thread record and later looks the record up by
+ * GetCurrentThreadId() (sub_00741A90). Our CreateThread hands out a token, so
+ * the two must agree or the lookup returns NULL and the caller dereferences it
+ * (the pool pump wrote to guest VA 0x14 and died). */
+static __thread uint32_t g_guest_tid;
+uint32_t ka_guest_tid(void) { return g_guest_tid; }
 
 static void *thread_trampoline(void *p) {
     thread_start_t *t = (thread_start_t *)p;
     uint32_t args[1];
     uint32_t ret;
     ka_thread_attach("CreateThread");
+    g_guest_tid = t->token;
     /* CREATE_SUSPENDED: the engine's spawner passes the start routine, then
      * fills the parameter block (its function pointer, its event) only after
      * CreateThread returns. A thread that starts early reads those slots as
@@ -591,6 +604,10 @@ ka_thread *ka_thread_find(uint32_t token) {
     return NULL;
 }
 
+/* Lets a kernel32 shim recognise a thread id (as OpenThread's caller holds it)
+ * without exposing the thread table's type. */
+int ka_thread_exists(uint32_t token) { return ka_thread_find(token) != NULL; }
+
 /* ResumeThread returns the previous suspend count; 0xFFFFFFFF means "not a
  * thread of ours", which the shim turns into WAIT_FAILED/ERROR_INVALID_HANDLE. */
 uint32_t ka_thread_resume(uint32_t token) {
@@ -618,7 +635,9 @@ uint32_t ka_thread_wait(uint32_t token, uint32_t timeout_ms) {
     int depth = g_ts.depth;
     for (int i = 0; i < depth; i++) mach_leave();
     if (timeout_ms == 0xFFFFFFFFu) {
-        pthread_join(t->th, NULL);
+        /* Already finished: joining again would be undefined (and the engine
+         * may open the same worker id more than once). */
+        if (!t->done) pthread_join(t->th, NULL);
         for (int i = 0; i < depth; i++) mach_enter();
         return 0;
     }

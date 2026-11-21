@@ -126,11 +126,63 @@ static void u_GetCursorPos(void) {
     RET(1, 1);
 }
 static void u_SetCursorPos(void) { RET(1, 2); }
-static void u_ClipCursor(void) { RET(1, 1); }
+static void u_ClipCursor(void) {
+    /* Post-decision snapshot. ClipCursor is the FIRST import the teardown
+     * helper 0x00760E40 makes, i.e. it runs immediately after
+     * sub_00847BB0(0xDB8AE8, 0xDB8AA0) returned - so 0x9B4390 shows whether
+     * step 1 (the 16 MB pool create) published a handle, and 0xDB8284 is the
+     * engine's memory manager whose guest allocator (vtable slot 3) refused
+     * the block. Fields: +8/+C list head/tail, +10, +14 sub-object, +44 total
+     * bytes, +48 the allocator used by 0x0073E700. */
+    static int n;
+    if (n < 4) {
+        uint32_t m = MEM32(0xDB8284);
+        n++;
+        ka_log("post: 9B4390=%08X 9B44E8=%08X CA2020=%u CA2990=%08X "
+               "CA1EE8=%u CA1EEC=%u DB8284=%08X vt=%08X +8=%08X +C=%08X "
+               "+10=%08X +14=%08X +44=%08X +48=%08X",
+               MEM32(0x9B4390), MEM32(0x9B44E8), MEM32(0xCA2020),
+               MEM32(0xCA2990), MEM32(0xCA1EE8), MEM32(0xCA1EEC), m,
+               m ? MEM32(m) : 0, m ? MEM32(m + 8) : 0, m ? MEM32(m + 0xC) : 0,
+               m ? MEM32(m + 0x10) : 0, m ? MEM32(m + 0x14) : 0,
+               m ? MEM32(m + 0x44) : 0, m ? MEM32(m + 0x48) : 0);
+        ka_log("post: heap calls=%u bytes=%u max=%u", ka_alloc_calls,
+               ka_alloc_bytes, ka_alloc_max);
+        {
+            uint32_t vt = m ? MEM32(m) : 0;
+            uint32_t a48 = m ? MEM32(m + 0x48) : 0;
+            ka_log("post: mem vt=%08X e0=%08X e4=%08X e8=%08X eC=%08X "
+                   "alloc=%08X avt=%08X", vt,
+                   vt ? MEM32(vt) : 0, vt ? MEM32(vt + 4) : 0,
+                   vt ? MEM32(vt + 8) : 0, vt ? MEM32(vt + 0xC) : 0, a48,
+                   a48 ? MEM32(a48) : 0);
+        }
+    }
+    RET(1, 1);
+}
 static void u_ScreenToClient(void) { RET(1, 2); }
 static void u_ClientToScreen(void) { RET(1, 2); }
 static void u_GetDesktopWindow(void) { RET(0x7000, 0); }
-static void u_GetForegroundWindow(void) { RET(g_last_hwnd ? g_last_hwnd : 0x7000, 0); }
+static void u_GetForegroundWindow(void) {
+    /* Pre-decision snapshot. The engine calls GetForegroundWindow as the last
+     * import of its framework start (0x007657D0 -> 0x00847A30) and then
+     * judges sub_00847BB0(0xDB8AE8, 0xDB8AA0), which aborts the boot unless
+     * it returns exactly 1. The ExitProcess dump was polluted by the memory
+     * teardown, so sample the pool-subsystem globals here instead: 0xCA1EF4
+     * is the ready flag (0x4A), 0xCA2990 the lazily created singleton (0x4B),
+     * 0xCA1EE8/0xCA1EEC the pool-record capacity and count. */
+    static int n;
+    if (n < 8) {
+        n++;
+        ka_log("pre: fg=%d CA1EF4=%02X CA1EE8=%u CA1EEC=%u CA1EF0=%08X "
+               "CA2990=%08X 9B4390=%08X CA2020=%u CA1FD8=%08X 9B4388=%u 9B438C=%u",
+               n, (unsigned)MEM8(0xCA1EF4), MEM32(0xCA1EE8), MEM32(0xCA1EEC),
+               MEM32(0xCA1EF0), MEM32(0xCA2990), MEM32(0x9B4390),
+               MEM32(0xCA2020), MEM32(0xCA1FD8), MEM32(0x9B4388),
+               MEM32(0x9B438C));
+    }
+    RET(g_last_hwnd ? g_last_hwnd : 0x7000, 0);
+}
 static void u_ShowWindow(void) { RET(1, 2); }
 static void u_SetWindowPos(void) { RET(1, 7); }
 static void u_GetWindowLongA(void) {

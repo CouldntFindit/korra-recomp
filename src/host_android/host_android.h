@@ -40,6 +40,7 @@ int       ka_mem_init(void);
 void     *ka_host(uint32_t va);              /* host pointer, no checks */
 int       ka_commit(uint32_t va, uint32_t size, int prot_none); /* 0 ok */
 uint32_t  ka_guest_alloc(uint32_t size, uint32_t align);        /* 0 = out */
+extern uint32_t ka_alloc_calls, ka_alloc_bytes, ka_alloc_max;
 void      ka_guest_free(uint32_t va);
 uint32_t  ka_guest_strdup(const char *s);
 uint32_t  ka_guest_size(uint32_t va);
@@ -126,7 +127,11 @@ uint32_t ka_thread_attach(const char *why);   /* returns TIB VA for this thread 
 void     ka_thread_detach(void);
 uint32_t ka_thread_create(uint32_t start_va, uint32_t param, int suspended);
 uint32_t ka_thread_resume(uint32_t token);   /* previous suspend count, 0xFFFFFFFF if unknown */
+int      ka_thread_exists(uint32_t token);   /* 1 if the id names a live host thread */
 uint32_t ka_thread_wait(uint32_t token, uint32_t timeout_ms);
+/* The CreateThread token of the calling guest thread, or 0 outside one.
+ * GetCurrentThreadId must return it (see k_GetCurrentThreadId). */
+uint32_t ka_guest_tid(void);
 uint32_t ka_thread_exit_code(uint32_t token);
 uint32_t ka_thread_self_param(void);
 int      ka_spine_depth(void);
