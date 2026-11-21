@@ -39,9 +39,11 @@ void korra_crash_probe_init(void);
 void korra_perf_probe_init(void);
 void korra_fps_cap_init(void);
 void korra_windowed_init(void);
+void korra_watch_probe_lookup(uint32_t va);
 /* No hand-written function overrides yet. This is where a specific guest VA
  * gets a host body (a debug hook, a stubbed subsystem), keyed by address. */
 recomp_func_t recomp_lookup_manual(uint32_t va) {
+    korra_watch_probe_lookup(va);   /* KORRA_ICALL / KORRA_WATCHLOG (debug) */
     (void)va;
     return NULL;
 }

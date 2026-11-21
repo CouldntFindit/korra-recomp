@@ -24,6 +24,7 @@
 #include <ucontext.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/system_properties.h>
 #include <unistd.h>
 
 #include "host_android.h"
@@ -391,6 +392,64 @@ static void ka_crash_handler(int sig, siginfo_t *si, void *uc) {
     if (n > 0) {
         ssize_t w = write(2, buf, (size_t)n);
         (void)w;
+    }
+    /* `adb shell setprop debug.korra.watch E4D064`: dump that guest address (and
+     * the two pointers in front of it) at fault time. Half of a crash is the
+     * state of the object the faulting code was reading; the register dump only
+     * gives its address. The address must be a mapped guest VA - a second fault
+     * inside a handler kills the tombstone. */
+    {
+        char pv[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.korra.watch", pv);
+        uint32_t va = (uint32_t)strtoul(pv, NULL, 16);
+        if (va) {
+            uint32_t *m = (uint32_t *)((char *)g_mem_base + va);
+            for (int i = 0; i < 4; i++) {
+                uint32_t b = va + (uint32_t)i * 0x10u;
+                uint32_t *p = (uint32_t *)((char *)g_mem_base + b);
+                n = snprintf(buf, sizeof buf,
+                             "[crash] watch %08X: %08X %08X %08X %08X\n", b,
+                             p[0], p[1], p[2], p[3]);
+                if (n > 0) { ssize_t w = write(2, buf, (size_t)n); (void)w; }
+            }
+            uint32_t head = m[0];
+            if (head > 0x400000u && head < 0x80000000u) {
+                uint32_t *p = (uint32_t *)((char *)g_mem_base + head);
+                n = snprintf(buf, sizeof buf,
+                             "[crash] watch [%08X]=%08X: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+                             va, head, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+                if (n > 0) { ssize_t w = write(2, buf, (size_t)n); (void)w; }
+            }
+            uint32_t sub = m[0x30 / 4];
+            if (sub > 0x400000u && sub < 0x80000000u) {
+                uint32_t *p = (uint32_t *)((char *)g_mem_base + sub);
+                n = snprintf(buf, sizeof buf,
+                             "[crash] watch [%08X+30]=%08X: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+                             va, sub, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+                if (n > 0) { ssize_t w = write(2, buf, (size_t)n); (void)w; }
+            }
+        }
+    }
+    /* Walk the device-change callback list (head [0xDC0F3C], entries
+     * {fn, arg, ?, next, key}) so a fault can be read against the exact
+     * object that was dispatched. Cheap: a few entries. */
+    {
+        uint32_t e = *(uint32_t *)((char *)g_mem_base + 0xDC0F3C);
+        for (int i = 0; i < 300 && e > 0x400000u && e < 0x80000000u; i++) {
+            uint32_t *p = (uint32_t *)((char *)g_mem_base + e);
+            n = snprintf(buf, sizeof buf,
+                         "[crash] list %08X: fn=%08X arg=%08X next=%08X key=%08X\n",
+                         e, p[0], p[1], p[3], p[4]);
+            if (n > 0) { ssize_t w = write(2, buf, (size_t)n); (void)w; }
+            if (p[0] == 0x0074F8F0u && p[1] > 0x400000u && p[1] < 0x80000000u) {
+                uint32_t *o = (uint32_t *)((char *)g_mem_base + p[1]);
+                n = snprintf(buf, sizeof buf,
+                             "[crash] list arg %08X: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+                             p[1], o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7]);
+                if (n > 0) { ssize_t w = write(2, buf, (size_t)n); (void)w; }
+            }
+            e = p[3];
+        }
     }
     signal(sig, SIG_DFL);
     raise(sig);

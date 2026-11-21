@@ -2574,3 +2574,76 @@ Not verified: a >2 minute run (the NULL fault still ends it); a genuinely stale
 surface (the staleness check covers it by construction, but nothing has exercised
 it - rotating the device is the obvious test); the first-area frame rate.
 
+
+## 2026-11-21 - M3: the NULL technique pointer is one entry of the frame's pass queue
+
+The crash (see the entry above) is now named end to end. The chain, all of it
+inside lifted code with no import in it:
+
+    sub_00541400(0xE4D064)          frame submit (recomp_0016.c:44944)
+      -> sub_00748580               releases frame resources, clears +0x30
+      -> sub_0074F740               walks the pass queue
+           entry {fn=0x0074F8F0, arg=0x22EC4E80, key=0x6B100000}
+      -> sub_0074F8F0               thunk: call [obj->vtable + 4]
+      -> sub_0072EED0               the render pass itself (recomp_0038.c:57650)
+           esi = [device + 0x30]    <- NULL
+      -> sub_00736A20               push esi as arg3, 0x9E5754 as arg4
+      -> sub_007492B0               edx = [arg3 + 4] before any test  <- fault
+
+`sub_00541400` is called from `sub_005414B0` only, which passes the literal
+`0x00E4D064`: a frame/render-context singleton whose real base is `0xE4D060`
+(`[0xE4D064]` = the device object `0x20027120`, `+0x20/+0x24` = 1280x720).
+The queue head is `[0xDC0F3C]` (gate `[0xDC0F68]`, 62 entries by the time of
+the crash); entries are `{fn, arg, key, next, key2}`, inserted by
+`sub_0074F7D0` through the allocator at `[[0xDC0F08+0x58]+8]`, and the walk
+decodes a class/sub/index triple out of `key`. The one entry that ends the run
+was dumped at crash time: `fn=0074F8F0 arg=22EC4E80 next=2044BE80 key=6B100000`.
+
+Its `arg` is a 0x80-byte heap object with vtable `0x0096C88C`
+(`[0]=00631DF0 [1]=0072EED0 [2]=0099FAC8 [3]=0073DD00 [4]=00735550`),
+constructed in `sub_00732920` by `sub_0073E700(&out, 0x80, ...)` and published
+as the global at `0xE46940`; the only literal store of that vtable is
+`recomp_0038.c:62838`. So the faulting pass is that object's slot 1.
+
+Two measurements made the remaining question small. First, a sampler
+(`debug.korra.watchlog`, below) sitting in `recomp_lookup` and reading eight
+dwords at `0xE4D094` on every indirect transfer shows **`[0xE4D064+0x30]` is
+never written by any guest code in a 45 s run** - it is zero at the first
+sample and zero at the crash, while `+0x34` (`0xE4D098`) flips 1/0 with
+`from=00748CB0` (draw) and `from=00749020` (frame reset). The "cleared just
+before the walk" reading of `sub_00748580` is therefore dead: the pass never
+sees anything but NULL. Second, `sub_007492B0` would bail anyway - with
+`arg4 = 0x9E5754`, `ecx = [0x9E5754] = 0` fails its `edx && ecx` test, so the
+call is a no-op on every machine. The deref, not the missing value, is what
+kills the run: a NULL `+0x30` should mean "nothing to draw for this pass".
+
+So the open question is exactly one: on a machine where this run reaches the
+same point, is `+0x30` non-NULL (and which function wrote it), or does the
+queue not contain this entry yet? The Android host has no reference for that,
+so the Windows host was given the same two probes (`src/host/watch_probe.c`,
+`KORRA_ICALL` / `KORRA_WATCHLOG`, called from `recomp_lookup_manual`) and the
+build is ready (`build/korra_recomp.exe`); the run was not made in this
+session. If Windows writes the field, the sampler prints the writer's VA and
+the fix layer is whatever leaves it unset here; if Windows faults at
+`0x7492B0` too, the field is legitimately NULL and the layer is the pass queue
+(an entry registered for a pass whose target was never set).
+
+New host tooling, all off unless asked for (`adb shell setprop`, hex, no `0x`):
+`debug.korra.icall` (caller + first three stack arguments of any indirect
+transfer to a VA), `debug.korra.icallfrom` (every target dispatched from a VA),
+`debug.korra.watchlog` (eight dwords sampled on every indirect transfer, each
+change logged with the function that was running), `debug.korra.watch` (four
+lines of memory at a VA plus its pointee, printed by the crash handler, together
+with a walk of the pass queue at `[0xDC0F3C]`).
+
+Two tooling corrections worth keeping. `work/LoK.analysis.exe` **does not have
+the layout of the loaded image**: guest `0x96C88C` holds the vtable above, but
+that VA in the analysis copy is UTF-16 text; the same bytes sit at file offset
+`0x56B68C`. Dump statics from the original `LoK.exe` through a pefile section
+map. And `g_esp` inside `recomp_lookup` already includes the pushed arguments -
+`MEM32(g_esp+0)`, `+4`, `+8` are the callee's first three args (verified against
+a live frame).
+
+Not verified: what Windows holds at `+0x30` (the oracle run above); whether the
+crash also happens on Windows; that the entry is present on Windows at the same
+frame count; the first-area frame rate; anything after frame 2,321.
