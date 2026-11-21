@@ -128,6 +128,7 @@ uint32_t ka_thread_create(uint32_t start_va, uint32_t param, int suspended);
 uint32_t ka_thread_resume(uint32_t token);   /* previous suspend count, 0xFFFFFFFF if unknown */
 uint32_t ka_thread_wait(uint32_t token, uint32_t timeout_ms);
 uint32_t ka_thread_exit_code(uint32_t token);
+uint32_t ka_thread_self_param(void);
 int      ka_spine_depth(void);
 uint32_t ka_mono_ms(void);
 uint32_t ka_hat_packet(void);

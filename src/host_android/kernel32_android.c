@@ -81,6 +81,48 @@ static uint32_t obj_new(int kind, int manual, int initial) {
     return 0;
 }
 
+/* ------------------------------------------------------ pool slot probe ---
+ * M3 deadlock, 2026-11-21. The asset-load pool is two managers of slots, each
+ * slot a 0x18-byte block in guest heap reached through a posted/done semaphore
+ * pair: the pump sub_00741410 takes the pool's own InterlockedCompareExchange
+ * spin lock, stores a job count, releases every slot's posted semaphore and
+ * then waits on every slot's done semaphore; the worker sub_007414E0 waits on
+ * [+8], calls the job function at [+0x10] with the argument at [+0x14], and
+ * releases [+0xc]. On Windows every one of those posts carries a live function
+ * and the game reaches the menu. On the device one worker woke with [+0x10]
+ * already zero, called it, and then spun forever on a wait handle of 0.
+ *
+ * These records answer, in one run, which handle is which slot's semaphore and
+ * what the block held at the moment of the wake. They are diagnostics only:
+ * nothing here changes an answer the guest sees. */
+typedef struct { uint32_t h, init, max, esp, ebp; } ka_sem_rec;
+#define MAX_SEM_REC 24
+static ka_sem_rec g_sem_rec[MAX_SEM_REC];
+static int g_sem_n;
+
+static uint32_t sem_note(uint32_t tok, uint32_t init, uint32_t max) {
+    if (g_sem_n < MAX_SEM_REC) {
+        ka_sem_rec *r = &g_sem_rec[g_sem_n++];
+        r->h = tok; r->init = init; r->max = max; r->esp = g_esp; r->ebp = g_ebp;
+        ka_log("sem: h=%08X init=%u max=%u esp=%08X ebp=%08X", tok, init, max, g_esp, g_ebp);
+    }
+    return tok;
+}
+
+/* The worker block, read at wake. `mgr` is the pool object at [0] and its byte
+ * at +8 carries the shutdown bits sub_007414E0 tests. */
+static void slot_dump(uint32_t h, uint32_t param) {
+    uint32_t mgr, flags = 0;
+    if (param < KA_HEAP_BASE || param >= KA_HEAP_END) return;
+    mgr = MEM32(param);
+    if (mgr >= KA_HEAP_BASE && mgr < KA_HEAP_END) flags = MEM8(mgr + 8);
+    ka_log("slot: h=%08X param=%08X cap=%u post=%08X done=%08X fn=%08X arg=%08X"
+           " w18=%08X w1c=%08X mgr=%08X mgrflags=%02X",
+           h, param, MEM32(param + 4), MEM32(param + 8), MEM32(param + 0xc),
+           MEM32(param + 0x10), MEM32(param + 0x14),
+           MEM32(param + 0x18), MEM32(param + 0x1c), mgr, flags);
+}
+
 /* ------------------------------------------------------ critical sections */
 #define MAX_CS 256
 static pthread_mutex_t g_cs[MAX_CS];
@@ -138,6 +180,20 @@ static void guest_sleep_ms(uint32_t ms) {
 static void k_CloseHandle(void) {
     uint32_t h = A32(0);
     ka_obj *o = obj_get(h);
+    {
+        /* Handle reuse is normal on Windows too, so this is not a bug by
+         * itself: it is how the run shows WHICH object a value stood for at the
+         * moment the pool handed it on. obj_new reuses a freed slot, so a
+         * stale handle silently becomes the next object created. */
+        static int n;
+        if (n < 40) {
+            n++;
+            ka_log("close: h=%08X %s esp=%08X ebp=%08X fs=%08X", h,
+                   o ? (o->kind == OBJ_SEM ? "sem" : o->kind == OBJ_EVENT ? "event" : "mutex")
+                     : "not an object",
+                   g_esp, g_ebp, g_fs_base);
+        }
+    }
     if (o) { o->used = 0; RET(1, 1); }
     if (ka_file_close(h)) RET(1, 1);
     RET(0, 1);
@@ -809,8 +865,24 @@ static void k_WaitForSingleObject(void) {
             if (n2 < 40) {
                 n2++;
                 ka_log("wait: h=%08X woke after %u polls fs=%08X", h, waited, g_fs_base);
+                /* Same 40 wakes, so the two lines pair up: what the slot held
+                 * when its worker was let through. A fn of zero here, on a
+                 * post the pump just made, is the device bug itself. */
+                slot_dump(h, ka_thread_self_param());
             }
         }
+        RET(0, 2);
+    }
+    /* A handle of 0 is not an object at all: obj_get rejects it and no thread
+     * token can equal it, so the call below would return WAIT_OBJECT_0 in zero
+     * time and the caller loops as fast as it can. That is the terminal state
+     * of the M3 device run (worker token 265, after calling a NULL job
+     * function). The wait can never succeed here, so a 1 ms sleep cannot hide
+     * a real wake - it only keeps a 22 s device log small enough to read. */
+    if (h == 0) {
+        static int n0;
+        if (n0 < 20) { n0++; ka_log("wait: h=0 is not a handle, throttling fs=%08X", g_fs_base); }
+        guest_sleep_ms(1);
         RET(0, 2);
     }
     RET(ka_thread_wait(h, ms), 2);
@@ -845,7 +917,20 @@ static void k_ExitCodeThread(void) {
     if (out) MEM32(out) = ka_thread_exit_code(h);
     RET(1, 2);
 }
-static void k_OpenThread(void) { RET(0xFFFFFFFEu, 3); }
+/* OpenThread is a stub: it answers a value that belongs to no table, so the
+ * engine's "wait for that worker to finish" returns at once. The device log
+ * shows the pool teardown doing exactly this and then closing semaphores while
+ * five workers are still parked. Log the caller frame; whether the engine
+ * depends on this join is the question the morning run answers. */
+static void k_OpenThread(void) {
+    static int n;
+    if (n < 40) {
+        n++;
+        ka_log("openthread: tid=%u access=%08X esp=%08X ebp=%08X fs=%08X",
+               A32(2), A32(1), g_esp, g_ebp, g_fs_base);
+    }
+    RET(0xFFFFFFFEu, 3);
+}
 static void k_SetThreadPriority(void) { RET(1, 2); }
 static void k_GetThreadPriority(void) { RET(0, 1); }
 static void k_SetThreadAffinityMask(void) { RET(1, 2); }
@@ -886,6 +971,7 @@ static void k_CreateSemaphoreA(void) {
     uint32_t tok = obj_new(OBJ_SEM, 0, 0);
     ka_obj *o = obj_get(tok);
     if (o) { o->signaled = A32(1) != 0; o->count = (int)A32(1); o->maxcount = (int)A32(2); }
+    sem_note(tok, A32(1), A32(2));
     RET(tok, 4);
 }
 
@@ -904,6 +990,14 @@ static void k_FlushProcessWriteBuffers(void) { RETV(0); }
 static void k_GetCurrentProcessorNumber(void) { RET(0, 0); }
 static void k_ReleaseSemaphore(void) {
     ka_obj *o = obj_get(A32(0));
+    {
+        static int n;
+        if (n < 60) {
+            n++;
+            ka_log("semrel: h=%08X n=%u esp=%08X ebp=%08X fs=%08X",
+                   A32(0), A32(1), g_esp, g_ebp, g_fs_base);
+        }
+    }
     if (A32(2)) MEM32(A32(2)) = o ? (uint32_t)o->count : 0;
     if (o) { o->count += (int)A32(1); o->signaled = o->count > 0; }
     RET(1, 3);

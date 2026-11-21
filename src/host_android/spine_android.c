@@ -641,3 +641,16 @@ uint32_t ka_thread_exit_code(uint32_t token) {
     ka_thread *t = ka_thread_find(token);
     return t ? t->exit_code : 0;
 }
+
+/* The parameter block this host thread was started with, 0 when it is not one
+ * of ours. The asset-load pool gives each worker one block (sub_007414E0 reads
+ * [+8] posted semaphore, [+0xc] done semaphore, [+0x10] job function, [+0x14]
+ * job argument), so naming the block from a shim turns "a worker woke" into
+ * "slot N of pool P woke". */
+uint32_t ka_thread_self_param(void) {
+    pthread_t me = pthread_self();
+    for (int i = 0; i < MAX_THREADS; i++)
+        if (g_threads[i].used && pthread_equal(g_threads[i].th, me))
+            return g_threads[i].param;
+    return 0;
+}
