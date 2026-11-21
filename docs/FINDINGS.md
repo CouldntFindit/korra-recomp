@@ -2350,3 +2350,98 @@ content. No title screen has been captured.
 - Cube and volume textures still have no host vtable; they would dispatch to
   VA 0 exactly as the 2D texture did. No cube/volume texture has been created
   on the phone so far.
+## 2026-11-21 - M3: two host-table defects in a row - the D3D9 object table overflow, then the lock staging leak
+
+The run that froze at ~40 s after thirteen presents (`docs/FINDINGS.md`,
+critical-section entry above) was not a deadlock in the engine. Two host
+defects, one behind the other.
+
+### 1. `new_token()` wrote past `g_objs` into the kernel object table
+
+The freeze: two asset-pool workers spinning at 700,000 `WaitForSingleObject`
+calls a second on handles `0x0A` and `0x0C`, with `wd: stalled
+func=00867E90` - the frame tick - never advancing. A repeat-wait probe in
+`k_WaitForSingleObject` showed the handles still resolved to `g_obj`
+entries, but the entries themselves read `kind=0xB400006E,
+manual=0x20000650, signaled=1`: the two halves of a host heap pointer
+(the DXVK device prints as `0xb400006e63478dd0`), not an object. `used`,
+`maxcount` and `owned` survived, so a 16-byte aligned store had landed at
+`&g_obj[0] + 0x100` in one run and `g_obj + 0` in another. `signaled`
+reading 1 is why a blocking wait returned at once and the workers spun.
+
+`llvm-nm -S --numeric-sort` on the unstripped `libkorra.so` placed
+`g_objs` (the D3D9 token table, `0x30000` bytes = 4096 x 48) at
+`0xacf0688` and `g_obj` (the kernel object table, `0x1c00`) at
+`0xad27cd0` - `g_obj` starts 0x7688 bytes past the end of `g_objs`, i.e.
+631 entries. `new_token()` did `g_objs[g_obj_count++]` with no bound
+check and `IUnknown::Release` is `RET(0,0)` ("objects live for the
+process"), so nothing ever freed a slot. `d_GetRenderTarget()` and
+`d_GetDepthStencilSurface()` minted a **fresh token on every call**, and
+the engine calls both every frame: about 4096 tokens in 40 s, and entry
+4096 + 631 wrote `g_objs[idx].p` - a host pointer - over `g_obj`'s
+`kind`/`manual`/`signaled`.
+
+The import ring (`ka_ring_note`/`ka_ring_dump`, newest 8 non-wait imports
+with their `g_cur_func` and `g_fs_base`) and `ka_obj_check()`, called on
+every import dispatch, are what named it: the corruption was first seen
+on the thread doing `EnterCriticalSection`/`LeaveCriticalSection` around
+`0x8D1990`/`0x8D19D0`, and the check caught the write within 8 imports of
+its occurrence.
+
+Fix (`1eb7979`): the table grows (`objs_ensure`, doubling from 4096,
+`calloc` + `memcpy`, logs `d3d9: object table grew to N entries`) so it
+can never write outside itself, and `new_token` returns the existing
+token when the same kind and COM pointer are already registered - the
+same object gets the same token, which is what D3D9 promises - which
+stops the per-frame churn and its 12-byte guest token leak at the source.
+Run `logs/log7.txt` (90 s): `obj: entry` corruption 0 (was 1), `wd:
+stalled` 0 (was 40), `dev:17` 13, `tex:19` 10, `ICALL` 0, and the table
+grew once, at startup.
+
+### 2. The texture/surface/buffer lock staging buffer was never freed
+
+With the spin gone the run reached the same thirteen presents and then
+died differently: `guest heap exhausted (want 921600 bytes at
+0x5FFFC800)` three times, then a signal 11 in the CRT's `memcpy`
+(`sub_0077D660`, `recomp_0042.c:50142`) with `edi=0` - the engine
+memcpy'ing into the NULL the exhausted allocator returned. 921,600 is
+exactly 1280 x 720.
+
+`t_LockRect`, `s_LockRect` and `b_Lock` each allocate a guest staging
+buffer (`o->lock_va = ka_guest_alloc(size, 16)`) and the matching Unlock
+only copied the guest's writes back before dropping `lock_host` - the
+staging buffer was **never freed**, so every unlocked surface leaked its
+full size. The engine locks a 1280x720 surface per frame; ~780 locks
+fills the 1 GiB guest heap.
+
+Fix: `t_UnlockRect`, `s_UnlockRect` and `b_Unlock` now `ka_guest_free`
+the staging buffer and clear `lock_va`/`lock_size`, and each Lock frees a
+previous staging buffer before allocating a new one (a lock without an
+unlock still leaked). Run `logs/log8.txt` (75 s): `heap exhausted` 0,
+`crash` 2, `dev:17` 13, `tex:19` 10, `ICALL` 0, `wd: stalled` 0,
+`obj: entry` 0.
+
+### The next fault, recorded and not yet fixed
+
+```
+d3dx: TextureFromFileInMemoryEx failed 0x8876086C (size 16512)
+[crash] signal 11 code=2 addr=0x6b53f6f000 guest_func=0x0053C630
+        esp=0xCDFFFF34 ebp=0xCDFFFF3C eax=1 ecx=0 edx=2 ebx=esi=0x2147D1D4 edi=0x00740D50
+[crash] pc=0x6C5E480188 off=0x226E188 lr=0x6C5E480138 sp=0x6B3809A9B0
+```
+`addr2line` puts the fault inside the lifted `sub_0053C630`
+(`recomp_0016.c`), which installs per-index callbacks at
+`[0xDC0AD4]+0x10/+0x14`, `+0x28`, `+0x58`, `+0x5C`, calls `sub_00741410`,
+then calls through `[0xDBE130]->vt+0x10` and `[0xDC0140]->vt+0x10`
+(`RECOMP_ICALL`). The guest `esp` (0xCDFFFF34) is at the very top of the
+guest stack region while other guest threads sit near 0xC03FF... - read
+that as a stack-pointer setup defect for a freshly created thread before
+blaming the D3DX failure, since `d3dx: TextureFromFileInMemoryEx failed
+0x8876086C` (D3DERR_INVALIDCALL) is the line right before the fault and a
+texture the engine expected is now NULL.
+
+**Not verified:** no title screen or first area yet - every screenshot of
+a live run so far is either black or the launcher (the app exits during
+the run). The game still stops at thirteen presents; the frame burst is
+not yet a frame loop, so the 30 fps default and the touch->XInput mapping
+are untouched. Tested on the owner's S24 only (`RFCYA0VVJKH`).

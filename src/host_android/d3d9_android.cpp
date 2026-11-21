@@ -811,6 +811,7 @@ void t_LockRect() {
     if (SUCCEEDED(hr)) {
         TEX->GetLevelDesc(A32(0), &desc);
         uint32_t size = lr.Pitch * desc.Height;
+        if (o->lock_va) ka_guest_free(o->lock_va);   /* lock without unlock */
         o->lock_va = ka_guest_alloc(size, 16);
         o->lock_host = lr.pBits;
         o->lock_size = size;
@@ -830,7 +831,15 @@ void t_UnlockRect() {
     Obj *o = self_obj();
     if (o->lock_host && o->lock_va)
         memcpy(o->lock_host, ka_host(o->lock_va), o->lock_size);
+    /* The staging buffer is ours: LockRect allocates it and the guest's copy
+     * goes back through it, so it dies with the lock. It used to be leaked -
+     * a 1280x720 surface lock is 921,600 bytes, the engine locks a surface
+     * every frame, and the leak filled the 1 GiB guest heap in ~780 locks;
+     * the engine's next memcpy then wrote through the NULL the exhausted
+     * allocator returned (docs/FINDINGS.md, 2026-11-21). */
+    if (o->lock_va) { ka_guest_free(o->lock_va); o->lock_va = 0; }
     o->lock_host = nullptr;
+    o->lock_size = 0;
     RET_HR(TEX->UnlockRect(A32(0)), 1);
 }
 void t_AddDirtyRect() { RET_HR(TEX->AddDirtyRect((const RECT *)P(A32(0))), 1); }
@@ -847,6 +856,7 @@ void s_LockRect() {
     if (SUCCEEDED(hr)) {
         SURF->GetDesc(&desc);
         uint32_t size = lr.Pitch * desc.Height;
+        if (o->lock_va) ka_guest_free(o->lock_va);   /* lock without unlock */
         o->lock_va = ka_guest_alloc(size, 16);
         o->lock_host = lr.pBits;
         o->lock_size = size;
@@ -860,7 +870,9 @@ void s_UnlockRect() {
     Obj *o = self_obj();
     if (o->lock_host && o->lock_va)
         memcpy(o->lock_host, ka_host(o->lock_va), o->lock_size);
+    if (o->lock_va) { ka_guest_free(o->lock_va); o->lock_va = 0; }   /* see t_UnlockRect */
     o->lock_host = nullptr;
+    o->lock_size = 0;
     RET_HR(SURF->UnlockRect(), 0);
 }
 void s_GetDC() { RET_HR(SURF->GetDC((HDC *)P(A32(0))), 1); }
@@ -889,6 +901,7 @@ void b_Lock() {
     else
         hr = reinterpret_cast<IDirect3DIndexBuffer9 *>(o->p)->Lock(A32(0), A32(1), &host, A32(3));
     if (SUCCEEDED(hr)) {
+        if (o->lock_va) ka_guest_free(o->lock_va);   /* lock without unlock */
         o->lock_va = ka_guest_alloc(A32(1) ? A32(1) : 0x10000, 16);
         o->lock_host = host;
         o->lock_size = A32(1);
@@ -900,7 +913,9 @@ void b_Unlock() {
     Obj *o = self_obj();
     if (o->lock_host && o->lock_va && o->lock_size)
         memcpy(o->lock_host, ka_host(o->lock_va), o->lock_size);
+    if (o->lock_va) { ka_guest_free(o->lock_va); o->lock_va = 0; }   /* see t_UnlockRect */
     o->lock_host = nullptr;
+    o->lock_size = 0;
     if (o->kind == K_VBUFFER)
         RET_HR(reinterpret_cast<IDirect3DVertexBuffer9 *>(o->p)->Unlock(), 0);
     RET_HR(reinterpret_cast<IDirect3DIndexBuffer9 *>(o->p)->Unlock(), 0);
