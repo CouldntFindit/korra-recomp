@@ -492,35 +492,68 @@ void d_CreateIndexBuffer() {
     if (A32(4)) MEM32(A32(4)) = SUCCEEDED(hr) ? new_token(K_IBUFFER, b, g_ecx) : 0;
     RET((uint32_t)hr, 6);
 }
+static int g_crt_log, g_cds_log;   /* token-contract logs, capped */
+/* 8 arguments: (w, h, fmt, ms, msq, lockable, ppSurface, pSharedHandle).
+ * The engine pushes `this` last here too (same codegen as CreateVertexBuffer),
+ * so the first real argument is A32(0) and ppSurface is A32(6) with
+ * pSharedHandle at A32(7). Writing the token through A32(7) - the pSharedHandle
+ * slot, which the engine leaves NULL - skipped the store entirely: the engine
+ * kept a NULL render-target surface, later handed it to SetRenderTarget(0, 0),
+ * DXVK answered D3DERR_INVALIDCALL, the 0x756B00 gate bailed and the technique
+ * install never copied its descriptor (measured [shader+0x30]+4 == 0 on the
+ * device, a live surface on Windows). */
 void d_CreateRenderTarget() {
     IDirect3DSurface9 *s = nullptr;
     HRESULT hr = DEV->CreateRenderTarget(A32(0), A32(1), (D3DFORMAT)A32(2),
                                          (D3DMULTISAMPLE_TYPE)A32(3), A32(4), A32(5), &s,
-                                         (HANDLE *)P(A32(6)));
-    if (A32(7)) MEM32(A32(7)) = SUCCEEDED(hr) ? new_token(K_SURFACE, s, g_ecx) : 0;
-    if (FAILED(hr)) ka_log("d3d9: CreateRenderTarget %ux%u fmt=%u -> 0x%08X", A32(0), A32(1), A32(2), (unsigned)hr);
+                                         (HANDLE *)P(A32(7)));
+    uint32_t tok = SUCCEEDED(hr) ? new_token(K_SURFACE, s, g_ecx) : 0;
+    if (A32(6)) MEM32(A32(6)) = tok;
+    if (g_crt_log < 6) {
+        g_crt_log++;
+        ka_log("d3d9: CreateRenderTarget %ux%u fmt=%u -> 0x%08X out=%08X shared=%08X tok=%08X",
+               A32(0), A32(1), A32(2), (unsigned)hr, A32(6), A32(7), tok);
+    }
     RET((uint32_t)hr, 8);
 }
 void d_CreateDepthStencilSurface() {
     IDirect3DSurface9 *s = nullptr;
     HRESULT hr = DEV->CreateDepthStencilSurface(A32(0), A32(1), (D3DFORMAT)A32(2),
                                                 (D3DMULTISAMPLE_TYPE)A32(3), A32(4), A32(5),
-                                                &s, (HANDLE *)P(A32(6)));
-    if (A32(7)) MEM32(A32(7)) = SUCCEEDED(hr) ? new_token(K_SURFACE, s, g_ecx) : 0;
-    if (FAILED(hr)) ka_log("d3d9: CreateDepthStencilSurface %ux%u fmt=%u -> 0x%08X", A32(0), A32(1), A32(2), (unsigned)hr);
+                                                &s, (HANDLE *)P(A32(7)));
+    uint32_t tok = SUCCEEDED(hr) ? new_token(K_SURFACE, s, g_ecx) : 0;
+    if (A32(6)) MEM32(A32(6)) = tok;
+    if (g_cds_log < 6) {
+        g_cds_log++;
+        ka_log("d3d9: CreateDepthStencilSurface %ux%u fmt=%u -> 0x%08X out=%08X shared=%08X tok=%08X",
+               A32(0), A32(1), A32(2), (unsigned)hr, A32(6), A32(7), tok);
+    }
     RET((uint32_t)hr, 8);
 }
-void d_UpdateSurface() { RET_HR(DEV->UpdateSurface((IDirect3DSurface9 *)P(A32(0)), (const RECT *)P(A32(1)), (IDirect3DSurface9 *)P(A32(2)), (const POINT *)P(A32(3))), 4); }
-void d_UpdateTexture() { RET_HR(DEV->UpdateTexture((IDirect3DBaseTexture9 *)P(A32(0)), (IDirect3DBaseTexture9 *)P(A32(1))), 2); }
-void d_GetRenderTargetData() { RET_HR(DEV->GetRenderTargetData((IDirect3DSurface9 *)P(A32(0)), (IDirect3DSurface9 *)P(A32(1))), 2); }
-void d_GetFrontBufferData() { RET_HR(DEV->GetFrontBufferData(A32(0), (IDirect3DSurface9 *)P(A32(1))), 2); }
+/* Interface arguments are guest TOKENS, not pointers. P(token) hands DXVK a
+ * fake IDirect3DSurface9 whose vtable slot is guest memory; the first method it
+ * calls faults at NULL+small (measured: addr=0x24 inside
+ * D3D9DeviceEx::StretchRect from sub_00756580). Resolve every interface
+ * argument through obj_of() and pass the real object, nullptr when unknown. */
+static IDirect3DSurface9 *surf_arg(int i) {
+    Obj *o = obj_of(A32(i));
+    return o ? (IDirect3DSurface9 *)o->p : nullptr;
+}
+static IDirect3DBaseTexture9 *tex_arg(int i) {
+    Obj *o = obj_of(A32(i));
+    return o ? (IDirect3DBaseTexture9 *)o->p : nullptr;
+}
+void d_UpdateSurface() { RET_HR(DEV->UpdateSurface(surf_arg(0), (const RECT *)P(A32(1)), surf_arg(2), (const POINT *)P(A32(3))), 4); }
+void d_UpdateTexture() { RET_HR(DEV->UpdateTexture(tex_arg(0), tex_arg(1)), 2); }
+void d_GetRenderTargetData() { RET_HR(DEV->GetRenderTargetData(surf_arg(0), surf_arg(1)), 2); }
+void d_GetFrontBufferData() { RET_HR(DEV->GetFrontBufferData(A32(0), surf_arg(1)), 2); }
 void d_StretchRect() {
-    RET_HR(DEV->StretchRect((IDirect3DSurface9 *)P(A32(0)), (const RECT *)P(A32(1)),
-                            (IDirect3DSurface9 *)P(A32(2)), (const RECT *)P(A32(3)),
+    RET_HR(DEV->StretchRect(surf_arg(0), (const RECT *)P(A32(1)),
+                            surf_arg(2), (const RECT *)P(A32(3)),
                             (D3DTEXTUREFILTERTYPE)A32(4)), 5);
 }
 void d_ColorFill() {
-    RET_HR(DEV->ColorFill((IDirect3DSurface9 *)P(A32(0)), (const RECT *)P(A32(1)), A32(2)), 3);
+    RET_HR(DEV->ColorFill(surf_arg(0), (const RECT *)P(A32(1)), A32(2)), 3);
 }
 void d_CreateOffscreenPlainSurface() {
     IDirect3DSurface9 *s = nullptr;
@@ -531,9 +564,21 @@ void d_CreateOffscreenPlainSurface() {
 }
 
 /* Object-token out parameters: the caller's pointer holds a guest token. */
+/* HRESULT failure log for the four calls in the technique-install gate
+ * (sub_00756B00 / sub_00756600). They bail on any negative HRESULT with `js`,
+ * so a silently failing shim turns into a skipped technique install and a NULL
+ * technique pointer two frames later. Cap the lines: the gate runs per frame. */
+static int g_hr_log_rt, g_hr_log_ds, g_hr_log_rs, g_hr_log_bb;
 void d_SetRenderTarget() {
     Obj *o = obj_of(A32(1));
-    RET_HR(DEV->SetRenderTarget(A32(0), o ? (IDirect3DSurface9 *)o->p : nullptr), 2);
+    uint32_t gtok = A32(1);
+    HRESULT hr = DEV->SetRenderTarget(A32(0), o ? (IDirect3DSurface9 *)o->p : nullptr);
+    if (g_hr_log_rt < 40) {
+        g_hr_log_rt++;
+        ka_log("d3d9: SetRenderTarget(%u, tok=%08X %s) -> 0x%08X", A32(0), gtok,
+               o ? "known" : "UNKNOWN", (unsigned)hr);
+    }
+    RET((uint32_t)hr, 2);
 }
 void d_GetRenderTarget() {
     IDirect3DSurface9 *s = nullptr;
@@ -548,6 +593,10 @@ void d_SetDepthStencilSurface() {
 void d_GetDepthStencilSurface() {
     IDirect3DSurface9 *s = nullptr;
     HRESULT hr = DEV->GetDepthStencilSurface(&s);
+    if (FAILED(hr) && g_hr_log_ds < 12) {
+        g_hr_log_ds++;
+        ka_log("d3d9: GetDepthStencilSurface -> 0x%08X surf=%p", (unsigned)hr, (void *)s);
+    }
     if (A32(0)) MEM32(A32(0)) = SUCCEEDED(hr) ? new_token(K_SURFACE, s, g_ecx) : 0;
     RET((uint32_t)hr, 1);
 }
@@ -579,7 +628,12 @@ void d_SetRenderState() {
     RET_HR(DEV->SetRenderState((D3DRENDERSTATETYPE)A32(0), A32(1)), 2);
 }
 void d_GetRenderState() {
-    RET_HR(DEV->GetRenderState((D3DRENDERSTATETYPE)A32(0), (DWORD *)P(A32(1))), 2);
+    HRESULT hr = DEV->GetRenderState((D3DRENDERSTATETYPE)A32(0), (DWORD *)P(A32(1)));
+    if (FAILED(hr) && g_hr_log_rs < 12) {
+        g_hr_log_rs++;
+        ka_log("d3d9: GetRenderState(%u) -> 0x%08X", A32(0), (unsigned)hr);
+    }
+    RET((uint32_t)hr, 2);
 }
 void d_CreateStateBlock() {
     IDirect3DStateBlock9 *sb = nullptr;
@@ -774,11 +828,19 @@ void s_Present() {
     RET_HR(SELF_AS(IDirect3DSwapChain9, K_SWAPCHAIN)->Present(
             (const RECT *)P(A32(0)), (const RECT *)P(A32(1)), (HWND)(uintptr_t)A32(2), (const RGNDATA *)P(A32(3)), 0), 4);
 }
-void s_GetFrontBufferData() { RET_HR(SELF_AS(IDirect3DSwapChain9, K_SWAPCHAIN)->GetFrontBufferData((IDirect3DSurface9 *)P(A32(0))), 1); }
+void s_GetFrontBufferData() { RET_HR(SELF_AS(IDirect3DSwapChain9, K_SWAPCHAIN)->GetFrontBufferData(surf_arg(0)), 1); }
 void s_GetBackBuffer() {
     IDirect3DSurface9 *s = nullptr;
     HRESULT hr = SELF_AS(IDirect3DSwapChain9, K_SWAPCHAIN)->GetBackBuffer(A32(0), (D3DBACKBUFFER_TYPE)A32(1), &s);
-    if (A32(2)) MEM32(A32(2)) = SUCCEEDED(hr) ? new_token(K_SURFACE, s, g_ecx) : 0;
+    uint32_t tok = 0;
+    if (A32(2)) {
+        MEM32(A32(2)) = SUCCEEDED(hr) ? (tok = new_token(K_SURFACE, s, g_ecx)) : 0;
+    }
+    if (g_hr_log_bb < 20) {
+        g_hr_log_bb++;
+        ka_log("d3d9: sc GetBackBuffer(%u,%u) -> 0x%08X surf=%p tok=%08X", A32(0), A32(1),
+               (unsigned)hr, (void *)s, tok);
+    }
     RET((uint32_t)hr, 3);
 }
 void s_GetRasterStatus() { RET_HR(SELF_AS(IDirect3DSwapChain9, K_SWAPCHAIN)->GetRasterStatus((D3DRASTER_STATUS *)P(A32(0))), 1); }
