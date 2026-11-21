@@ -463,6 +463,12 @@ static uint32_t g_watchlog_va, g_watchlog_hits;
 static uint32_t g_watchlog_last[8];
 static int      g_watchlog_read;
 
+/* 400 was not enough twice: the Task-2 slot churn alone spends 400 lines in
+ * the first 30 s, and the line that mattered (a cache being zeroed before the
+ * pass that reads it) lands after level load. The host probe has used 3000
+ * since 2026-11-21 for the same reason. */
+#define KA_WATCHLOG_CAP 3000
+
 static void watch_log(void) {
     if (!g_watchlog_read) {
         char buf[PROP_VALUE_MAX] = {0};
@@ -480,7 +486,7 @@ static void watch_log(void) {
     uint32_t *w = (uint32_t *)((char *)g_mem_base + g_watchlog_va);
     for (int i = 0; i < 8; i++) {
         if (w[i] == g_watchlog_last[i]) continue;
-        if (++g_watchlog_hits <= 400)
+        if (++g_watchlog_hits <= KA_WATCHLOG_CAP)
             ka_log("[wlog] +%02X = %08X (was %08X) from=%08X", i * 4, w[i],
                    g_watchlog_last[i], g_cur_func);
         g_watchlog_last[i] = w[i];

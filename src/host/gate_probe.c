@@ -119,6 +119,29 @@ report:
         fprintf(stderr, "[gate] ctx dev=%08X d4=%08X d8=%08X"
                         " c08=%08X c10=%08X c18=%08X c20=%08X\n",
                 dev, rd(dev + 4u), rd(dev + 8u), c08, c10, c18, c20);
+        /* Same `rec` line as the device probe (gate_probe_android.c): the
+         * recorder's technique cache and the flags that gate it. The binder
+         * sub_00550280 at 0x5502FF passes
+         * `[0xE4CCF8] > 0xB ? [0xE4CCF4] + 0xDC : 0` as the technique to
+         * sub_007492B0 - a NULL there is the Task-2 fault, so this is the line
+         * that says whether the cache is filled on this machine. */
+        fprintf(stderr, "[gate] rec e46e90=%08X q74=%08X q68=%08X"
+                        " ccf0=%08X ccf4=%08X ccf8=%08X ccfc=%08X\n",
+                MEM32(0xE46E90u), MEM32(0xDC0F74u), MEM32(0xDC0F68u),
+                MEM32(0xE4CCF0u), MEM32(0xE4CCF4u), MEM32(0xE4CCF8u),
+                MEM32(0xE4CCFCu));
+        /* The package the technique cache is resolved from - same line as the
+         * device probe. sub_0053F82C looks up "pre_texture.wta"/".wtp" in the
+         * object at 0xDC0988 through 0x73C4A0 and only fills [0xE4CCF4] when
+         * both names are found. */
+        {
+            uint32_t head = MEM32(0xDC0988u), page = head ? rd(head) : 0;
+            fprintf(stderr, "[gate] pkg d984=%08X d988=%08X d98c=%08X"
+                            " head0=%08X head4=%08X head8=%08X head10=%08X\n",
+                    MEM32(0xDC0984u), head, MEM32(0xDC098Cu),
+                    page ? rd(page) : 0, page ? rd(page + 4u) : 0,
+                    page ? rd(page + 8u) : 0, page ? rd(page + 0x10u) : 0);
+        }
         /* 00748B30 hands 00756600 [entry+0x14], not the table entry, so the
          * cached pass state lives at [[t+0x14]+0x30]+4. Same lines as the
          * device probe, so the bind inputs can be diffed directly. */

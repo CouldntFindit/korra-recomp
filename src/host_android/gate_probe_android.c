@@ -160,6 +160,37 @@ void ka_gate_tick(void) {
     ka_log("[gate] ctx dev=%08X d4=%08X d8=%08X v34=%08X c04=%08X l04=%08X"
            " c08=%08X c10=%08X c18=%08X c20=%08X gp=%08X gp30=%08X daa0=%08X",
            dev, dev4, dev8, ctx34, c04, l04, c08, c10, c18, c20, gp, gp30, sdaa0);
+
+    /* The recorder's technique cache, and the two flags that gate it.
+     * sub_00550280 binds pass 3 with `[0xE4CCF8] > 0xB ? [0xE4CCF4] + 0xDC : 0`
+     * (0x5502FF), so a cache that is still empty there hands sub_007492B0 a
+     * NULL technique and the flush faults reading [NULL+4] - the Task-2 crash
+     * on the device. 0xE4CCF0 is the fill's own success flag (set at 0x73C564
+     * from sub_007516C0's return), so these four dwords separate "the fill
+     * never ran", "it ran and found nothing" and "it ran, then a reset zeroed
+     * it". [0xDC0F68] is the pass-queue non-empty gate, [0xDC0F74] the
+     * deferred-flush flag the binder tests, [0xE46E90] the in-pass flag. */
+    ka_log("[gate] rec e46e90=%08X q74=%08X q68=%08X ccf0=%08X ccf4=%08X"
+           " ccf8=%08X ccfc=%08X",
+           MEM32(0xE46E90u), MEM32(0xDC0F74u), MEM32(0xDC0F68u),
+           MEM32(0xE4CCF0u), MEM32(0xE4CCF4u), MEM32(0xE4CCF8u),
+           MEM32(0xE4CCFCu));
+    /* The package the technique cache comes from. sub_0053F82C resolves
+     * "pre_texture.wta"/".wtp" through 0x73C4A0 against the object at
+     * 0xDC0988, whose head is [0xDC0984]; 0x73C4A0 walks that chain with the
+     * ASCII stricmp 0x77BE27 and only fills [0xE4CCF4] when BOTH names are
+     * found. On the device the cache is still {0,0} at the crash, on Windows
+     * it is {0B3F5EE4, 0xF} by the second census - so this line says whether
+     * the package was never built (head 0), built without those two entries
+     * (pages 0), or built and simply not consulted. */
+    {
+        uint32_t head = MEM32(0xDC0988u), page = head ? rd(head) : 0;
+        ka_log("[gate] pkg d984=%08X d988=%08X d98c=%08X"
+               " head0=%08X head4=%08X head8=%08X head10=%08X",
+               MEM32(0xDC0984u), head, MEM32(0xDC098Cu),
+               page ? rd(page) : 0, page ? rd(page + 4u) : 0,
+               page ? rd(page + 8u) : 0, page ? rd(page + 0x10u) : 0);
+    }
     ka_log("[gate] pair %08X:%08X | %08X:%08X | %08X:%08X | %08X:%08X",
            a08, b08, a10, b10, a18, b18, a20, b20);
 }
