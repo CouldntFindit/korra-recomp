@@ -42,6 +42,9 @@ int       ka_commit(uint32_t va, uint32_t size, int prot_none); /* 0 ok */
 uint32_t  ka_guest_alloc(uint32_t size, uint32_t align);        /* 0 = out */
 extern uint32_t ka_alloc_calls, ka_alloc_bytes, ka_alloc_max;
 void      ka_guest_free(uint32_t va);
+/* Dumps the engine memory manager, its allocator and the fallback allocator
+ * (free lists, used list); see memory_android.c. Diagnostics only. */
+void      ka_pool_dump(const char *tag);
 uint32_t  ka_guest_strdup(const char *s);
 uint32_t  ka_guest_size(uint32_t va);
 /* A fresh guest stack; returns the initial esp (top, 16-byte aligned). */

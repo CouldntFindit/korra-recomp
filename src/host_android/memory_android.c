@@ -175,6 +175,105 @@ uint32_t ka_stack_new(uint32_t size, uint32_t *limit) {
     return esp;
 }
 
+/* ---- engine pool inspection -------------------------------------------- */
+/* The graphics-init abort is the engine's own memory manager refusing a 16 MB
+ * pool, without any host allocation call. Its allocator (vtable 0x0096C930,
+ * core 0x0073E9C0) is a segregated-fit pool: class count at +0x58, class heads
+ * array at +0x40 indexed (fl*4 + sl), per-class bitmaps at +0x3C/+0x38, used
+ * list head at +0x44, used count at +0x54, alignment at +0x48, lock flag
+ * +0x20. Chunks: neighbour tags -0x8/-0xC, self tag +0x18 = payload size,
+ * owner +0x1C, and the same-class chain at +0x10.
+ * 0x00767630 passes A0 = [0xDB8284] and a one-entry fallback list built from
+ * *(0xDB8284+0x14); A0's class index for 16 MB is out of range on Windows too,
+ * so Windows is served by that fallback. Dump both, before and after the
+ * request, and the delta names the refusal branch. */
+static int pool_ok(uint32_t va) {
+    if (va & 3u) return 0;
+    if (va >= KA_HEAP_BASE && va < KA_HEAP_END) return 1;
+    if (va >= KA_IMAGE_BASE && va < 0x01000000u) return 1;
+    return 0;
+}
+static uint32_t pool_u32(uint32_t va) { return pool_ok(va) ? MEM32(va) : 0; }
+
+static void pool_dump_obj(const char *tag, const char *name, uint32_t o) {
+    uint32_t vt, fl, heads, i, nodes = 0, sum = 0, big = 0, bigc = 0;
+    if (!pool_ok(o)) {
+        ka_log("%s %s=%08X <not a pool>", tag, name, o);
+        return;
+    }
+    vt = MEM32(o);
+    fl = pool_u32(o + 0x58);
+    heads = pool_u32(o + 0x40);
+    ka_log("%s %s=%08X vt=%08X +8=%08X +C=%08X +10=%08X +14=%08X +18=%08X "
+           "+1C=%08X +20=%08X +38=%08X +3C=%08X +40=%08X +44=%08X +48=%08X "
+           "+54=%u +58=%u +5C=%08X",
+           tag, name, o, vt, pool_u32(o + 8), pool_u32(o + 0xC),
+           pool_u32(o + 0x10), pool_u32(o + 0x14), pool_u32(o + 0x18),
+           pool_u32(o + 0x1C), pool_u32(o + 0x20), pool_u32(o + 0x38),
+           pool_u32(o + 0x3C), heads, pool_u32(o + 0x44),
+           pool_u32(o + 0x48), pool_u32(o + 0x54), fl, pool_u32(o + 0x5C));
+
+    if (pool_ok(heads) && fl <= 64) {
+        uint32_t ncls = fl * 4u;
+        for (i = 0; i < ncls; i++) {
+            uint32_t n = pool_u32(heads + i * 4u), k = 0, csum = 0, cbig = 0;
+            while (pool_ok(n) && k < 512) {
+                uint32_t sz = pool_u32(n + 0x18);
+                csum += sz;
+                if (sz > cbig) cbig = sz;
+                k++;
+                n = pool_u32(n + 0x10);
+            }
+            if (k) {
+                nodes += k;
+                sum += csum;
+                if (cbig > big) { big = cbig; bigc = i; }
+                ka_log("%s %s free[%u] (fl=%u sl=%u) n=%u largest=%u",
+                       tag, name, i, i >> 2, i & 3u, k, cbig);
+            }
+        }
+    }
+    ka_log("%s %s free total: nodes=%u sum=%u largest=%u@%u",
+           tag, name, nodes, sum, big, bigc);
+
+    {
+        uint32_t c = pool_u32(o + 0x44), k = 0;
+        while (pool_ok(c) && k < 64) {
+            ka_log("%s %s used[%u] %08X sz=%u own=%08X", tag, name, k, c,
+                   pool_u32(c + 0x18), pool_u32(c + 0x1C));
+            c = pool_u32(c + 0x10);
+            k++;
+        }
+        ka_log("%s %s used end k=%u", tag, name, k);
+    }
+}
+
+void ka_pool_dump(const char *tag) {
+    uint32_t m = pool_u32(0xDB8284);
+    uint32_t cell, fb;
+    if (!pool_ok(m)) {
+        ka_log("%s mgr=%08X <not mapped>", tag, m);
+        return;
+    }
+    cell = pool_u32(m + 0x14);
+    fb = pool_u32(cell);
+    ka_log("%s mgr=%08X vt=%08X +8=%08X +C=%08X +10=%08X +14=%08X +18=%08X "
+           "+1C=%08X +20=%08X +44=%08X +48=%08X +4C=%08X",
+           tag, m, pool_u32(m), pool_u32(m + 8), pool_u32(m + 0xC),
+           pool_u32(m + 0x10), cell, pool_u32(m + 0x18), pool_u32(m + 0x1C),
+           pool_u32(m + 0x20), pool_u32(m + 0x44), pool_u32(m + 0x48),
+           pool_u32(m + 0x4C));
+    if (!pool_ok(cell)) {
+        ka_log("%s fallback cell=%08X <none> (16 MB can only come from a0)",
+               tag, cell);
+        pool_dump_obj(tag, "a0", pool_u32(m));
+        return;
+    }
+    ka_log("%s fallback cell=%08X -> %08X", tag, cell, fb);
+    pool_dump_obj(tag, "a0", pool_u32(m));
+    pool_dump_obj(tag, "fb", fb);
+}
+
 /* ---- logging ---------------------------------------------------------- */
 /* Bring-up default on: one line per shim call is the only way to see what a
  * silent exit did last. Turn off with KORRA_TRACE_IMPORTS=0 on a desktop run. */

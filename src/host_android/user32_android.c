@@ -138,6 +138,7 @@ static void u_ClipCursor(void) {
     if (n < 4) {
         uint32_t m = MEM32(0xDB8284);
         n++;
+        if (n == 1) ka_pool_dump("post");
         ka_log("post: 9B4390=%08X 9B44E8=%08X CA2020=%u CA2990=%08X "
                "CA1EE8=%u CA1EEC=%u DB8284=%08X vt=%08X +8=%08X +C=%08X "
                "+10=%08X +14=%08X +44=%08X +48=%08X",
@@ -174,6 +175,7 @@ static void u_GetForegroundWindow(void) {
     static int n;
     if (n < 8) {
         n++;
+        if (n == 1) ka_pool_dump("pre");
         ka_log("pre: fg=%d CA1EF4=%02X CA1EE8=%u CA1EEC=%u CA1EF0=%08X "
                "CA2990=%08X 9B4390=%08X CA2020=%u CA1FD8=%08X 9B4388=%u 9B438C=%u",
                n, (unsigned)MEM8(0xCA1EF4), MEM32(0xCA1EE8), MEM32(0xCA1EEC),
