@@ -1830,3 +1830,197 @@ staging implementation had flags and the out-structure swapped.
 `tools/check_shim_arity.py` (own tool, compares against pcrecomp's win32hle)
 found the earlier `GetStringTypeW` over-pop; the audit above covers the symbols
 that have no reference counterpart.
+
+## 2026-11-21 - M3 asset-load deadlock: what the device log says, what Windows says, and the one run that decides
+
+The phone was away, so this session was evidence only: the device log from the
+last boot, the Windows build of the same binary, the shim sources, and a probe
+built for the next device run. Nothing here is called "fixed".
+
+### The device run ends inside the pool worker, not in the spin
+
+`logs/log.txt` (177,149,654 bytes, 3,688,251 lines) is 99.6 % one repeated line:
+**3,674,552** `ICALL: unresolved VA 0x00000000 from 0x007414E0`, first at line
+3689 and running to the last line of the file. Everything else is ~6,900 lines.
+
+`sub_007414E0` is the pool worker loop, and the flood is its unguarded job call:
+
+```
+7414f3  mov eax,[edi+0xa8] / test / je        ; guarded start hook
+741502  mov ebx,[0x8fd0a4]                    ; WaitForSingleObject
+741508  push -1 / push [esi+8] / call ebx     ; wait on the slot's posted semaphore
+74150f  test byte [edi+8],2 / jne 74153c      ; manager shutdown bits
+741515  push [esi+0x14] / mov eax,[esi+0x10] / push 0 / call eax   ; <-- fn == NULL
+741522  push 0 / push 1 / push [esi+0xc] / call [0x8fd0a8]         ; ReleaseSemaphore(done)
+74152f  push -1 / push [esi+8] / call ebx     ; wait again, same esp as the head wait
+741536  test byte [edi+8],2 / je 741515        ; loop
+```
+
+The thread that floods is `fs=346315E0` = **token 265**, the last of the fifth
+`CreateThread` batch, `param=346301E0`. Its recorded end:
+
+```
+2658  [w346315E0] WaitForSingleObject esp=0xC27FFF34
+      wait: h=00000012 kind=3 manual=0 signaled=0 ms=4294967295 main=0   <- blocks on a semaphore
+3688  wait: h=00000012 woke after 6 polls fs=346315E0
+3689  ICALL: unresolved VA 0x00000000 from 0x007414E0
+3690  [import] ReleaseSemaphore esp=0xC27FFF30 ebp=0xC27FFF4C
+3692  [import] WaitForSingleObject esp=0xC27FFF34 ebp=0xC27FFF4C
+3694  wait: h=00000000 notobj ms=4294967295 fs=346315E0   -> returns at once, forever
+```
+
+So the worker woke into a slot whose job function `[esi+0x10]` was **0**, called
+it, released the done semaphore, and then found `[esi+8]` — the posted
+semaphore — also **0**. From that point the wait is not a wait: `obj_get(0)`
+rejects it, nothing maps it, and the guest loops as fast as the machine lock
+allows. **The terminal state is a slot whose two handles are gone, not a spin.**
+
+The `[spin] InterlockedExchange` lines are elsewhere in the file and unrelated:
+only 200 in the whole log, all between lines 1395 and 1637, from `0x008D116E`,
+and the main thread's spins retire as soon as a worker wakes (`woke after 45
+polls` at 1558). The `0x2139780C` spin is a symptom of a worker not running
+yet, and on this run it is short-lived.
+
+### The workers, named
+
+Ten `CreateThread` calls in the log, all sharing the CRT bootstrap
+`va=0x0077CAEE` (so that VA names the CRT, not the worker body):
+
+| tokens | created | first object waited on | group |
+|---|---|---|---|
+| 256-260 | not suspended, four different call sites | manual-reset events `0x2 0x3 0x4 0x5 0x6` | file/data pool |
+| 261-265 | `suspended=1`, one call site `esp=0xC03FF504` | semaphores `0x8 0xA 0xC 0xE 0x12` | asset pool |
+
+All 14 `CreateSemaphoreA` calls come from one frame (`esp=0xC03FF584
+ebp=0xC03FF5C8`): the five pool semaphore pairs. The last `ReleaseSemaphore`
+before the 6-poll wake are five releases at `esp=0xC03FFF48`, each followed by
+`OpenThread`, `WaitForSingleObject`, and two `CloseHandle` — a join-and-destroy
+sequence, and the same frame accounts for the 14 `CloseHandle esp=0xC03FFF04`.
+
+### Windows ground truth (the discriminator)
+
+`build\run_deadlock.exe` (own copy of `korra_recomp.exe`) with `KORRA_TRACE=1`,
+25 s, killed: the game boots (37,327 functions dispatched, guest entered at
+`0x0077C3B7`) and reaches the menu. Trace:
+`The Legend of Korra\korra_host-20261121-042213.log`.
+
+- Every pool semaphore is `CreateSemaphoreA(NULL, 0, 1, NULL)` — initial count
+  0, maximum 1 — from `sub_00740F30` and `sub_00740580`.
+- Workers are created by `sub_007415F0` (five, `_beginthreadex(... ,
+  CREATE_SUSPENDED, &[ecx+8])`, `ResumeThread`, `CloseHandle`). It does **not**
+  fill the job function; something else does, before the first post.
+- The pump `sub_00741410` clamps the batch to capacity `[esi+4]`, takes the
+  manager's own spin lock (`InterlockedCompareExchange([esi+0x10],1,0)`, so IAT
+  `0x8FD01C` **is** InterlockedCompareExchange — the earlier assumption is
+  confirmed, not retired), stores the count at `[esi+0xc]`, then for **every**
+  slot of the pool does `ReleaseSemaphore([slot + 0x18i + 8], 1, NULL)` and
+  `WaitForSingleObject([slot + 0x18i + 0xc])`. Slot stride 0x18, +8 posted, +0xc
+  done.
+- In practice five posted semaphores (`0x4B0 0x524 0x510 0x4F4 0x4DC`) and five
+  done semaphores (`0x50C 0x528 0x520 0x4F0 0x494`) cycle thousands of times;
+  each worker releases its done semaphore from inside `sub_007414E0`.
+- **`OpenThread` is never called on Windows in 25 s**, and no worker ever calls a
+  NULL job function.
+- Handle values are recycled on Windows too (`0x510` is a closed thread handle
+  that later becomes a semaphore), so reuse by itself is not the defect.
+
+Windows therefore never posts a slot it did not fill, and it never takes the
+join-and-destroy path the device run took.
+
+### The difference the shims make
+
+- `k_OpenThread` is `RET(0xFFFFFFFEu, 3)` — a constant that belongs to no table.
+  `k_WaitForSingleObject` cannot resolve it, so **the engine's join returns
+  immediately** and the teardown is free to close the pool's semaphores while
+  five workers are still parked. That is the whole H2 mechanism: the join is
+  the only thing on this path that Windows has and we do not.
+- `k_CloseHandle` sets `used = 0` and `obj_new` returns the first free slot, so
+  a closed semaphore's value immediately becomes the next object created. The
+  worker then waits on a value that is either 0 (nothing created yet) or the
+  wrong object.
+- `k_WaitForSingleObject(h=0)` has no object and no thread token, so it returns
+  WAIT_OBJECT_0 in zero time and the guest spins. Nothing is signalled and
+  nothing logs it.
+
+### Where the two hypotheses stand
+
+**H2 (shim semantics) is now the leading hypothesis**, on the discriminator
+agreed before the run: Windows posts every slot filled and never joins, the
+device posted a slot whose function was zero and destroyed the pool around live
+workers. **H1 (structural: a first-use slot stays `fn=0` and a stretched race
+kicks it) is not supported by anything in the log** — the pump on Windows has no
+unfilled-post path, and the device's terminal state is best explained by the
+objects being closed under the workers.
+
+This is narrowing, not closing. Two readings still fit the same log:
+
+- H2a: the pool was torn down before the wake (join no-op), and the worker woke
+  into freed handles. Fix: a real `OpenThread`, and a `CloseHandle` that keeps a
+  finished thread's record.
+- H2b: the wake at 3688 was a legitimate post, but the slot had never been
+  filled because on the device the fill happens after the first post. Fix:
+  a spin gate (Korra-0009).
+
+`Korra-0009` stays on the backlog. The spin-gate item is about the machine lock
+starving workers, which is a real hazard, but it is not what ended this run.
+
+### The probe in the next device build
+
+`src/host_android/kernel32_android.c` and `spine_android.c`, diagnostics only:
+
+- `sem: h=… init=… max=… esp=… ebp=…` on every `CreateSemaphoreA` — the
+  create-sem caller-to-handle map (24 records).
+- `semrel: h=… n=… esp=… ebp=… fs=…` on the first 60 releases — who posts.
+- `close: h=… sem|event|mutex esp=… ebp=… fs=…` on the first 40 closes — which
+  object a value stood for when it was handed on.
+- `openthread: tid=… access=… esp=… ebp=…` — whether the teardown really joins.
+- `slot: h=… param=… cap=… post=… done=… fn=… arg=… w18=… w1c=… mgr=… mgrflags=…`
+  on the same 40 wakes as `wait: … woke after N polls` — the worker's parameter
+  block at the moment it was let through, through `ka_thread_self_param()`.
+- `h=0` waits are logged 20 times and then throttled with a 1 ms sleep. The wait
+  can never succeed on that handle, so the sleep cannot hide a real wake; it
+  keeps a 22 s device log readable instead of 3.6 M ICALL lines.
+
+Built with NDK clang (syntax check on both files) and
+`gradlew --no-daemon -PkorraLinkGuest=ON -PkorraWithDxvk=ON
+-PkorraDxvkSource=<absolute prepared tree> :app:assembleDebug`: BUILD
+SUCCESSFUL in 31 s, APK 372,232,750 bytes, and all six format strings are
+present in the stripped `libkorra.so`. The prepared DXVK path must be
+**absolute**; `..\..\reference\dxvk-native` fails `dxvk_android/CMakeLists.txt`
+because the cache variable stays relative.
+
+### What the next device run decides
+
+Read in this order:
+
+1. `slot: … fn=00000000` at the wake, after `openthread:` and `close:` lines for
+   the pool's semaphores → **H2a**: the join no-op destroyed the pool under live
+   workers. The fix is `OpenThread` -> the thread's token (CreateThread already
+   writes that same value as `lpThreadId`) plus a `CloseHandle` that retires a
+   finished thread instead of recycling it.
+2. `slot: … fn=00000000` with no preceding `openthread:`/`close:` and a live
+   `mgrflags` → **H2b/H1**: the engine posted an unfilled slot on the device
+   only. Then the spin gate (Korra-0009) becomes the fix, and that fact forces
+   the backlog item.
+3. `sem:` lines whose `h=` are not the five pairs the log expects, or a `close:`
+   whose kind is `not an object`, point at table collision rather than either
+   hypothesis, and the 24-record map names the aliasing handle directly.
+
+### bsr on a zero source (pcrecomp `e887ef2`, Korra-0003b)
+
+`recomp_bsf32`/`recomp_bsr32` shifted a zero operand forever
+(`while (!(v & 0x80000000u)) v <<= 1;`). The engine's SSE2 `strchr` reaches
+`bsr` with a zero mask on a 16-byte block that holds neither the byte nor a NUL,
+which is its normal case, so the CRT search path could hang with the machine
+lock held. Both helpers now return 0 with a `recomp_bsf_zero_hits` /
+`recomp_bsr_zero_hits` counter when the source is zero. `recomp_types.h` only,
+no relift.
+
+Verification: a standalone probe with the pinned MSVC x86, old body versus new,
+`bsr(0)`. The old body was still running at the 2 s budget and had to be killed;
+the new body exited 0 and printed `bsr new: bsr(0) = 0`. The defect is proven at
+function level. **The on-device attribution is not verified** — the surviving
+device log was already built with the guard, so there is no before/after device
+run for it. It is deliberately not numbered Korra-0009, which stays reserved for
+the spin gate.
+
