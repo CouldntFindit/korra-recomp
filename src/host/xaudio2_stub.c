@@ -132,6 +132,7 @@ typedef struct xa2_voice {
     UINT32 last_logged_q;  /* diagnostics: last BuffersQueued printed */
     int had_data, dry;     /* underrun accounting */
     int first_submit_logged;
+    UINT32 gs_calls;       /* diagnostics: GetState polls seen on this voice */
     const void *cb;        /* guest IXAudio2VoiceCallback, or NULL */
     UINT32 cb_kind;        /* XA2_CB_* - what retirement dispatches to */
     UINT32 cb_warned;
@@ -1165,6 +1166,18 @@ static void __stdcall src_GetState(xa2_voice *self, xa2_voice_state *state) {
     state->pCurrentBufferContext = self->qcount ? self->q[self->qhead].ctx : self->last_ctx;
     state->BuffersQueued = self->qcount;
     state->SamplesPlayed = now;
+    /* Who polls a voice, and how often, is the one part of the Wwise picture the
+     * submit log cannot show: a voice created, started and never fed looks the
+     * same whether the engine polls it 60 times a second or not at all. */
+    if (g_verbose >= 2) {
+        self->gs_calls++;
+        if (self->gs_calls == 1u || self->gs_calls % 600u == 0u) {
+            xa2_log("GetState(%p): %s poll #%lu queued=%u played=%llu (from 0x%08X)",
+                    (void *)self, self->gs_calls == 1u ? "first" : "periodic",
+                    (unsigned long)self->gs_calls, state->BuffersQueued,
+                    (unsigned long long)now, g_cur_func);
+        }
+    }
     if (g_verbose > 2 && state->BuffersQueued != self->last_logged_q) {
         self->last_logged_q = state->BuffersQueued;
         xa2_log("GetState(%p): queued=%u played=%llu ctx=%p (from 0x%08X)",
