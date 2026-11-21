@@ -287,6 +287,21 @@ Append only; newest last. Format: date — attempt — outcome — next idea.
   `0x0076C590`) about 5 minutes into every run. A COM vtable needs a per-slot
   entry whose `ret N` matches that method's arity; a generic "return 0" body is
   only safe for slots you know are unreachable.
+- 2026-11-21 — `recomp_yield_hook` as the fix for the on-device spin at
+  `InterlockedExchange(0x2139780C)` — **fired three times and then never again**.
+  The spinning loop has no instrumented back edge, so the hook cannot run there.
+  Do not re-try; instrument the spin's own shim instead (it is already in
+  `k_InterlockedExchange`).
+- 2026-11-21 — releasing the machine lock every 4096 import dispatches, to let
+  the starved pool workers run — **the spin was unchanged**. On the device the
+  lock is held across a loop that calls no import at all, so a cadence tied to
+  imports never reaches the loop. The device log later showed the spin was not
+  the failure: the run dies when a pool worker calls a NULL job function and
+  then waits on handle 0 (see `docs/FINDINGS.md`, 2026-11-21 deadlock entry).
+- 2026-11-21 — `-PkorraDxvkSource=..\..\reference\dxvk-native` — **fails at CMake
+  configure** with "DXVK tree not prepared", because the value is a CMake cache
+  `PATH` and stays relative to the *build* directory. Pass an absolute path.
+
 
 
 ## 7. Reporting
