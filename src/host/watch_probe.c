@@ -8,6 +8,11 @@
  *
  *   KORRA_ICALL=<hex>     every indirect transfer to that guest VA logs its
  *                         caller and the first three stack arguments (8 hits).
+ *   KORRA_ICALLFROM=<hex> every indirect transfer *whose caller* is that guest
+ *                         VA logs its target and the first three stack
+ *                         arguments. This names a vtable slot whose target is
+ *                         dynamic (one object built at run time), which the
+ *                         target filter above cannot address.
  *   KORRA_WATCHLOG=<hex>  eight dwords at that VA are sampled on every indirect
  *                         transfer; each change is logged with the lifted
  *                         function that was running when it appeared. This is
@@ -23,6 +28,7 @@
 
 static int      s_read;
 static uint32_t s_icall_va, s_icall_hits;
+static uint32_t s_from_va, s_from_hits;
 static uint32_t s_watch_va, s_watch_hits, s_watch_last[8];
 
 static uint32_t hex_env(const char *name) {
@@ -32,12 +38,19 @@ static uint32_t hex_env(const char *name) {
 }
 
 void korra_watch_probe_tick(void) {
+    extern void korra_wprot_tick(void);   /* wprot_probe.c: KORRA_WPROT (debug) */
+    extern void korra_gate_tick(void);    /* gate_probe.c: KORRA_GATE (debug) */
+    korra_wprot_tick();
+    korra_gate_tick();
     if (!s_read) {
         s_read = 1;
         s_icall_va = hex_env("KORRA_ICALL");
+        s_from_va = hex_env("KORRA_ICALLFROM");
         s_watch_va = hex_env("KORRA_WATCHLOG");
         if (s_icall_va)
             fprintf(stderr, "[icall] watching %08X\n", s_icall_va);
+        if (s_from_va)
+            fprintf(stderr, "[icallfrom] watching callers of %08X\n", s_from_va);
         if (s_watch_va) {
             const uint32_t *w = (const uint32_t *)ADDR(s_watch_va);
             int i;
@@ -53,7 +66,7 @@ void korra_watch_probe_tick(void) {
         int i;
         for (i = 0; i < 8; i++) {
             if (w[i] == s_watch_last[i]) continue;
-            if (++s_watch_hits <= 400)
+            if (++s_watch_hits <= 3000)
                 fprintf(stderr, "[wlog] +%02X = %08X (was %08X) from=%08X\n",
                         i * 4, w[i], s_watch_last[i], g_cur_func);
             s_watch_last[i] = w[i];
@@ -63,6 +76,19 @@ void korra_watch_probe_tick(void) {
 
 void korra_watch_probe_lookup(uint32_t va) {
     korra_watch_probe_tick();
+    if (s_from_va && g_cur_func == s_from_va) {
+        if (++s_from_hits <= 200) {
+            fprintf(stderr, "[icallfrom] from=%08X target=%08X esp=%08X"
+                            " args=%08X %08X %08X",
+                    s_from_va, va, g_esp,
+                    (uint32_t)MEM32(g_esp), (uint32_t)MEM32(g_esp + 4),
+                    (uint32_t)MEM32(g_esp + 8));
+            if (s_watch_va)
+                fprintf(stderr, " watch=%08X", (uint32_t)MEM32(s_watch_va));
+            fputc('\n', stderr);
+            fflush(stderr);
+        }
+    }
     if (!s_icall_va || va != s_icall_va) return;
     if (++s_icall_hits > 8) return;
     fprintf(stderr, "[icall] target=%08X from=%08X esp=%08X ebp=%08X"
