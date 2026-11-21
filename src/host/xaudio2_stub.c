@@ -49,6 +49,7 @@
 #include <string.h>
 #include <wchar.h>
 #include "native32.h"
+#include "audio_sink.h"
 #include "xaudio2_stub.h"
 
 /* ------------------------------------------------------------------ GUIDs
@@ -108,23 +109,39 @@ typedef struct {
 
 typedef void (__stdcall *xa2_fn)(void);   /* one vtable entry, called by the guest */
 
+typedef struct xa2_slice {
+    UINT64 start, end;        /* absolute source frames */
+    const BYTE *data;         /* already-decoded PCM, owned by the guest */
+    const void *ctx;
+} xa2_slice;
+
 typedef struct xa2_voice {
     const xa2_fn *vtbl;
     UINT32 magic, kind;
     UINT32 rate, channels, block_align;
+    UINT32 fmt_tag, bits, is_float, channel_mask;
     float ratio, volume;
     int running;
     UINT32 qhead, qcount;
-    UINT64 played;         /* frames retired so far */
+    double pos;            /* next source frame to mix (fractional) */
+    UINT64 played;         /* frames retired so far (QPC fallback clock) */
     UINT64 base;           /* frames at t0, start of the current run */
     UINT64 t0;             /* QPC at start of the current run */
     UINT64 next_end;       /* frame cursor for the next submitted buffer */
     const void *last_ctx;
     UINT32 last_logged_q;  /* diagnostics: last BuffersQueued printed */
+    int had_data, dry;     /* underrun accounting */
+    int first_submit_logged;
     const void *cb;        /* guest IXAudio2VoiceCallback, or NULL */
     UINT32 cb_kind;        /* XA2_CB_* - what retirement dispatches to */
     UINT32 cb_warned;
-    struct { UINT64 end; const void *ctx; } q[XA2_QUEUE_MAX];
+    xa2_slice q[XA2_QUEUE_MAX];
+    /* The engine's own downmix, installed through SetOutputMatrix. CRI computes
+     * this once per voice (FUN_007b27e2) and it is the level the shipping game
+     * hears; ignoring it and inventing coefficients made the mix peak at
+     * +2.7 dBFS. src_ch == 0 means "no matrix installed, use the default". */
+    UINT32 matrix_ch;
+    float matrix[8 * 2];
 } xa2_voice;
 
 /* What a voice's completion callback does when a buffer ends. The guest body
@@ -194,13 +211,32 @@ void xa2_stub_get_stats(xa2_stub_stats *out) {
 }
 
 static void xa2_log(const char *fmt, ...) {
+    char buf[1024];
+    char pre[32];
+    int n, pn;
     va_list ap;
+    static LONGLONG t0;
+    LARGE_INTEGER f, t;
+    double ms = 0.0;
     va_start(ap, fmt);
-    fputs("[xa2] ", stderr);
-    vfprintf(stderr, fmt, ap);
+    n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if ((size_t)n > sizeof buf - 16) n = (int)sizeof buf - 16;
+    /* Milliseconds since the first line, so a stall has a time. QueryPerformance
+     * Counter is monotonic here (the QPC clock is already the stub's code path). */
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t);
+    if (!t0) t0 = t.QuadPart ? t.QuadPart : 1;
+    if (f.QuadPart) ms = (double)(t.QuadPart - t0) * 1000.0 / (double)f.QuadPart;
+    pn = snprintf(pre, sizeof pre, "[xa2] %8.1f ", ms);
+    if (pn < 0 || pn >= (int)sizeof pre) pn = 6;
+    /* One write per line: the sink thread and the guest thread both log, and a
+     * prefix printed separately lands inside the other thread's line. */
+    fwrite(pre, 1, (size_t)pn, stderr);
+    fwrite(buf, 1, (size_t)n, stderr);
     fputc('\n', stderr);
     fflush(stderr);
-    va_end(ap);
 }
 
 /* A guest pointer we are about to dereference (CLSID, WAVEFORMATEX, buffer).
@@ -216,7 +252,16 @@ static int xa2_readable(const void *p, size_t bytes) {
     return (size_t)((const char *)mbi.BaseAddress + mbi.RegionSize - c) >= bytes;
 }
 
-/* ------------------------------------------------------------ virtual clock */
+/* ------------------------------------------------------------ playback clock
+ * One clock is authoritative at a time:
+ *   sink live - `pos` (fractional source frames) is advanced by the mixer,
+ *               exactly one step per frame the device asked for. Nothing else
+ *               may move it, and retirement happens in the mixer.
+ *   no sink   - the M2.9 QPC clock (base/t0/ratio) advances `played` from every
+ *               device entry point, so the engine's feed loop never stalls
+ *               waiting for a completion. This is the fallback when opening an
+ *               audio device failed (KORRA_NO_AUDIO, no sound card, ...).
+ */
 static UINT64 xa2_voice_now(const xa2_voice *v) {
     LARGE_INTEGER t;
     double seconds, frames;
@@ -228,6 +273,18 @@ static UINT64 xa2_voice_now(const xa2_voice *v) {
     return v->base + (UINT64)(frames + 0.5);
 }
 
+static int xa2_sink_live(void) { return korra_audio_sink_live(); }
+
+/* The frame the voice's next buffer will start at. */
+static UINT64 xa2_voice_cursor(xa2_voice *v) {
+    if (xa2_sink_live()) return (UINT64)v->pos;
+    {
+        UINT64 now = xa2_voice_now(v);
+        v->pos = (double)now;
+        return now;
+    }
+}
+
 /* ------------------------------------------------------- completion dispatch
  * CRI's worker does not only read GetState: after it stops feeding it waits for
  * its own completion counter, and only OnBufferEnd ever moves that counter.
@@ -236,13 +293,10 @@ static UINT64 xa2_voice_now(const xa2_voice *v) {
  * parks on its audio lock (boot freeze, KORRA_NO_AUDIO=1 bypasses it).
  *
  * So retired buffers are dispatched to the callback's observed semantics:
- * CRI's OnBufferEnd (guest 0x7B2A24) is exactly `*(UINT32 *)pBufferContext += 1`,
- * which is done here. The lifted body is deliberately not entered: a callback
- * would have to run through native32_call_guest from inside a COM bridge call,
- * and that path returns with the machine's esp advanced by its own arguments and
- * every register holding the callee's values - the caller it would return to is
- * mid-`call [ecx+0x54]` and expects callee-saved registers intact. A real
- * callback thread (M4) is where re-entry belongs. */
+ * CRI's OnBufferEnd (guest 0x7B2A24) is exactly `*(UINT32 *)pBufferContext += 1`.
+ * That is done here, on whichever thread consumed the buffer (with the M4 sink,
+ * the output thread - never the guest's). Only retire a buffer once its PCM is
+ * no longer needed: early free is a dropout, late is a stall. */
 static void xa2_dispatch_buffer_end(xa2_voice *v, const void *ctx) {
     if (!ctx) {
         g_stats.callbacks_no_context++;
@@ -268,31 +322,185 @@ static void xa2_dispatch_buffer_end(xa2_voice *v, const void *ctx) {
     }
 }
 
+static void xa2_slice_complete(xa2_voice *v, const xa2_slice *s) {
+    g_stats.frames_played += s->end - v->played;
+    v->played = s->end;
+    v->last_ctx = s->ctx;
+    xa2_dispatch_buffer_end(v, s->ctx);
+}
+
+/* QPC fallback: retire everything whose end the clock has passed. */
 static void xa2_voice_retire(xa2_voice *v, UINT64 now) {
-    while (v->qcount) {
-        UINT64 end = v->q[v->qhead].end;
-        const void *ctx = v->q[v->qhead].ctx;
-        if (now < end) break;
-        g_stats.frames_played += end - v->played;
-        v->played = end;
-        v->last_ctx = ctx;
+    while (v->qcount && now >= v->q[v->qhead].end) {
+        xa2_slice s = v->q[v->qhead];
         v->qhead = (v->qhead + 1) % XA2_QUEUE_MAX;
         v->qcount--;
-        /* Called with the stub lock held: the counter is guest memory, and the
-         * guest thread that polls it can run concurrently. */
-        xa2_dispatch_buffer_end(v, ctx);
+        xa2_slice_complete(v, &s);
+    }
+    if (v->qcount) v->pos = (double)(now < v->played ? v->played : now);
+    else { v->next_end = v->played; v->pos = (double)v->played; }
+}
+
+/* Mixer-side retirement: the sample cursor crossed one or more slice ends. */
+static void xa2_voice_retire_consumed(xa2_voice *v) {
+    while (v->qcount && v->pos >= (double)v->q[v->qhead].end) {
+        xa2_slice s = v->q[v->qhead];
+        v->qhead = (v->qhead + 1) % XA2_QUEUE_MAX;
+        v->qcount--;
+        xa2_slice_complete(v, &s);
+    }
+    if (!v->qcount) {
+        v->next_end = v->played;
+        if (v->pos > (double)v->played) v->pos = (double)v->played;
     }
 }
 
 /* Advance every voice's clock. Called from every device/voice entry point,
  * CommitChanges included: when the engine waits for completions it keeps
- * committing, and nothing else would otherwise move the clock. */
+ * committing, and in the QPC fallback nothing else would move the clock. With
+ * a live sink the mixer does the retiring, on the device's own cadence. */
 static void xa2_pump_all(void) {
     int i;
+    if (xa2_sink_live()) return;
     for (i = 0; i < XA2_MAX_VOICES; i++) {
         xa2_voice *v = &g_voices[i];
         if (v->magic == XA2_MAGIC && v->qcount) xa2_voice_retire(v, xa2_voice_now(v));
     }
+}
+
+/* --------------------------------------------------------------- the mixer
+ * Flat bus: every running source voice is summed straight into the stereo
+ * output. That is exactly what the two consumers of this device do - CRI feeds
+ * one voice, and the Hw mixer's single float voice is the engine's final mix.
+ * Channel conversion happens here (the engine downmixes 5.1 once it sees a
+ * stereo mastering voice, so this path is mostly mono/stereo in practice). */
+static float xa2_sample_ch(const xa2_voice *v, const xa2_slice *s, UINT32 idx, UINT32 ch) {
+    const BYTE *p;
+    if (!s->data || !v->bits || idx >= (UINT32)(s->end - s->start)) return 0.0f;
+    p = s->data + ((size_t)idx * v->channels + ch) * (size_t)(v->bits / 8);
+    if (v->is_float && v->bits == 32) return *(const float *)p;
+    if (v->bits == 16) return (float)(*(const short *)p) * (1.0f / 32768.0f);
+    if (v->bits == 24) {
+        int x = p[0] | (p[1] << 8) | (p[2] << 16);
+        if (x & 0x800000) x -= 0x1000000;
+        return (float)x * (1.0f / 8388608.0f);
+    }
+    if (v->bits == 32) return (float)(*(const int *)p) * (1.0f / 2147483648.0f);
+    return 0.0f;
+}
+
+static void xa2_frame_stereo(const xa2_voice *v, const xa2_slice *s, UINT32 idx, float *l, float *r) {
+    UINT32 c, nch = v->channels ? v->channels : 2;
+    float ch[8];
+    if (nch > 8) nch = 8;
+    for (c = 0; c < nch; c++) ch[c] = xa2_sample_ch(v, s, idx, c);
+    if (v->matrix_ch == nch && v->matrix_ch > 0) {
+        float ml = 0.0f, mr = 0.0f;
+        for (c = 0; c < nch; c++) {
+            ml += ch[c] * v->matrix[c * 2 + 0];
+            mr += ch[c] * v->matrix[c * 2 + 1];
+        }
+        *l = ml; *r = mr;
+        return;
+    }
+    switch (nch) {
+    case 1: *l = *r = ch[0]; break;
+    case 3: *l = ch[0] + ch[2] * 0.7071f; *r = ch[1] + ch[2] * 0.7071f; break;
+    case 4: *l = ch[0] + ch[2] * 0.7071f; *r = ch[1] + ch[3] * 0.7071f; break;
+    case 5: *l = ch[0] + ch[2] * 0.7071f + ch[3] * 0.7071f;
+            *r = ch[1] + ch[2] * 0.7071f + ch[4] * 0.7071f; break;
+    case 6: *l = ch[0] + ch[2] * 0.7071f + ch[3] * 0.5f + ch[4] * 0.7071f;
+            *r = ch[1] + ch[2] * 0.7071f + ch[3] * 0.5f + ch[5] * 0.7071f; break;
+    case 7: *l = ch[0] + ch[2] * 0.7071f + ch[4] * 0.7071f + ch[6] * 0.7071f;
+            *r = ch[1] + ch[2] * 0.7071f + ch[5] * 0.7071f + ch[6] * 0.7071f; break;
+    default:
+        if (nch >= 8) {
+            *l = ch[0] + ch[2] * 0.7071f + ch[4] * 0.7071f + ch[6] * 0.7071f;
+            *r = ch[1] + ch[2] * 0.7071f + ch[5] * 0.7071f + ch[7] * 0.7071f;
+        } else { *l = ch[0]; *r = ch[1]; }
+        break;
+    }
+}
+
+static void xa2_read_at(xa2_voice *v, double p, float *l, float *r) {
+    const xa2_slice *s = &v->q[v->qhead];
+    UINT32 n = (UINT32)(s->end - s->start);
+    double rel;
+    UINT32 i0;
+    float l0, r0, l1, r1, f;
+    if (p < (double)s->start) p = (double)s->start;
+    if (!n) { *l = *r = 0.0f; return; }
+    rel = p - (double)s->start;
+    i0 = (UINT32)rel;
+    if (i0 >= n) i0 = n - 1;
+    f = (float)(rel - (double)i0);
+    xa2_frame_stereo(v, s, i0, &l0, &r0);
+    if (i0 + 1 < n) {
+        xa2_frame_stereo(v, s, i0 + 1, &l1, &r1);
+    } else if (v->qcount > 1) {
+        const xa2_slice *nx = &v->q[(v->qhead + 1) % XA2_QUEUE_MAX];
+        if (nx->start == s->end && nx->end > nx->start) xa2_frame_stereo(v, nx, 0, &l1, &r1);
+        else { l1 = l0; r1 = r0; }
+    } else { l1 = l0; r1 = r0; }
+    *l = l0 + (l1 - l0) * f;
+    *r = r0 + (r1 - r0) * f;
+}
+
+static void xa2_mix_voice(xa2_voice *v, float *out, int frames) {
+    double step = (double)v->rate * (double)(v->ratio > 0.0f ? v->ratio : 1.0f) /
+                  (double)KORRA_AUDIO_RATE;
+    int i;
+    if (!(step > 0.0)) step = 1.0;
+    for (i = 0; i < frames; i++) {
+        float l, r;
+        if (v->qcount && v->pos >= (double)v->q[v->qhead].end) xa2_voice_retire_consumed(v);
+        if (!v->qcount) {
+            if (v->had_data && !v->dry) {
+                v->dry = 1;
+                korra_audio_sink_note_underrun();
+                if (g_verbose)
+                    xa2_log("voice %p ran dry at frame %llu (device wanted %d frames)",
+                            (void *)v, (unsigned long long)v->played, frames);
+            }
+            return;
+        }
+        xa2_read_at(v, v->pos, &l, &r);
+        out[2 * i] += l * v->volume;
+        out[2 * i + 1] += r * v->volume;
+        v->pos += step;
+    }
+    if (v->qcount) v->dry = 0;
+}
+
+/* Called by the sink's one output thread, for exactly the frames the device
+ * wants. No guest code runs here; the only guest memory touched is the CRI
+ * completion counter, which is one aligned dword. */
+void xa2_render_audio(float *dst, int frames) {
+    int i;
+    if (!dst || frames <= 0) return;
+    memset(dst, 0, (size_t)frames * KORRA_AUDIO_CHANNELS * sizeof(float));
+    xa2_lock();
+    for (i = 0; i < XA2_MAX_VOICES; i++) {
+        xa2_voice *v = &g_voices[i];
+        if (v->magic == XA2_MAGIC && v->kind == XA2_KIND_SOURCE && v->running)
+            xa2_mix_voice(v, dst, frames);
+    }
+    if (g_device.master && g_device.master->volume != 1.0f) {
+        float g = g_device.master->volume;
+        int n = frames * KORRA_AUDIO_CHANNELS, k;
+        for (k = 0; k < n; k++) dst[k] *= g;
+    }
+    xa2_unlock();
+}
+
+/* Open the output device on the first real buffer, not on device creation:
+ * the boot creates two XAudio2 devices before any audio exists, and one of them
+ * (CRI) may never be fed at all. */
+static void xa2_ensure_sink(void) {
+    static LONG tried;
+    if (xa2_sink_live()) return;
+    if (InterlockedCompareExchange(&tried, 1, 0) != 0) return;
+    korra_audio_sink_start(xa2_render_audio);
 }
 
 static xa2_voice *xa2_voice_slot(void) {
@@ -633,7 +841,17 @@ static HRESULT __stdcall dev_CreateSourceVoice(xa2_device *self, void **pp, cons
     if (!v) { xa2_unlock(); xa2_log("CreateSourceVoice: no free voice slot"); return XA2_HR_NOMEM; }
     v->rate = fmt->nSamplesPerSec ? fmt->nSamplesPerSec : 48000;
     v->channels = fmt->nChannels ? fmt->nChannels : 2;
-    v->block_align = fmt->nBlockAlign ? fmt->nBlockAlign : v->channels * 4;
+    v->fmt_tag = fmt->wFormatTag;
+    v->bits = fmt->wBitsPerSample ? fmt->wBitsPerSample : 16;
+    v->is_float = (fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT);
+    v->channel_mask = 0;
+    if (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE && fmt->cbSize >= 22) {
+        const WAVEFORMATEXTENSIBLE *x = (const WAVEFORMATEXTENSIBLE *)fmt;
+        v->is_float = (x->SubFormat.Data1 == 3);
+        v->channel_mask = x->dwChannelMask;
+    }
+    v->block_align = fmt->nBlockAlign ? fmt->nBlockAlign
+                                      : v->channels * (v->bits / 8);
     /* Identify the completion callback now, not per retired buffer: the guest
      * keeps the object alive for the voice's lifetime. */
     v->cb = cb;
@@ -647,9 +865,10 @@ static HRESULT __stdcall dev_CreateSourceVoice(xa2_device *self, void **pp, cons
     *pp = v;
     xa2_unlock();
     if (g_verbose)
-        xa2_log("CreateSourceVoice(%u ch, %u Hz, %u bits, tag 0x%04X, maxratio %.3f) -> #%d (silent, cb=%p %s)",
-                fmt->nChannels, fmt->nSamplesPerSec, fmt->wBitsPerSample, fmt->wFormatTag,
-                max_ratio, (int)(v - g_voices), cb,
+        xa2_log("CreateSourceVoice(%u ch, %u Hz, %u bits %s, tag 0x%04X, mask 0x%X, maxratio %.3f) -> #%d (sink, cb=%p %s)",
+                fmt->nChannels, fmt->nSamplesPerSec, fmt->wBitsPerSample,
+                v->is_float ? "float" : "pcm",
+                fmt->wFormatTag, v->channel_mask, max_ratio, (int)(v - g_voices), cb,
                 v->cb_kind == XA2_CB_CRI_COUNTER ? "CRI counter" :
                 v->cb_kind == XA2_CB_OTHER ? "other" : "none");
     return XA2_HR_OK;
@@ -764,15 +983,36 @@ static void __stdcall voice_GetChannelVolumes(xa2_voice *self, UINT32 channels, 
 }
 static HRESULT __stdcall voice_SetOutputMatrix(xa2_voice *self, const void *dest, UINT32 src_ch,
                                                UINT32 dst_ch, const float *levels, UINT32 opset) {
-    (void)dest; (void)src_ch; (void)dst_ch; (void)levels; (void)opset;
-    /* CRI computes the downmix itself (FUN_007b27e2) and installs it here. */
-    return xa2_voice_valid(self) ? XA2_HR_OK : XA2_HR_INVALID;
+    UINT32 i;
+    (void)dest; (void)opset;
+    if (!xa2_voice_valid(self)) return XA2_HR_INVALID;
+    /* CRI computes the downmix itself (FUN_007b27e2) and installs it here, and
+     * the level it chooses is the level the shipping game hears. Apply it. */
+    if (!levels || dst_ch != KORRA_AUDIO_CHANNELS || src_ch < 1 || src_ch > 8) {
+        self->matrix_ch = 0;
+        return XA2_HR_OK;
+    }
+    if (!xa2_readable(levels, src_ch * dst_ch * sizeof(float))) {
+        if (g_verbose) xa2_log("SetOutputMatrix(%p): unreadable levels %p (%ux%u)",
+                               (void *)self, (const void *)levels, src_ch, dst_ch);
+        return XA2_HR_INVALID;
+    }
+    xa2_lock();
+    self->matrix_ch = src_ch;
+    for (i = 0; i < src_ch * dst_ch; i++) self->matrix[i] = levels[i];
+    if (g_verbose >= 2) xa2_log("SetOutputMatrix(%p): %u x %u -> matrix installed",
+                               (void *)self, src_ch, dst_ch);
+    xa2_unlock();
+    return XA2_HR_OK;
 }
 static void __stdcall voice_GetOutputMatrix(xa2_voice *self, const void *dest, UINT32 src_ch,
                                             UINT32 dst_ch, float *levels) {
     UINT32 i, n = src_ch * dst_ch;
-    (void)self; (void)dest;
-    for (i = 0; levels && i < n; i++) levels[i] = 0.0f;
+    (void)dest;
+    for (i = 0; levels && i < n; i++) {
+        levels[i] = (self && self->matrix_ch == src_ch && i < self->matrix_ch * 2)
+                        ? self->matrix[i] : 0.0f;
+    }
 }
 static void __stdcall voice_DestroyVoice(xa2_voice *self) {
     if (!xa2_voice_valid(self)) return;
@@ -793,9 +1033,10 @@ static HRESULT __stdcall src_Start(xa2_voice *self, UINT32 flags, UINT32 opset) 
         QueryPerformanceCounter(&t);
         self->t0 = (UINT64)t.QuadPart;
         self->running = 1;
+        if (!self->qcount) self->pos = (double)self->played;
     }
     xa2_unlock();
-    if (g_verbose > 1) xa2_log("Start(%p) -> 0", (void *)self);
+    if (g_verbose > 1) xa2_log("Start(%p) -> 0 (from 0x%08X)", (void *)self, g_cur_func);
     return XA2_HR_OK;
 }
 
@@ -804,8 +1045,9 @@ static HRESULT __stdcall src_Stop(xa2_voice *self, UINT32 flags, UINT32 opset) {
     if (!xa2_voice_valid(self)) return XA2_HR_INVALID;
     xa2_lock();
     if (self->running) {
-        self->played = xa2_voice_now(self);
+        self->played = xa2_sink_live() ? (UINT64)self->pos : xa2_voice_now(self);
         self->running = 0;
+        self->dry = 0;
     }
     xa2_unlock();
     if (g_verbose > 1) xa2_log("Stop(%p) -> 0", (void *)self);
@@ -813,8 +1055,9 @@ static HRESULT __stdcall src_Stop(xa2_voice *self, UINT32 flags, UINT32 opset) {
 }
 
 static HRESULT __stdcall src_SubmitSourceBuffer(xa2_voice *self, const xa2_buffer *buf, const void *wma) {
-    UINT64 frames, start, end;
+    UINT64 frames, start, end, cursor;
     UINT32 total, play_begin, play_len;
+    xa2_slice *slot;
     (void)wma;
     if (!xa2_voice_valid(self) || !buf) return XA2_HR_INVALID;
     if (!xa2_readable(buf, sizeof *buf)) return XA2_HR_INVALID;
@@ -827,28 +1070,47 @@ static HRESULT __stdcall src_SubmitSourceBuffer(xa2_voice *self, const xa2_buffe
     if (play_len > total - play_begin) play_len = total - play_begin;
     frames = play_len ? play_len : 1;   /* a zero-length buffer must still retire */
 
+    if (buf->LoopCount > 1 && g_verbose)
+        xa2_log("SubmitSourceBuffer(%p): LoopCount %u is not implemented (playing once)",
+                (void *)self, buf->LoopCount);
+
     xa2_lock();
     if (self->qcount == XA2_QUEUE_MAX) {
-        /* Never happens with CRI's 4-deep ring; drop the oldest to stay alive. */
+        /* Never happens with the consumers' 4- and 8-deep rings; drop the
+         * oldest to stay alive rather than failing the submit. */
         self->qhead = (self->qhead + 1) % XA2_QUEUE_MAX;
         self->qcount--;
         if (g_verbose) xa2_log("SubmitSourceBuffer: queue overflow, dropped one");
     }
-    /* A buffer handed over after the clock ran past the previous ones starts
+    /* A buffer handed over after the mixer ran past the previous ones starts
      * where playback is now, not where the last one ended. */
-    xa2_voice_retire(self, xa2_voice_now(self));
-    start = self->next_end > self->played ? self->next_end : self->played;
+    cursor = xa2_voice_cursor(self);
+    start = self->next_end > cursor ? self->next_end : cursor;
     end = start + frames;
-    self->q[(self->qhead + self->qcount) % XA2_QUEUE_MAX].end = end;
-    self->q[(self->qhead + self->qcount) % XA2_QUEUE_MAX].ctx = buf->pContext;
+    slot = &self->q[(self->qhead + self->qcount) % XA2_QUEUE_MAX];
+    slot->start = start;
+    slot->end = end;
+    slot->data = buf->pAudioData + (size_t)play_begin * self->block_align;
+    slot->ctx = buf->pContext;
     self->qcount++;
     self->next_end = end;
+    self->had_data = 1;
+    self->dry = 0;
     g_stats.buffers_submitted++;
     xa2_unlock();
 
-    if (g_verbose > 1)
-        xa2_log("SubmitSourceBuffer(%p): %u bytes, %u frames, ctx=%p -> 0",
-                (void *)self, buf->AudioBytes, (unsigned)frames, buf->pContext);
+    /* Open the device outside the lock: it creates COM objects and loads DLLs. */
+    xa2_ensure_sink();
+
+    if (g_verbose && !self->first_submit_logged) {
+        self->first_submit_logged = 1;
+        xa2_log("SubmitSourceBuffer(%p): first buffer %u bytes, %u frames (%u Hz, %u ch, %s), ctx=%p",
+                (void *)self, buf->AudioBytes, (unsigned)frames, self->rate, self->channels,
+                self->is_float ? "float" : "pcm", buf->pContext);
+    } else if (g_verbose > 2) {
+        xa2_log("SubmitSourceBuffer(%p): %u frames, ctx=%p -> 0",
+                (void *)self, (unsigned)frames, buf->pContext);
+    }
     return XA2_HR_OK;
 }
 
@@ -856,11 +1118,14 @@ static HRESULT __stdcall src_FlushSourceBuffers(xa2_voice *self) {
     if (!xa2_voice_valid(self)) return XA2_HR_INVALID;
     xa2_lock();
     /* Whatever already played has completed: report it before discarding the
-     * rest, so CRI's counter keeps matching what it submitted. */
-    xa2_voice_retire(self, xa2_voice_now(self));
+     * rest, so CRI's counter keeps matching what it submitted. With a live sink
+     * the mixer already retired every buffer it consumed. */
+    if (!xa2_sink_live()) xa2_voice_retire(self, xa2_voice_now(self));
     self->qhead = self->qcount = 0;
     self->next_end = self->played;
+    self->pos = (double)self->played;
     self->last_ctx = NULL;
+    self->dry = 0;
     xa2_unlock();
     if (g_verbose > 1) xa2_log("FlushSourceBuffers(%p) -> 0", (void *)self);
     return XA2_HR_OK;
@@ -869,7 +1134,10 @@ static HRESULT __stdcall src_FlushSourceBuffers(xa2_voice *self) {
 static HRESULT __stdcall src_Discontinuity(xa2_voice *self) {
     if (!xa2_voice_valid(self)) return XA2_HR_INVALID;
     xa2_lock();
-    if (!self->qcount) self->next_end = self->played;
+    if (!self->qcount) {
+        self->next_end = xa2_voice_cursor(self);
+        self->pos = (double)self->next_end;
+    }
     xa2_unlock();
     if (g_verbose > 1) xa2_log("Discontinuity(%p) -> 0", (void *)self);
     return XA2_HR_OK;
@@ -885,11 +1153,14 @@ static void __stdcall src_GetState(xa2_voice *self, xa2_voice_state *state) {
     if (!state) return;
     if (!xa2_voice_valid(self)) { memset(state, 0, sizeof *state); return; }
     xa2_lock();
-    now = xa2_voice_now(self);
-    xa2_voice_retire(self, now);
-    /* SamplesPlayed counts frames played since the voice started, including the
-     * part of the buffer that is playing right now; with nothing queued it must
-     * freeze at the cursor (a started XAudio2 voice does not count silence). */
+    if (xa2_sink_live()) {
+        now = (UINT64)self->pos;
+    } else {
+        now = xa2_voice_now(self);
+        xa2_voice_retire(self, now);
+    }
+    /* SamplesPlayed includes the part of the buffer that is playing right now;
+     * with nothing queued it must freeze at the cursor. */
     if (now > self->next_end) now = self->next_end;
     state->pCurrentBufferContext = self->qcount ? self->q[self->qhead].ctx : self->last_ctx;
     state->BuffersQueued = self->qcount;
@@ -908,10 +1179,13 @@ static HRESULT __stdcall src_SetFrequencyRatio(xa2_voice *self, float ratio, UIN
     (void)opset;
     if (!xa2_voice_valid(self) || !(ratio > 0.0f)) return XA2_HR_INVALID;
     xa2_lock();
-    /* Re-base the clock so a ratio change does not move the cursor backwards. */
-    self->base = xa2_voice_now(self);
-    QueryPerformanceCounter(&t);
-    self->t0 = (UINT64)t.QuadPart;
+    /* Re-base the QPC fallback clock so a ratio change does not move the cursor
+     * backwards. The sink mixer reads `ratio` per block, so it needs nothing. */
+    if (!xa2_sink_live()) {
+        self->base = xa2_voice_now(self);
+        QueryPerformanceCounter(&t);
+        self->t0 = (UINT64)t.QuadPart;
+    }
     self->ratio = ratio;
     xa2_unlock();
     return XA2_HR_OK;
@@ -923,9 +1197,11 @@ static HRESULT __stdcall src_SetSourceSampleRate(xa2_voice *self, UINT32 rate) {
     LARGE_INTEGER t;
     if (!xa2_voice_valid(self) || !rate) return XA2_HR_INVALID;
     xa2_lock();
-    self->base = xa2_voice_now(self);
-    QueryPerformanceCounter(&t);
-    self->t0 = (UINT64)t.QuadPart;
+    if (!xa2_sink_live()) {
+        self->base = xa2_voice_now(self);
+        QueryPerformanceCounter(&t);
+        self->t0 = (UINT64)t.QuadPart;
+    }
     self->rate = rate;
     xa2_unlock();
     return XA2_HR_OK;
@@ -970,6 +1246,20 @@ HRESULT xa2_stub_create_instance(const GUID *rclsid, DWORD cls_context, const GU
  * Every other CLSID goes to the real ole32, which matters here: the same
  * binary also creates DirectSound8 (0x88aae0) and the WASAPI device
  * enumerator (0x8701f0) through this import. */
+/* COM servers the engine also creates through this import; naming them keeps
+ * the audio route visible in the log (DirectSound8 is a real sink today, the
+ * WASAPI enumerator is only used for device notifications). */
+static const GUID xa2_clsid_dsound8 =
+    { 0x3901cc3f, 0x84b5, 0x4fa4, { 0xba, 0x35, 0xaa, 0x81, 0x72, 0xb8, 0xa0, 0x9b } };
+static const GUID xa2_clsid_mmdev =
+    { 0xbcde0395, 0xe52f, 0x467c, { 0x8e, 0x3d, 0xc4, 0x57, 0x92, 0x91, 0x69, 0x2e } };
+
+static const char *xa2_clsid_name(const GUID *g) {
+    if (IsEqualGUID(g, &xa2_clsid_dsound8)) return "DirectSound8";
+    if (IsEqualGUID(g, &xa2_clsid_mmdev)) return "MMDeviceEnumerator";
+    return "other";
+}
+
 static void shim_CoCreateInstance(void) {
     uint32_t *a = (uint32_t *)(uintptr_t)(g_esp + 4);
     const GUID *rclsid = (const GUID *)(uintptr_t)a[0];
@@ -994,6 +1284,10 @@ static void shim_CoCreateInstance(void) {
         guest_error = GetLastError();
         mach_enter();
         SetLastError(guest_error);
+        if (g_verbose)
+            xa2_log("CoCreateInstance(%s) -> real ole32 hr=0x%08lX (from 0x%08X)",
+                    xa2_readable(rclsid, sizeof(GUID)) ? xa2_clsid_name(rclsid) : "unreadable",
+                    (unsigned long)hr, g_cur_func);
     }
     g_eax = (uint32_t)hr;
     g_esp += 4 + 5 * 4;   /* ret + the five stdcall arguments */
