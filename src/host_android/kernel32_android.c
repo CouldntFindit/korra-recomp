@@ -10,6 +10,7 @@
  */
 #define _GNU_SOURCE
 #include <dirent.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -19,9 +20,31 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unwind.h>
 #include <unistd.h>
 
 #include "host_android.h"
+
+/* ------------------------------------------------------ host backtrace ---
+ * The guest stack cannot name callers: RECOMP_CALL pushes RECOMP_RETADDR
+ * (0xDEAD0000) instead of a real return address, so a frame walk finds only
+ * that marker. The HOST stack still has the lifted C function return
+ * addresses, and addr2line over the unstripped libkorra.so turns those into
+ * sub_XXXXXXXX names. bionic has no backtrace() in <execinfo.h>, so this walks
+ * with the unwinder. */
+typedef struct { void **pc; int n, max; } ka_bt;
+static _Unwind_Reason_Code ka_bt_cb(struct _Unwind_Context *ctx, void *arg) {
+    ka_bt *b = (ka_bt *)arg;
+    uintptr_t ip = (uintptr_t)_Unwind_GetIP(ctx);
+    if (ip && b->n < b->max) b->pc[b->n++] = (void *)ip;
+    return b->n < b->max ? _URC_NO_REASON : _URC_END_OF_STACK;
+}
+static int ka_host_backtrace(void **pc, int max) {
+    ka_bt b;
+    b.pc = pc; b.n = 0; b.max = max;
+    _Unwind_Backtrace(ka_bt_cb, &b);
+    return b.n;
+}
 
 /* ------------------------------------------------------------- constants */
 #define INVALID_HANDLE 0xFFFFFFFFu
@@ -330,7 +353,52 @@ static void k_InterlockedDecrement(void) {
 }
 static void k_InterlockedExchange(void) {
     uint32_t p = A32(0), v = A32(1);
-    if (p) RET(__atomic_exchange_n((uint32_t *)ka_host(p), v, __ATOMIC_SEQ_CST), 2);
+    if (p) {
+        uint32_t old = __atomic_exchange_n((uint32_t *)ka_host(p), v, __ATOMIC_SEQ_CST);
+        /* Spin diagnosis: the engine's TestAndSet loops on this. Log the first
+         * few hundred and then sparsely, so a stuck spin names its address. */
+        static int n;
+        /* g_backedges proves whether the spin loop's back edge is instrumented:
+         * it is the runtime's own global, incremented by RECOMP_BACKEDGE, and
+         * every 0x10000 of them calls recomp_yield_hook. */
+        if (n < 200 || (n % 100000) == 0)
+            ka_log("[spin] InterlockedExchange(%08X, %u) old=%u n=%d from=0x%08X back=%u",
+                   p, v, old, n, g_cur_func, g_backedges);
+        n++;
+        /* One guest backtrace from inside the sustained spin: 0x008D116E is
+         * only the InterlockedExchange forwarder, so g_cur_func names the
+         * thunk. Walking ebp names the real spinner and its callers. */
+        {
+            static int bt;
+            if (p == 0x2139780Cu && old == 1 && ++bt == 50) {
+                uint32_t fp;
+                ka_log("spin: backtrace for %08X (fs=%08X ebp=%08X esp=%08X):", p, g_fs_base, g_ebp, g_esp);
+                ka_log("spin:   lock words: %08X %08X %08X %08X %08X",
+                       MEM32(p + 4), MEM32(p + 8), MEM32(p + 0xC), MEM32(p + 0x10), MEM32(p + 0x14));
+                /* Guest return addresses are RECOMP_RETADDR, so walk the HOST
+                 * stack instead and resolve it with addr2line: that names the
+                 * lifted C function that is spinning. */
+                {
+                    void *btv[24];
+                    Dl_info di;
+                    uintptr_t base = 0;
+                    int bn, i;
+                    bn = ka_host_backtrace(btv, 24);
+                    if (dladdr((void *)&ka_machine_yield, &di)) base = (uintptr_t)di.dli_fbase;
+                    ka_log("spin: host frames=%d base=%08lX", bn, (unsigned long)base);
+                    for (i = 0; i < bn; i++)
+                        ka_log("spin:   off=0x%lX", (unsigned long)((uintptr_t)btv[i] - base));
+                }
+                for (fp = g_ebp; fp >= 0x1000u; ) {
+                    uint32_t next = MEM32(fp), ret = MEM32(fp + 4);
+                    ka_log("spin:   ebp=%08X ret=%08X", fp, ret);
+                    if (next <= fp) break;
+                    fp = next;
+                }
+            }
+        }
+        RET(old, 2);
+    }
     RET(0, 2);
 }
 static void k_InterlockedExchangeAdd(void) {
@@ -349,6 +417,13 @@ static void k_InterlockedCompareExchange(void) {
         uint32_t prev = c;
         __atomic_compare_exchange_n((uint32_t *)ka_host(p), &prev, x, 0,
                                     __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+        /* Spin diagnosis: a guest spinlock built on CAS loops here. Log the
+         * first calls and then sparsely so a stuck spin names its address. */
+        static int n;
+        if (n < 200 || (n % 100000) == 0)
+            ka_log("[cmp] InterlockedCompareExchange(%08X, %u, %u) old=%u n=%d from=0x%08X",
+                   p, x, c, prev, n, g_cur_func);
+        n++;
         RET(prev, 3);
     }
     RET(0, 3);
@@ -451,6 +526,7 @@ static void k_CreateDirectoryA(void) {
 }
 static void k_SetCurrentDirectoryA(void) {
     extern void ka_fs_set_cwd(const char *);
+    ka_log("fs: SetCurrentDirectoryA(%s)", ASTR(0));
     ka_fs_set_cwd(ASTR(0));
     RET(1, 1);
 }
@@ -489,42 +565,136 @@ static void k_GetStdHandle(void) {
 static void k_SetStdHandle(void) { RET(1, 2); }
 
 /* WIN32_FIND_DATAA is 320 bytes; only attributes/size/name are filled. */
+/* ------------------------------------------------------- find first/next */
+/* The engine's rofs mounts GameData by enumerating it (Hw::rofs::fst builds a
+ * file-size table); FindNextFileA returning FALSE made that table one entry
+ * long and the engine aborted with
+ *   "HWライブラリエラー: [Hw::rofs::fst] ファイルサイズテーブルの作成に失敗しました".
+ * So the enumeration has to be a real one: wildcard match, real attributes and
+ * a directory stream that survives between FindFirstFileA and FindNextFileA. */
+#define FIND_MAX 32
+typedef struct {
+    DIR *d;
+    char mask[260];
+    char dir[900];
+} ka_find;
+static ka_find g_finds[FIND_MAX];
+static pthread_mutex_t g_find_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int wild_match(const char *mask, const char *name) {
+    const char *m = mask, *n = name, *star = NULL, *retry = NULL;
+    while (*n) {
+        if (*m == '*' && !star) { star = ++m; retry = n; }
+        else if (*m == '?' || *m == *n) { if (*m) m++, n++; else break; }
+        else if (star) { m = star; n = ++retry; }
+        else return 0;
+    }
+    while (*m == '*') m++;
+    return *m == 0;
+}
+
+static void fill_find_data(uint32_t out, const char *dir, const char *name) {
+    struct stat st;
+    char full[1100];
+    int is_dir = 0;
+    memset(ka_host(out), 0, 320);
+    snprintf(full, sizeof full, "%s/%s", dir, name);
+    if (stat(full, &st) == 0) is_dir = S_ISDIR(st.st_mode);
+    MEM32(out + 0) = is_dir ? 0x10u : 0x80u;
+    if (stat(full, &st) == 0) {
+        MEM32(out + 28) = (uint32_t)((uint64_t)st.st_size >> 32);
+        MEM32(out + 32) = (uint32_t)((uint64_t)st.st_size & 0xFFFFFFFFu);
+    }
+    strncpy((char *)ka_host(out + 44), name, 259);
+}
+
+/* Returns a 1-based index into g_finds, or 0. */
+static uint32_t find_next_matching(uint32_t slot, uint32_t out) {
+    ka_find *f = &g_finds[slot - 1];
+    struct dirent *e;
+    if (!f->d) return 0;
+    while ((e = readdir(f->d)) != NULL) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        if (!wild_match(f->mask, e->d_name)) continue;
+        if (out) fill_find_data(out, f->dir, e->d_name);
+        return slot;
+    }
+    return 0;
+}
+
 static uint32_t find_first_impl(const char *pat, uint32_t out) {
     char path[1024];
-    DIR *d;
-    struct dirent *e;
+    char *slash;
+    uint32_t slot;
+    if (!pat || !*pat) return INVALID_HANDLE;
     ka_fs_resolve(pat, path, sizeof path);
-    {
-        char *slash = strrchr(path, '/');
-        if (slash) *slash = 0;
+    slash = strrchr(path, '/');
+    if (slash) {
+        snprintf(g_finds[FIND_MAX - 1].mask, sizeof g_finds[0].mask, "%s", slash + 1);
+        *slash = 0;
+    } else {
+        snprintf(g_finds[FIND_MAX - 1].mask, sizeof g_finds[0].mask, "%s", path);
+        path[0] = '.';
+        path[1] = 0;
     }
-    d = opendir(path);
-    if (!d) return INVALID_HANDLE;
-    while ((e = readdir(d)) != NULL) {
-        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
-        if (out) {
-            memset(ka_host(out), 0, 320);
-            MEM32(out + 0) = 0x20;
-            strncpy((char *)ka_host(out + 44), e->d_name, 259);
+    snprintf(g_finds[FIND_MAX - 1].dir, sizeof g_finds[0].dir, "%s", path);
+    g_finds[FIND_MAX - 1].d = opendir(path);
+    if (!g_finds[FIND_MAX - 1].d) {
+        ka_log("fs: FindFirstFileA(%s) -> opendir(%s) failed: %s", pat, path, strerror(errno));
+        return INVALID_HANDLE;
+    }
+    ka_log("fs: FindFirstFileA(%s) -> %s mask=%s", pat, path, g_finds[FIND_MAX - 1].mask);
+    pthread_mutex_lock(&g_find_lock);
+    for (slot = 1; slot <= FIND_MAX - 1; slot++) {
+        if (!g_finds[slot - 1].d) {
+            g_finds[slot - 1] = g_finds[FIND_MAX - 1];
+            g_finds[FIND_MAX - 1].d = NULL;
+            break;
         }
-        closedir(d);
-        return 0x9001u;
     }
-    closedir(d);
-    return INVALID_HANDLE;
+    pthread_mutex_unlock(&g_find_lock);
+    if (slot > FIND_MAX - 1) {
+        closedir(g_finds[FIND_MAX - 1].d);
+        g_finds[FIND_MAX - 1].d = NULL;
+        return INVALID_HANDLE;
+    }
+    if (!find_next_matching(slot, out)) {
+        closedir(g_finds[slot - 1].d);
+        g_finds[slot - 1].d = NULL;
+        return INVALID_HANDLE;
+    }
+    return slot;
 }
+
 static void k_FindFirstFileA(void) { RET(find_first_impl(ASTR(0), A32(1)), 2); }
 /* (name, infoLevel, data, searchOp, filter, flags) */
 static void k_FindFirstFileExA(void) { RET(find_first_impl(ASTR(0), A32(2)), 6); }
 
-static void k_FindNextFileA(void) { RET(0, 2); }
-static void k_FindClose(void) { RET(1, 1); }
+static void k_FindNextFileA(void) {
+    uint32_t h = A32(0), out = A32(1);
+    if (h == 0 || h >= FIND_MAX + 1) RET(0, 2);
+    if (!find_next_matching(h, out)) {
+        closedir(g_finds[h - 1].d);
+        g_finds[h - 1].d = NULL;
+        ka_last_error_set(18);         /* ERROR_NO_MORE_FILES */
+        RET(0, 2);
+    }
+    RET(1, 2);
+}
+static void k_FindClose(void) {
+    uint32_t h = A32(0);
+    if (h >= 1 && h <= FIND_MAX - 1 && g_finds[h - 1].d) {
+        closedir(g_finds[h - 1].d);
+        g_finds[h - 1].d = NULL;
+    }
+    RET(1, 1);
+}
 
 /* ------------------------------------------------------------ modules */
 static void k_GetModuleFileNameA(void) {
     uint32_t buf = A32(1), n = A32(2);
-    extern const char *ka_fs_exe_path(void);
-    const char *p = ka_fs_exe_path();
+    extern const char *ka_fs_guest_exe(void);
+    const char *p = ka_fs_guest_exe();
     size_t len = strlen(p);
     if (!buf || !n) RET(0, 3);
     if (len >= n) len = n - 1;
@@ -534,8 +704,8 @@ static void k_GetModuleFileNameA(void) {
 }
 static void k_GetModuleFileNameW(void) {
     uint32_t buf = A32(1), n = A32(2);
-    extern const char *ka_fs_exe_path(void);
-    const char *p = ka_fs_exe_path();
+    extern const char *ka_fs_guest_exe(void);
+    const char *p = ka_fs_guest_exe();
     uint32_t i;
     if (!buf || !n) RET(0, 3);
     for (i = 0; p[i] && i + 1 < n; i++) ((uint16_t *)ka_host(buf))[i] = (uint16_t)(uint8_t)p[i];
@@ -583,23 +753,64 @@ static void k_GetProcAddress(void) {
 /* ------------------------------------------------------------ threads */
 static void k_CreateThread(void) {
     uint32_t va = A32(2), param = A32(3);
-    uint32_t tok = ka_thread_create(va, param);
+    uint32_t flags = A32(4), id_out = A32(5);
+    /* CREATE_SUSPENDED (0x4) is load-bearing: the engine's spawner fills the
+     * worker's parameter block after this returns. lpThreadId shares the
+     * handle's number, which is what the guest compares and prints. */
+    uint32_t tok = ka_thread_create(va, param, (flags & 0x4u) != 0);
     if (!tok) { ka_last_error_set(8); RET(INVALID_HANDLE, 6); }
+    if (id_out) MEM32(id_out) = tok;
     RET(tok, 6);
 }
 uint32_t ka_thread_wait(uint32_t token, uint32_t timeout_ms);
 static void k_WaitForSingleObject(void) {
     uint32_t h = A32(0), ms = A32(1);
     ka_obj *o = obj_get(h);
+    /* Worker waits: name the handle and its state. The five CRI data-line
+     * threads end in this call and never move again, so either nothing ever
+     * signals the object or it is not an object at all. */
+    {
+        static int n;
+        if (n < 120) {
+            n++;
+            int ismain = (g_fs_base && g_fs_base == ka_spine_main_fs());
+            if (o)
+                ka_log("wait: h=%08X kind=%u manual=%u signaled=%u ms=%u main=%d fs=%08X",
+                       h, o->kind, o->manual, o->signaled, ms, ismain, g_fs_base);
+            else
+                ka_log("wait: h=%08X notobj ms=%u main=%d fs=%08X",
+                       h, ms, ismain, g_fs_base);
+        }
+    }
     if (o) {
         uint32_t waited = 0;
+        int ismain = (g_fs_base && g_fs_base == ka_spine_main_fs());
         while (!o->signaled && (ms == 0xFFFFFFFFu || waited < ms)) {
             guest_sleep_ms(1);
             waited++;
             if (ms == 0) break;
+            /* A main-thread wait is not logged above (it is the common case),
+             * but a boot that goes silent ends in exactly one of two places: a
+             * lifted loop that calls no import, or this call. 2 s is far longer
+             * than any legitimate wait in the load path. */
+            if (ismain && waited == 2000) {
+                static int nm;
+                if (nm < 10) {
+                    nm++;
+                    ka_log("wait: MAIN h=%08X kind=%u manual=%u still waiting after %u ms fs=%08X",
+                           h, o->kind, o->manual, waited, g_fs_base);
+                }
+            }
         }
         if (!o->signaled) RET(258u, 2);   /* WAIT_TIMEOUT */
         if (!o->manual) o->signaled = 0;
+        if (waited) {
+            static int n2;
+            if (n2 < 40) {
+                n2++;
+                ka_log("wait: h=%08X woke after %u polls fs=%08X", h, waited, g_fs_base);
+            }
+        }
         RET(0, 2);
     }
     RET(ka_thread_wait(h, ms), 2);
@@ -623,7 +834,11 @@ static void k_WaitForMultipleObjectsEx(void) {
         waited++;
     }
 }
-static void k_ResumeThread(void) { RET(1, 1); }
+static void k_ResumeThread(void) {
+    uint32_t prev = ka_thread_resume(A32(0));
+    if (prev == 0xFFFFFFFFu) { ka_last_error_set(6); RET(0xFFFFFFFFu, 1); }
+    RET(prev, 1);
+}
 static void k_ExitCodeThread(void) {
     uint32_t h = A32(0), out = A32(1);
     extern uint32_t ka_thread_exit_code(uint32_t);
@@ -649,6 +864,14 @@ static void k_CreateEventW(void) {
 }
 static void k_SetEvent(void) {
     ka_obj *o = obj_get(A32(0));
+    {
+        static int n;
+        if (n < 60) {
+            n++;
+            ka_log("setevent: h=%08X %s fs=%08X", A32(0),
+                   o ? (o->kind == OBJ_EVENT ? "event" : "other") : "not an object", g_fs_base);
+        }
+    }
     if (o) o->signaled = 1;
     RET(1, 1);
 }

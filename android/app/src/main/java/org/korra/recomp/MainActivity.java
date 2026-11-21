@@ -66,12 +66,18 @@ public class MainActivity extends GameActivity {
                         ViewGroup.LayoutParams.MATCH_PARENT));
         overlay.setOnClickListener(v -> pickGameFolder());
 
-        File external = getExternalFilesDir(null);
-        if (external == null) {
-            showMessage("External files directory is unavailable.", false);
+        /* Internal storage, not getExternalFilesDir(): Android 17 refuses the
+         * app write access to its own external files dir, and mkdirs() there
+         * fails outright - the installer reported "cannot create
+         * .../files/game/GameData" on the S24. Internal storage is also what the
+         * native side probes first. Only the destination moved; the SAF picker
+         * read side is unchanged. */
+        File internal = getFilesDir();
+        if (internal == null) {
+            showMessage("App files directory is unavailable.", false);
             return;
         }
-        File gameRoot = new File(external, "game");
+        File gameRoot = new File(internal, "game");
         File gameData = new File(gameRoot, "GameData");
         if (GameDataInstaller.isInstalled(gameRoot)) {
             overlay.setVisibility(TextView.GONE);
@@ -126,11 +132,11 @@ public class MainActivity extends GameActivity {
             // Not fatal: the copy starts now while the grant is live.
         }
 
-        File external = getExternalFilesDir(null);
-        if (external == null) {
+        File internal = getFilesDir();
+        if (internal == null) {
             return;
         }
-        File gameRoot = new File(external, "game");
+        File gameRoot = new File(internal, "game");
         if (gameRoot.getUsableSpace() < GameDataInstaller.REQUIRED_BYTES) {
             showMessage(getString(R.string.no_space,
                     GameDataInstaller.human(GameDataInstaller.REQUIRED_BYTES),

@@ -30,6 +30,10 @@ void ka_fs_set_root(const char *root) {
 }
 const char *ka_fs_root(void) { return g_root; }
 
+/* What GetModuleFileNameA/W report to the guest: the virtual drive, never the
+ * host root (see the mapping in ka_fs_resolve). */
+const char *ka_fs_guest_exe(void) { return "C:\\LoK.exe"; }
+
 const char *ka_fs_resolve(const char *guest_path, char *out, size_t cap) {
     char norm[768];
     size_t i, j = 0;
@@ -41,25 +45,50 @@ const char *ka_fs_resolve(const char *guest_path, char *out, size_t cap) {
         norm[j++] = (p[i] == '\\') ? '/' : p[i];
     norm[j] = 0;
 
-    /* An absolute path: either the one GetModuleFileNameA hands the engine or an
-     * absolute path the engine built from it. Never re-root it. */
-    if (norm[0] == '/') { snprintf(out, cap, "%s", norm); return out; }
-
-    /* drive letter / UNC prefix */
-    p = norm;
-    if (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':')
-        p += 2;
-    while (*p == '/' || *p == '\\') p++;
-    snprintf(norm, sizeof norm, "%s", p);
-
-    /* A path the engine built from its own module name: keep from GameData. */
+    /* The guest sees a virtual C: drive: "C:\LoK.exe", "C:\GameData\...". The
+     * drive letter is not cosmetic. The engine decides whether a path is an
+     * absolute Windows path by looking for "X:", so a POSIX root
+     * (/data/user/0/...) looked relative and the engine prepended its own base
+     * directory to it - "<root>/<root>/GameData\" - and the rofs mount failed.
+     * Everything below maps a guest path onto the host root. */
     {
-        char *g = strstr(norm, "GameData/");
-        if (g && g != norm) memmove(norm, g, strlen(g) + 1);
+        size_t w = 0;
+        for (i = 0; norm[i]; i++) {
+            if (norm[i] == '/' && w && norm[w - 1] == '/') continue;
+            norm[w++] = norm[i];
+        }
+        norm[w] = 0;
+    }
+
+    /* Defensive: if a host path leaked through (GetModuleFileNameA used to hand
+     * the engine one), drop leading copies of the host root. */
+    {
+        size_t rl = strlen(g_root);
+        while (rl && strncmp(norm, g_root, rl) == 0 && (norm[rl] == 0 || norm[rl] == '/')) {
+            const char *rest = norm + rl;
+            while (*rest == '/') rest++;
+            memmove(norm, rest, strlen(rest) + 1);
+        }
+    }
+
+    /* "C:" (or any single-letter drive): absolute inside the guest root. */
+    p = norm;
+    if (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':') {
+        p += 2;
+        while (*p == '/') p++;
+        snprintf(out, cap, "%s/%s", g_root, p);
+        return out;
+    }
+
+    /* A leading slash is an absolute guest path as well. */
+    if (norm[0] == '/') {
+        p = norm;
+        while (*p == '/') p++;
+        snprintf(out, cap, "%s/%s", g_root, p);
+        return out;
     }
 
     if (!g_cwd[0]) snprintf(out, cap, "%s/%s", g_root, norm);
-    else if (g_cwd[0] == '/') snprintf(out, cap, "%s/%s", g_cwd, norm);
     else snprintf(out, cap, "%s/%s/%s", g_root, g_cwd, norm);
     return out;
 }
@@ -142,12 +171,31 @@ int ka_file_close(uint32_t tok) {
 }
 
 /* ---- guest cwd -------------------------------------------------------- */
+/* The cwd is guest-relative: "C:\GameData\" and "\GameData\" both become
+ * "GameData", "" means the root. Keeping it relative is what makes a relative
+ * guest path join correctly no matter how the engine spelled its base. */
 void ka_fs_set_cwd(const char *p) {
+    char norm[768];
+    size_t i, j = 0;
+    const char *q;
+
     if (!p || !*p) { g_cwd[0] = 0; return; }
-    snprintf(g_cwd, sizeof g_cwd, "%s", p);
-    for (char *c = g_cwd; *c; c++) if (*c == '\\') *c = '/';
-    /* Keep an absolute path absolute; only a relative one is rooted later. */
-    if (g_cwd[0] != '/') while (g_cwd[0] == '/') memmove(g_cwd, g_cwd + 1, strlen(g_cwd));
+    for (i = 0; p[i] && j + 1 < sizeof norm; i++)
+        norm[j++] = (p[i] == '\\') ? '/' : p[i];
+    norm[j] = 0;
+
+    q = norm;
+    if (((q[0] >= 'A' && q[0] <= 'Z') || (q[0] >= 'a' && q[0] <= 'z')) && q[1] == ':')
+        q += 2;
+    while (*q == '/') q++;
+    {
+        size_t rl = strlen(g_root);
+        while (rl && strncmp(q, g_root, rl) == 0 && (q[rl] == 0 || q[rl] == '/')) {
+            q += rl;
+            while (*q == '/') q++;
+        }
+    }
+    snprintf(g_cwd, sizeof g_cwd, "%s", q);
 }
 const char *ka_fs_cwd(void) { return g_cwd; }
 uint32_t ka_file_read_at(uint32_t tok, void *buf, uint32_t n, uint64_t off, uint32_t *got);

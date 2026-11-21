@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -172,4 +173,46 @@ void ka_log(const char *fmt, ...) {
     fputc('\n', stderr);
     va_end(ap);
     fflush(stderr);
+}
+
+/* ---- crash breadcrumb -------------------------------------------------- */
+/* A tombstone shows host frames only. The guest register file lives in host
+ * globals, so a handler can still say which guest function was running and what
+ * its registers were - the difference between "memset faulted" and "guest ebp
+ * was zero because a shim over-popped". Logs through the raw fd, so it works
+ * even if libc's stdio state is the thing that is broken. */
+static void ka_crash_handler(int sig, siginfo_t *si, void *uc) {
+    char buf[320];
+    int n;
+    (void)uc;
+    n = snprintf(buf, sizeof buf,
+                 "\n[crash] signal %d addr=%p guest_func=0x%08X esp=0x%08X "
+                 "ebp=0x%08X eax=0x%08X ecx=0x%08X edx=0x%08X ebx=0x%08X "
+                 "esi=0x%08X edi=0x%08X\n",
+                 sig, si ? si->si_addr : (void *)0, g_cur_func, g_esp, g_ebp,
+                 g_eax, g_ecx, g_edx, g_ebx, g_esi, g_edi);
+    if (n > 0) {
+        ssize_t w = write(2, buf, (size_t)n);
+        (void)w;
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+void ka_crash_init(void) {
+    static char altstack[SIGSTKSZ];
+    stack_t ss;
+    struct sigaction sa;
+    ss.ss_sp = altstack;
+    ss.ss_size = sizeof altstack;
+    ss.ss_flags = 0;
+    sigaltstack(&ss, NULL);
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = ka_crash_handler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGFPE, &sa, NULL);
 }

@@ -184,30 +184,110 @@ static void x_GetState(void) {
 }
 static void x_SetState(void) { RET(0, 2); }
 
+static uint32_t ka_dinput_device(void);
+
 /* DirectInput8: enumerate no devices, answer everything else with a failure.
  * The engine's keyboard path then finds nothing (correct: a phone has no
  * keyboard) and the XInput path keeps working.
  *
- * Each vtable slot pops its own argument count. A single shared thunk cannot
- * do that: IDirectInput8 is QueryInterface(2), AddRef(0), Release(0),
- * CreateDevice(3), EnumDevices(4), GetDeviceStatus(1), RunControlPanel(2),
- * Initialize(2). */
+ * Each vtable slot pops its own argument count, and on x86 COM `this` is a
+ * stack argument, so the count is the C parameters PLUS one. The guest proves
+ * it: sub_00760320 pushes the object before every slot
+ * (`push eax; call [ecx+0x10]` for EnumDevices). Popping the C count instead
+ * leaves 4 bytes on the stack per call, and the caller's `pop ebp` then reads
+ * a zero - seen on device as a fault at [ebp-4] with ebp=0 in the function
+ * that runs the engine's static initialisers.
+ *
+ *   QueryInterface(this, riid, out)   3     GetDeviceStatus(this, guid)   2
+ *   AddRef(this) / Release(this)      1     RunControlPanel(this, hwnd)   3
+ *   CreateDevice(this, guid, out, unk) 4    Initialize(this, hinst, ver)   3
+ *   EnumDevices(this, type, cb, ref, flags) 5 */
 static void d_QueryInterface(void) {
-    uint32_t out = A32(1);
+    uint32_t out = A32(2);
     if (out) MEM32(out) = 0;
-    RET(0x80004002u, 2);              /* E_NOINTERFACE */
+    RET(0x80004002u, 3);              /* E_NOINTERFACE */
 }
-static void d_AddRef(void) { RET(1, 0); }
-static void d_Release(void) { RET(1, 0); }
-static void d_GetDeviceStatus(void) { RET(0x80004005u, 1); }
-static void d_RunControlPanel(void) { RET(0x80004005u, 2); }
-static void d_Initialize(void) { RET(0x80004005u, 2); }
-/* EnumDevices(dwDevType, callback, ref, dwFlags) is 4 args - popping 5 ate the
- * caller's local on every DirectInput init (found on device, docs/quirks.md 5.2). */
-static void d_EnumDevices(void) { RET(0, 4); }
-/* CreateDevice(rguid, out, outer) is 3. */
-static void d_CreateDevice(void) { RET(0x80070057u, 3); }  /* E_INVALIDARG */
-static void di_DirectInput8Create(void) { RET(ka_dinput_object(), 5); }
+static void d_AddRef(void) { RET(1, 1); }
+static void d_Release(void) { RET(1, 1); }
+static void d_GetDeviceStatus(void) { RET(0x80004005u, 2); }
+static void d_RunControlPanel(void) { RET(0x80004005u, 3); }
+static void d_Initialize(void) { RET(0x80004005u, 3); }
+static void d_EnumDevices(void) { RET(0, 5); }   /* no devices: the engine falls back */
+/* A device object, not a refusal: the engine creates the keyboard and mouse
+ * directly after enumerating (it never waits for the enumeration callback), and
+ * a failed CreateDevice makes main() tear everything down and exit(0) before it
+ * ever asks for a D3D9 device. GetDeviceState zeroes the caller's buffer, which
+ * is the honest answer for a phone with no physical keyboard, and it is where
+ * touch will inject keys later. */
+static void dv_QueryInterface(void) {
+    uint32_t out = A32(2);
+    if (out) MEM32(out) = 0;
+    RET(0x80004002u, 3);
+}
+static void dv_AddRef(void) { RET(2, 1); }
+static void dv_Release(void) { RET(1, 1); }
+static void dv_GetCapabilities(void) {
+    /* DIDEVICEINSTANCE-style header: dwSize, then flags/type. An attached,
+     * emulated device with no axes or buttons. */
+    uint32_t p = A32(1);
+    if (p) {
+        uint32_t cb = MEM32(p);
+        if (cb > 0x60) cb = 0x60;
+        if (cb) memset(ka_host(p), 0, cb);
+        MEM32(p) = cb;
+        MEM32(p + 4) = 0x5u;        /* DIDC_ATTACHED | DIDC_EMULATED */
+        MEM32(p + 8) = 0x0102u;     /* DI8DEVTYPE_KEYBOARD */
+    }
+    RET(0, 2);
+}
+static void dv_EnumObjects(void) { RET(0, 4); }   /* no axes, so no callbacks */
+static void dv_GetProperty(void) { RET(0x80070057u, 3); }
+static void dv_SetProperty(void) { RET(0x80070057u, 4); }
+static void dv_Acquire(void) { RET(0, 1); }
+static void dv_Unacquire(void) { RET(0, 1); }
+static void dv_GetDeviceState(void) {
+    uint32_t cb = A32(1), p = A32(2);
+    if (p && cb) memset(ka_host(p), 0, cb);   /* nothing held down */
+    RET(0, 3);
+}
+static void dv_GetDeviceData(void) {
+    uint32_t n = A32(3);                      /* this, cb, rgdod, pdwInOut, flags */
+    if (n) MEM32(n) = 0;
+    RET(0, 5);
+}
+static void dv_SetDataFormat(void) { RET(0, 2); }
+static void dv_SetEventNotification(void) { RET(0, 2); }
+static void dv_SetCooperativeLevel(void) { RET(0, 3); }
+static void dv_GetObjectInfo(void) { RET(0x80070057u, 4); }
+static void dv_GetDeviceInfo(void) {
+    uint32_t p = A32(1);
+    if (p) {
+        uint32_t cb = MEM32(p);
+        if (cb > 0x240) cb = 0x240;
+        if (cb) memset(ka_host(p), 0, cb);
+        MEM32(p) = cb;
+    }
+    RET(0, 2);
+}
+static void dv_RunControlPanel(void) { RET(0x80004005u, 3); }
+static void dv_Initialize(void) { RET(0, 4); }
+static void d_CreateDevice(void) {
+    uint32_t out = A32(2);
+    if (out) MEM32(out) = ka_dinput_device();
+    RET(0, 4);
+}
+/* DirectInput8Create(hinst, version, riid, ppvOut, outer) - 5 args.
+ *
+ * The caller keeps the object in a global (0xE4E818 in this exe) read back from
+ * the out parameter, not from the return value: returning the token in EAX and
+ * leaving *ppvOut zero made the engine dereference a NULL vtable right after a
+ * "successful" call. The HRESULT is what says whether it worked. */
+static void di_DirectInput8Create(void) {
+    uint32_t out = A32(3);
+    uint32_t tok = ka_dinput_object();
+    if (out) MEM32(out) = tok;
+    RET(0, 5);   /* DI_OK */
+}
 
 /* --------------------------------------------------------------- D3DX9 */
 static void dx_CreateTexture(void) {
@@ -353,5 +433,32 @@ uint32_t ka_dinput_object(void) {
         g_dinput_obj = make_object(slots, 8, "DInput", 0x44494E50u);
     }
     return g_dinput_obj;
+}
+
+/* IDirectInputDevice8, slot order straight from dinput.h: QueryInterface,
+ * AddRef, Release, GetCapabilities, EnumObjects, GetProperty, SetProperty,
+ * Acquire, Unacquire, GetDeviceState, GetDeviceData, SetDataFormat,
+ * SetEventNotification, SetCooperativeLevel, GetObjectInfo, GetDeviceInfo,
+ * RunControlPanel, Initialize. */
+static uint32_t g_dinput_dev;
+static uint32_t ka_dinput_device(void) {
+    static const ka_shim slots[] = {
+        { "DInputDev:0", dv_QueryInterface }, { "DInputDev:1", dv_AddRef },
+        { "DInputDev:2", dv_Release },        { "DInputDev:3", dv_GetCapabilities },
+        { "DInputDev:4", dv_EnumObjects },    { "DInputDev:5", dv_GetProperty },
+        { "DInputDev:6", dv_SetProperty },    { "DInputDev:7", dv_Acquire },
+        { "DInputDev:8", dv_Unacquire },      { "DInputDev:9", dv_GetDeviceState },
+        { "DInputDev:10", dv_GetDeviceData }, { "DInputDev:11", dv_SetDataFormat },
+        { "DInputDev:12", dv_SetEventNotification },
+        { "DInputDev:13", dv_SetCooperativeLevel },
+        { "DInputDev:14", dv_GetObjectInfo }, { "DInputDev:15", dv_GetDeviceInfo },
+        { "DInputDev:16", dv_RunControlPanel }, { "DInputDev:17", dv_Initialize },
+        { NULL, NULL }
+    };
+    if (!g_dinput_dev) {
+        ka_shim_register(slots);
+        g_dinput_dev = make_object(slots, 18, "DInputDev", 0x44454B42u);
+    }
+    return g_dinput_dev;
 }
 
