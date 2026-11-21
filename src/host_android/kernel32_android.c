@@ -195,6 +195,10 @@ static void k_CloseHandle(void) {
         }
     }
     if (o) { o->used = 0; RET(1, 1); }
+    /* A thread handle: create/openthread ids are real here even though they are
+     * not kernel objects, and closing one must not touch the thread table (the
+     * engine opens the same worker again to join it). */
+    if (ka_thread_exists(h)) RET(1, 1);
     if (ka_file_close(h)) RET(1, 1);
     RET(0, 1);
 }
@@ -206,7 +210,14 @@ static void k_GetCurrentProcess(void) { RET(0xFFFFFFFFu, 0); }
 static void k_GetCurrentProcessId(void) { RET((uint32_t)getpid(), 0); }
 static void k_GetCurrentThread(void) { RET(0xFFFFFFFEu, 0); }
 static void k_GetCurrentThreadId(void) {
+    extern uint32_t ka_guest_tid(void);
+    /* Inside a guest thread this must be the id CreateThread reported as
+     * lpThreadId - the engine indexes its thread records by it (sub_00741A90)
+     * and dereferences a NULL when the two disagree. Threads the guest did not
+     * create (the main thread, host helpers) get a lazy counter. */
+    uint32_t gid = ka_guest_tid();
     static __thread uint32_t id;
+    if (gid) { RET(gid, 0); }
     if (!id) { static uint32_t next = 100; id = __atomic_add_fetch(&next, 1, __ATOMIC_RELAXED); }
     RET(id, 0);
 }
@@ -275,6 +286,21 @@ static void k_RaiseException(void) {    uint32_t code = A32(0);
 }
 
 static void k_ExitProcess(void) {
+    /* The boot ends with an orderly shutdown before the first Present. The
+     * engine's framework start (sub_00847BB0 through sub_007657D0) needs
+     * eax==1 and otherwise crosses one of its early exits, so dumping the
+     * globals it tests names the branch: 9B4390 == FFFFFFFF means step 1's
+     * pool was never created (0x34), CA2990 == 0 means the 0x4B early check
+     * (its factory sub_0089F040 never ran), and CA2020 == 0 with both set
+     * means step 2 (sub_00847FF0) or step 3 (sub_00847CE0) failed. */
+    ka_log("state: 9B4390=%08X 9B4388=%08X 9B438C=%08X 9B4394=%08X CA2990=%08X "
+           "CA2020=%08X CA1FD8=%08X CA2004=%08X 9B4888=%08X 9B44E8=%08X",
+           MEM32(0x9B4390u), MEM32(0x9B4388u), MEM32(0x9B438Cu), MEM32(0x9B4394u),
+           MEM32(0xCA2990u), MEM32(0xCA2020u), MEM32(0xCA1FD8u), MEM32(0xCA2004u),
+           MEM32(0x9B4888u), MEM32(0x9B44E8u));
+    ka_log("state: DB8AA0=%08X DB8AA4=%08X DB8AC8=%08X DB8AE8=%08X DB8AF4=%08X",
+           MEM32(0xDB8AA0u), MEM32(0xDB8AA4u), MEM32(0xDB8AC8u), MEM32(0xDB8AE8u),
+           MEM32(0xDB8AF4u));
     ka_log("guest ExitProcess(%u)", A32(0));
     fflush(NULL);
     _exit((int)A32(0));
@@ -629,6 +655,9 @@ static void k_SetStdHandle(void) { RET(1, 2); }
  * So the enumeration has to be a real one: wildcard match, real attributes and
  * a directory stream that survives between FindFirstFileA and FindNextFileA. */
 #define FIND_MAX 32
+/* Find handles are their own namespace as well: small ints 1..31 used to share
+ * the object-handle and file-token space (see KA_FILE_TOKEN_BASE above). */
+#define FIND_TOKEN_BASE 0x02000000u
 typedef struct {
     DIR *d;
     char mask[260];
@@ -719,7 +748,7 @@ static uint32_t find_first_impl(const char *pat, uint32_t out) {
         g_finds[slot - 1].d = NULL;
         return INVALID_HANDLE;
     }
-    return slot;
+    return FIND_TOKEN_BASE + slot;
 }
 
 static void k_FindFirstFileA(void) { RET(find_first_impl(ASTR(0), A32(1)), 2); }
@@ -727,21 +756,25 @@ static void k_FindFirstFileA(void) { RET(find_first_impl(ASTR(0), A32(1)), 2); }
 static void k_FindFirstFileExA(void) { RET(find_first_impl(ASTR(0), A32(2)), 6); }
 
 static void k_FindNextFileA(void) {
-    uint32_t h = A32(0), out = A32(1);
-    if (h == 0 || h >= FIND_MAX + 1) RET(0, 2);
-    if (!find_next_matching(h, out)) {
-        closedir(g_finds[h - 1].d);
-        g_finds[h - 1].d = NULL;
+    uint32_t h = A32(0), out = A32(1), slot;
+    if (h < FIND_TOKEN_BASE) RET(0, 2);
+    slot = h - FIND_TOKEN_BASE;
+    if (slot == 0 || slot > FIND_MAX - 1) RET(0, 2);
+    if (!find_next_matching(slot, out)) {
+        closedir(g_finds[slot - 1].d);
+        g_finds[slot - 1].d = NULL;
         ka_last_error_set(18);         /* ERROR_NO_MORE_FILES */
         RET(0, 2);
     }
     RET(1, 2);
 }
 static void k_FindClose(void) {
-    uint32_t h = A32(0);
-    if (h >= 1 && h <= FIND_MAX - 1 && g_finds[h - 1].d) {
-        closedir(g_finds[h - 1].d);
-        g_finds[h - 1].d = NULL;
+    uint32_t h = A32(0), slot;
+    if (h < FIND_TOKEN_BASE) RET(0, 1);
+    slot = h - FIND_TOKEN_BASE;
+    if (slot >= 1 && slot <= FIND_MAX - 1 && g_finds[slot - 1].d) {
+        closedir(g_finds[slot - 1].d);
+        g_finds[slot - 1].d = NULL;
     }
     RET(1, 1);
 }
@@ -931,19 +964,25 @@ static void k_ExitCodeThread(void) {
     if (out) MEM32(out) = ka_thread_exit_code(h);
     RET(1, 2);
 }
-/* OpenThread is a stub: it answers a value that belongs to no table, so the
- * engine's "wait for that worker to finish" returns at once. The device log
- * shows the pool teardown doing exactly this and then closing semaphores while
- * five workers are still parked. Log the caller frame; whether the engine
- * depends on this join is the question the morning run answers. */
+/* OpenThread must return a handle that names the thread, because the engine's
+ * pool teardown (sub_00741320) releases each pump's semaphore and then waits on
+ * this handle before closing the semaphores. A stub value made that join a
+ * no-op: the destructor closed the semaphores and cleared the pool's stop bit
+ * while five pumps were still parked, so each woke into [pool+8]==0, called the
+ * zeroed job pointer (ICALL 0x00000000 from 0x007414E0, 3.6M repeats) and spun.
+ * Returning the thread's own id lets WaitForSingleObject reach ka_thread_wait,
+ * which unwinds the machine lock and joins for real. */
 static void k_OpenThread(void) {
+    uint32_t id = A32(2);
     static int n;
     if (n < 40) {
         n++;
-        ka_log("openthread: tid=%u access=%08X esp=%08X ebp=%08X fs=%08X",
-               A32(2), A32(1), g_esp, g_ebp, g_fs_base);
+        ka_log("openthread: tid=%u access=%08X -> %s esp=%08X ebp=%08X fs=%08X",
+               id, A32(1), ka_thread_exists(id) ? "thread" : "invalid",
+               g_esp, g_ebp, g_fs_base);
     }
-    RET(0xFFFFFFFEu, 3);
+    if (!ka_thread_exists(id)) { ka_last_error_set(87); RET(0, 3); }  /* ERROR_INVALID_PARAMETER */
+    RET(id, 3);
 }
 static void k_SetThreadPriority(void) { RET(1, 2); }
 static void k_GetThreadPriority(void) { RET(0, 1); }

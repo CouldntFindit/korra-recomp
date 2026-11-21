@@ -5,6 +5,7 @@
  */
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifndef KORRA_WITH_DXVK
@@ -75,6 +76,7 @@ enum Kind {
     K_VDECL,
     K_STATEBLOCK,
     K_QUERY,
+    K_D3DXCT,
 };
 
 struct Obj {
@@ -413,16 +415,28 @@ void d_CreateCubeTexture() {
 }
 void d_CreateVertexBuffer() {
     IDirect3DVertexBuffer9 *b = nullptr;
+    /* The engine pushes `this` last (sub_00757ED0 at 0x757F4C does
+     * push 0; push &out; push 1; push 0; push 0; push size; push token),
+     * so ka_vtable_note_import sees a token at g_esp and sets
+     * g_d9_stack_this = 1: A32(0) is the first real parameter and the
+     * out pointer is A32(4) with pSharedHandle at A32(5). Passing them
+     * the other way wrote the token into the (zero) pShared slot, the
+     * engine then read a NULL ppVertexBuffer and faulted at guest VA 0
+     * (recomp_0040.c:21646). */
     HRESULT hr = DEV->CreateVertexBuffer(A32(0), A32(1), A32(2), (D3DPOOL)A32(3), &b,
-                                         (HANDLE *)P(A32(4)));
-    if (A32(5)) MEM32(A32(5)) = SUCCEEDED(hr) ? new_token(K_VBUFFER, b, g_ecx) : 0;
+                                         (HANDLE *)P(A32(5)));
+    if (A32(4)) MEM32(A32(4)) = SUCCEEDED(hr) ? new_token(K_VBUFFER, b, g_ecx) : 0;
     RET((uint32_t)hr, 6);
 }
 void d_CreateIndexBuffer() {
     IDirect3DIndexBuffer9 *b = nullptr;
     HRESULT hr = DEV->CreateIndexBuffer(A32(0), A32(1), (D3DFORMAT)A32(2), (D3DPOOL)A32(3),
-                                        &b, (HANDLE *)P(A32(4)));
-    if (A32(5)) MEM32(A32(5)) = SUCCEEDED(hr) ? new_token(K_IBUFFER, b, g_ecx) : 0;
+                                        &b, (HANDLE *)P(A32(5)));
+    /* Same argument order as CreateVertexBuffer: the engine pushes the out
+     * pointer last-but-one and pSharedHandle last, so A32(4) is ppIndexBuffer
+     * and A32(5) is pShared. Writing the token to A32(5) left the engine's
+     * pointer NULL and it faulted at guest VA 0 right after dev:27. */
+    if (A32(4)) MEM32(A32(4)) = SUCCEEDED(hr) ? new_token(K_IBUFFER, b, g_ecx) : 0;
     RET((uint32_t)hr, 6);
 }
 void d_CreateRenderTarget() {
@@ -598,7 +612,12 @@ void d_SetFVF() { RET_HR(DEV->SetFVF(A32(0)), 1); }
 void d_GetFVF() { RET_HR(DEV->GetFVF((DWORD *)P(A32(0))), 1); }
 void d_CreateVertexShader() {
     IDirect3DVertexShader9 *s = nullptr;
-    HRESULT hr = DEV->CreateVertexShader((const DWORD *)P(A32(0)), &s);
+    const void *code = P(A32(0));
+    static int n;
+    if (n++ < 4)
+        ka_log("d3d9: CreateVertexShader code=%p f=%08X out=%08X",
+               code, A32(0), A32(1));
+    HRESULT hr = DEV->CreateVertexShader((const DWORD *)code, &s);
     if (A32(1)) MEM32(A32(1)) = SUCCEEDED(hr) ? new_token(K_VS, s, g_ecx) : 0;
     RET((uint32_t)hr, 2);
 }
@@ -658,7 +677,12 @@ void d_GetIndices() {
 }
 void d_CreatePixelShader() {
     IDirect3DPixelShader9 *s = nullptr;
-    HRESULT hr = DEV->CreatePixelShader((const DWORD *)P(A32(0)), &s);
+    const void *code = P(A32(0));
+    static int n;
+    if (n++ < 4)
+        ka_log("d3d9: CreatePixelShader code=%p f=%08X out=%08X",
+               code, A32(0), A32(1));
+    HRESULT hr = DEV->CreatePixelShader((const DWORD *)code, &s);
     if (A32(1)) MEM32(A32(1)) = SUCCEEDED(hr) ? new_token(K_PS, s, g_ecx) : 0;
     RET((uint32_t)hr, 2);
 }
@@ -800,10 +824,17 @@ void b_Lock() {
     Obj *o = self_obj();
     void *host = nullptr;
     HRESULT hr;
+    /* Lock(OffsetToLock, SizeToLock, ppbData, Flags). The engine's call site
+     * (sub_00757ED0 at 0x757F63) pushes Flags last, then ppbData, Size and
+     * Offset, with `this` as arg0 - so with the stack shift A32(2) is the
+     * guest's ppbData and A32(3) is Flags. This used to pass A32(2) - a stack
+     * address - as Flags, DXVK answered D3DERR_INVALIDCALL, and the engine's
+     * failure path released the buffer and wrote through a NULL pointer
+     * (crash at guest VA 0). */
     if (o->kind == K_VBUFFER)
-        hr = reinterpret_cast<IDirect3DVertexBuffer9 *>(o->p)->Lock(A32(0), A32(1), &host, A32(2));
+        hr = reinterpret_cast<IDirect3DVertexBuffer9 *>(o->p)->Lock(A32(0), A32(1), &host, A32(3));
     else
-        hr = reinterpret_cast<IDirect3DIndexBuffer9 *>(o->p)->Lock(A32(0), A32(1), &host, A32(2));
+        hr = reinterpret_cast<IDirect3DIndexBuffer9 *>(o->p)->Lock(A32(0), A32(1), &host, A32(3));
     if (SUCCEEDED(hr)) {
         o->lock_va = ka_guest_alloc(A32(1) ? A32(1) : 0x10000, 16);
         o->lock_host = host;
@@ -862,6 +893,186 @@ void q_GetData() {
 void q_Issue() { RET_HR(reinterpret_cast<IDirect3DQuery9 *>(self_obj()->p)->Issue(A32(0)), 1); }
 void q_GetType() { RET(reinterpret_cast<IDirect3DQuery9 *>(self_obj()->p)->GetType(), 0); }
 void q_GetDataSize() { RET(reinterpret_cast<IDirect3DQuery9 *>(self_obj()->p)->GetDataSize(), 0); }
+
+/* ------------------------------------------------- D3DX9 constant tables */
+/* The engine's minimum-shader init creates a vertex shader (dev:91), asks D3DX
+ * for its constant table and treats a missing table as fatal: on device it
+ * released the shader, released DInput, tore the pools down, and quit with
+ * ExitProcess(0) - no frame, no message box. D3DX answers by parsing the CTAB
+ * comment chunk that fxc embeds in the bytecode; this does the same, so the
+ * engine's parameter binding sees the register set/index it expects. */
+struct DxConst {
+    char     name[96];
+    uint32_t name_va;
+    uint32_t reg_set, reg_index, reg_count;
+    uint32_t rows, cols, elements, members;
+    uint32_t bytes;
+    uint32_t default_va;
+};
+struct DxConstTable {
+    uint32_t creator_va;
+    uint32_t version;
+    uint32_t count;
+    DxConst  c[64];
+};
+/* The comment payload starts with the 'CTAB' fourcc; every offset inside it
+ * (creator, constant_info, name, typeinfo, defval) is relative to that fourcc,
+ * so the header keeps it as its first field. Reading size as the first field
+ * made constants land on the version token (0xFFFE0300) and the table was
+ * rejected, which is why the first parse reported "no CTAB". */
+struct DxCtabHdr  { uint32_t ctab, size, creator, version, constants, constant_info, flags, target; };
+struct DxCtabInfo { uint32_t name; uint16_t regset, regindex, regcount, reserved; uint32_t typeinfo; uint32_t defval; };
+struct DxCtabType { uint16_t klass, type, rows, cols, elements, members; uint32_t memberinfo; };
+
+static uint32_t dx_guest_str(const char *s) {
+    uint32_t n = (uint32_t)strlen(s) + 1u;
+    uint32_t va = ka_guest_alloc(n, 1);
+    if (va) memcpy(ka_host(va), s, n);
+    return va;
+}
+
+/* Walk the instruction stream for the comment token whose payload begins with
+ * 'CTAB'. Comment tokens are (dword_count << 16) | 0xFFFE; 0x0000FFFF is END. */
+static uint32_t dx_scanned;   /* tokens walked by the last dx_find_ctab */
+
+static const uint8_t *dx_find_ctab(const uint8_t *code) {
+    const uint32_t *tok = (const uint32_t *)code;
+    uint32_t i;
+    static int dumped;
+    if (dumped < 4) {
+        dumped++;
+        /* The first calls: what does the engine actually hand us? A real shader
+         * blob starts with a version token (low word 0xFFFE, e.g. 0xFFFF0300)
+         * and carries its constants as a 'CTAB' comment. */
+        ka_log("d3dx: code at %p: %08X %08X %08X %08X %08X %08X %08X %08X",
+               (const void *)code, tok[0], tok[1], tok[2], tok[3],
+               tok[4], tok[5], tok[6], tok[7]);
+    }
+    dx_scanned = 0;
+    for (i = 1; i < (1u << 16); i++) {
+        uint32_t t = tok[i];
+        dx_scanned = i;
+        uint32_t lo = t & 0xFFFFu;
+        if (lo == 0xFFFFu) return nullptr;
+        if (lo == 0xFFFEu) {
+            uint32_t words = (t >> 16) & 0x7FFFu;
+            const uint8_t *p = (const uint8_t *)(tok + i + 1);
+            if (words >= 2 && *(const uint32_t *)p == 0x42415443u) return p;  /* 'CTAB' */
+            i += words;
+        }
+    }
+    return nullptr;
+}
+
+static DxConstTable *dx_parse_ctab(const uint8_t *code) {
+    const uint8_t *ctab = dx_find_ctab(code);
+    const DxCtabHdr *h;
+    DxConstTable *t;
+    uint32_t i;
+    if (!ctab) return nullptr;
+    h = (const DxCtabHdr *)ctab;
+    if (h->ctab != 0x42415443u || h->size < 0x1Cu) return nullptr;
+    /* A shader with no uniforms still carries a CTAB with constants == 0; D3DX
+     * returns a valid (empty) table for it. Rejecting zero here made such a
+     * shader report "no CTAB", which aborted the engine's shader init. */
+    if (h->constants > 64) return nullptr;
+    t = (DxConstTable *)calloc(1, sizeof *t);
+    if (!t) return nullptr;
+    t->version = h->version;
+    t->creator_va = h->creator ? dx_guest_str((const char *)(ctab + h->creator)) : 0;
+    t->count = h->constants;
+    for (i = 0; i < t->count; i++) {
+        const DxCtabInfo *ci = (const DxCtabInfo *)(ctab + h->constant_info + i * sizeof(DxCtabInfo));
+        const DxCtabType *ti = (const DxCtabType *)(ctab + ci->typeinfo);
+        DxConst *c = &t->c[i];
+        strncpy(c->name, (const char *)(ctab + ci->name), sizeof c->name - 1);
+        c->name_va = dx_guest_str(c->name);
+        c->reg_set = ci->regset;
+        c->reg_index = ci->regindex;
+        c->reg_count = ci->regcount;
+        c->rows = ti->rows;
+        c->cols = ti->cols;
+        c->elements = ti->elements;
+        c->members = ti->members;
+        c->bytes = ti->rows * ti->cols * (ti->elements ? ti->elements : 1u) * 4u;
+        /* Copy the default out of the bytecode: the engine may free the shader
+         * blob after binding, and SetDefaults must still have valid data. */
+        if (ci->defval && !ti->members && c->bytes && c->bytes <= 64) {
+            uint32_t va = ka_guest_alloc(c->bytes, 4);
+            if (va) {
+                memcpy(ka_host(va), ctab + ci->defval, c->bytes);
+                c->default_va = va;
+            }
+        }
+    }
+    ka_log("d3dx: constant table: version=0x%08X constants=%u creator=%s",
+           t->version, t->count, t->creator_va ? (const char *)ka_host(t->creator_va) : "");
+    return t;
+}
+
+static DxConstTable *ct_self(void) {
+    Obj *o = self_obj();
+    return (o && o->kind == K_D3DXCT) ? (DxConstTable *)o->p : nullptr;
+}
+static int ct_index(uint32_t h) { return (h >= 1 && h <= 64) ? (int)(h - 1) : -1; }
+
+void ct_GetDesc() {                       /* D3DXCONSTANTTABLE_DESC *pDesc */
+    DxConstTable *t = ct_self();
+    uint32_t out = A32(0);
+    if (!t || !out) RET(t ? 0x8876086Cu : 0x8876086Cu, 1);
+    MEM32(out + 0) = t->creator_va;
+    MEM32(out + 4) = t->version;
+    MEM32(out + 8) = t->count;
+    RET(0, 1);
+}
+void ct_GetConstant() {                   /* hConstant, UINT Index */
+    DxConstTable *t = ct_self();
+    uint32_t idx = A32(1);
+    if (!t) RET(0, 2);
+    RET(idx < t->count ? idx + 1 : 0, 2);
+}
+void ct_GetConstantByName() {             /* hConstant, LPCSTR pName */
+    DxConstTable *t = ct_self();
+    const char *name = (const char *)P(A32(1));
+    if (!t || !name) RET(0, 2);
+    for (uint32_t i = 0; i < t->count; i++)
+        if (strcmp(t->c[i].name, name) == 0) RET(i + 1, 2);
+    RET(0, 2);
+}
+void ct_GetConstantElement() {            /* hConstant, UINT Index */
+    DxConstTable *t = ct_self();
+    uint32_t h = A32(0), idx = A32(1);
+    if (!t) RET(0, 2);
+    RET(idx == 0 ? h : 0, 2);
+}
+void ct_GetConstantDesc() {               /* hConstant, D3DXCONSTANT_DESC *pDesc, UINT *pCount */
+    DxConstTable *t = ct_self();
+    uint32_t h = A32(0), out = A32(1), countp = A32(2);
+    int idx = ct_index(h);
+    if (!t) RET(0x8876086Cu, 3);
+    if (idx < 0 || (uint32_t)idx >= t->count) {
+        if (countp) MEM32(countp) = 0;
+        RET(0x80070057u, 3);
+    }
+    if (out) {
+        DxConst &c = t->c[idx];
+        MEM32(out + 0)  = c.name_va;
+        MEM32(out + 4)  = c.reg_set;
+        MEM32(out + 8)  = c.reg_index;
+        MEM32(out + 12) = c.reg_count;
+        MEM32(out + 16) = c.rows;
+        MEM32(out + 20) = c.cols;
+        MEM32(out + 24) = c.elements;
+        MEM32(out + 28) = c.members;
+        MEM32(out + 32) = c.bytes;
+        MEM32(out + 36) = 0;               /* StructMemberInfo */
+        MEM32(out + 40) = c.default_va;
+    }
+    if (countp) MEM32(countp) = 1;
+    RET(0, 3);
+}
+void ct_GetSamplerIndex() { RET(0xFFFFFFFFu, 1); }   /* not a sampler */
+void ct_SetDefaults() { RET(0, 1); }
 
 /* ------------------------------------------------------------ vtable build */
 struct Slot { const char *name; recomp_func_t fn; };
@@ -1091,10 +1302,18 @@ static const Slot kSurface[] = {
     { nullptr, nullptr }
 };
 
+/* IDirect3DVertexBuffer9 / IDirect3DIndexBuffer9: IUnknown (3) +
+ * IDirect3DResource9 (8: GetDevice, Set/GetPrivateData, FreePrivateData,
+ * Set/GetPriority, PreLoad, GetType) = slot 11 belongs to the derived
+ * interface, and the header's declaration order is Lock, Unlock, GetDesc.
+ * With GetDesc first, the engine's Lock at [vtable+0x2C] (slot 11) landed on
+ * b_GetDesc, which returned D3DERR_INVALIDCALL for the zero desc pointer,
+ * so the engine's vertex-buffer fill took its release path and later wrote
+ * through a NULL pointer (crash at guest VA 0). */
 static const Slot kBuffer[] = {
-    S("GetDesc", b_GetDesc),
     S("Lock", b_Lock),
     S("Unlock", b_Unlock),
+    S("GetDesc", b_GetDesc),
     { nullptr, nullptr }
 };
 
@@ -1120,6 +1339,18 @@ static const Slot kQuery[] = {
     S("Issue", q_Issue),
     S("GetType", q_GetType),
     S("GetDataSize", q_GetDataSize),
+    { nullptr, nullptr }
+};
+
+/* ID3DXConstantTable, in d3dx9shader.h order after IUnknown. */
+static const Slot kConstTable[] = {
+    S("GetDesc", ct_GetDesc),
+    S("GetConstant", ct_GetConstant),
+    S("GetConstantByName", ct_GetConstantByName),
+    S("GetConstantElement", ct_GetConstantElement),
+    S("GetConstantDesc", ct_GetConstantDesc),
+    S("GetSamplerIndex", ct_GetSamplerIndex),
+    S("SetDefaults", ct_SetDefaults),
     { nullptr, nullptr }
 };
 
@@ -1230,6 +1461,14 @@ int ka_d3d9_init(void) {
         all[n].name = nullptr;
         build_vtable(K_QUERY, "q", nullptr, all);
     }
+    {
+        static Slot all[12];
+        int n = 0;
+        for (const Slot *s = kBase; s->name; s++, n++) all[n] = *s;
+        for (const Slot *s = kConstTable; s->name; s++, n++) all[n] = *s;
+        all[n].name = nullptr;
+        build_vtable(K_D3DXCT, "ct", nullptr, all);
+    }
     ka_log("d3d9: bridge ready (DXVK-native, Android WSI, %u shims)", ka_shim_count());
     return 0;
 }
@@ -1309,8 +1548,21 @@ int ka_d3dx_cube_from_memory(void) {
 }
 
 int ka_d3dx_constant_table(void) {
-    ka_log("d3dx: D3DXGetShaderConstantTable not implemented");
-    return (int)0x8876086Cu;
+    const uint8_t *code = (const uint8_t *)P(A32(0));
+    DxConstTable *t;
+    if (!code) {
+        if (A32(1)) MEM32(A32(1)) = 0;
+        return (int)0x8876086Cu;                 /* D3DERR_INVALIDCALL */
+    }
+    t = dx_parse_ctab(code);
+    if (!t) {
+        ka_log("d3dx: D3DXGetShaderConstantTable: no CTAB in bytecode %p (%u tokens)",
+               (const void *)code, dx_scanned);
+        if (A32(1)) MEM32(A32(1)) = 0;
+        return (int)0x8876086Cu;
+    }
+    if (A32(1)) MEM32(A32(1)) = new_token(K_D3DXCT, t, 0);
+    return 0;
 }
 
 } /* extern "C" */

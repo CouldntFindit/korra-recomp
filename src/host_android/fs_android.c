@@ -98,9 +98,20 @@ const char *ka_fs_resolve(const char *guest_path, char *out, size_t cap) {
 typedef struct { int fd; int used; } kfile;
 static kfile g_files[MAX_FILES];
 
+/* File tokens live in their own high range. They used to be small ints
+ * 1..MAX_FILES, the same space as kernel-object handles: the engine's two open
+ * CPKs took tokens 1 and 2, so its CloseHandle(1)/CloseHandle(2) destroyed
+ * mutex 1 and the file pool's wake event instead of the files. That pool could
+ * then never shut down (its final SetEvent had nothing to wake) and the boot
+ * ended in a SetEvent retry loop with no frame. Objects stay 1..256, find
+ * handles sit at 0x02000000, thread tokens at 0x1000 and up. */
+#define KA_FILE_TOKEN_BASE 0x01000000u
+
 static kfile *kf(uint32_t tok) {
-    uint32_t i = tok - 1;
-    if (tok == 0 || i >= MAX_FILES || !g_files[i].used) return NULL;
+    uint32_t i;
+    if (tok < KA_FILE_TOKEN_BASE) return NULL;
+    i = tok - KA_FILE_TOKEN_BASE;
+    if (i >= MAX_FILES || !g_files[i].used) return NULL;
     return &g_files[i];
 }
 
@@ -119,7 +130,7 @@ uint32_t ka_file_open(const char *guest_path) {
         if (!g_files[i].used) {
             g_files[i].used = 1;
             g_files[i].fd = fd;
-            return i + 1;
+            return KA_FILE_TOKEN_BASE + i;
         }
     }
     close(fd);
