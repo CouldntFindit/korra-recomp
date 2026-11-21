@@ -124,7 +124,14 @@ static void slot_dump(uint32_t h, uint32_t param) {
 }
 
 /* ------------------------------------------------------ critical sections */
-#define MAX_CS 256
+/* The engine initialises a critical section per object and does not delete it
+ * on the way up: a measured run called InitializeCriticalSection 239 times and
+ * InitializeCriticalSectionAndSpinCount 18 times with zero Delete calls, so a
+ * 256-slot table aborted the boot right after the frame loop started
+ * ("FATAL: out of critical sections"). Each slot is one pthread_mutex (a few
+ * dozen bytes), so the table is cheap; the guest keeps index+1 in its own
+ * CRITICAL_SECTION word, so the bound must stay below 65536. */
+#define MAX_CS 4096
 static pthread_mutex_t g_cs[MAX_CS];
 static int g_cs_used[MAX_CS];
 
@@ -392,8 +399,32 @@ static pthread_mutex_t *cs_of(uint32_t p) {
     return &g_cs[i - 1];
 }
 static void k_EnterCriticalSection(void) {
-    pthread_mutex_t *m = cs_of(A32(0));
-    if (m) pthread_mutex_lock(m);
+    uint32_t arg = A32(0);
+    pthread_mutex_t *m = cs_of(arg);
+    if (m) {
+        /* The uncontended case must not touch the machine lock. The contended
+         * case MUST release it: the guest thread that owns this critical
+         * section can only release it by running, and it cannot run while this
+         * thread holds the machine lock. That is the deadlock the watchdog
+         * caught (sub_00867E90 -> EnterCriticalSection(0xCA2034) parked in
+         * pthread_mutex_lock, frames resolved through the unstripped
+         * libkorra.so). guest_sleep_ms releases the whole recursion depth and
+         * re-enters the same way; the register file is saved to TLS on leave
+         * and reloaded on enter, so the shim's own state survives. */
+        if (pthread_mutex_trylock(m) != 0) {
+            extern int ka_spine_depth(void);
+            int depth = 0;
+            static int logged;
+            if (logged < 20) {
+                logged++;
+                ka_log("cs: contended slot=%u depth=%d esp=%08X fs=%08X",
+                       arg ? MEM32(arg) : 0, ka_spine_depth(), g_esp, g_fs_base);
+            }
+            while (ka_spine_depth() > 0) { mach_leave(); depth++; }
+            pthread_mutex_lock(m);
+            while (depth-- > 0) mach_enter();
+        }
+    }
     RETV(1);
 }
 static void k_LeaveCriticalSection(void) {
@@ -401,7 +432,22 @@ static void k_LeaveCriticalSection(void) {
     if (m) pthread_mutex_unlock(m);
     RETV(1);
 }
-static void k_DeleteCriticalSection(void) { RETV(1); }
+/* DeleteCriticalSection used to be a no-op, so the 256-slot table only ever
+ * filled: the engine creates and deletes a critical section per object (every
+ * texture and resource does), and the 257th InitializeCriticalSection aborted
+ * the run right after the fifth Present. The slot must be recycled; the guest
+ * writes the slot index into the CRITICAL_SECTION it owns, so clear that word
+ * too - a later Enter on the deleted object then finds no mutex and is a
+ * no-op instead of a lock on a destroyed one. */
+static void cs_release(uint32_t p) {
+    uint32_t i = p ? MEM32(p) : 0;
+    if (!i || i > MAX_CS || !g_cs_used[i - 1]) return;
+    if (pthread_mutex_destroy(&g_cs[i - 1]))
+        ka_log("cs: destroy failed slot=%u (still locked?)", i);
+    g_cs_used[i - 1] = 0;
+    if (p) MEM32(p) = 0;
+}
+static void k_DeleteCriticalSection(void) { cs_release(A32(0)); RETV(1); }
 /* Shared body: k_InitCSAndSpin and InitializeCriticalSectionEx differ only in
  * the flags argument the guest also pushes, so each wrapper does its own RET. */
 static int cs_init_at(uint32_t p) {

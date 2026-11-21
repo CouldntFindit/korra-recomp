@@ -123,6 +123,11 @@ uint32_t ka_thread_attach(const char *why) {
 void ka_thread_detach(void) { /* stacks are freed with the process */ }
 
 static volatile uint32_t g_wd_fs, g_wd_depth;
+/* The machine holder's pthread, so the stall probe interrupts the thread that
+ * is actually spinning instead of the idle main thread (a probe that sampled
+ * main reported 20 frames of a blocked waiter and named nothing). */
+static volatile uintptr_t g_wd_pt;
+static __thread uintptr_t g_my_pt;
 
 void mach_enter(void) {
     pthread_mutex_lock(&g_mach);
@@ -138,6 +143,8 @@ void mach_enter(void) {
          * writes is harmless. */
         g_wd_fs = g_ts.fs;
         g_wd_depth = g_ts.depth;
+        if (!g_my_pt) g_my_pt = (uintptr_t)pthread_self();
+        g_wd_pt = g_my_pt;
         /* One line per host thread the first time it gets the machine: with
          * five workers parked in mach_enter and the main thread spinning, this
          * says whether the hand-over never happens (no worker line) or the
@@ -295,9 +302,35 @@ static void ka_stall_mask_log(const char *what, pid_t tid) {
 
 static void ka_stall_probe_fire(void) {
     int r;
-    if (!g_main_pt) { ka_log("stall: probe has no main thread"); return; }
+    pthread_t target;
+    /* Read the guest stack the holder is sitting on. The lifted frame tick
+     * sub_00867E90 pushes ebx/esi/edi and its critical-section argument, so at
+     * loop level [esp]=0x00CA2034, [esp+4]=saved edi, [esp+8]=saved esi,
+     * [esp+0xC]=saved ebx (iterations still to run), [esp+0x10]=return VA.
+     * g_esp is a GUEST VA: the read must go through MEM32 (guest window), never
+     * through the number as a host pointer. Doing that once took a signal 11 in
+     * the watchdog, addr == esp (see the 2026-11-21 ledger entry). */
+    {
+        uint32_t esp = g_esp, i;
+        if (esp >= 0xC0000000u && esp <= 0xD0000000u) {
+            ka_log("stk: esp=%08X [0]=%08X [1]=%08X [2]=%08X [3]=%08X [4]=%08X",
+                   esp, MEM32(esp), MEM32(esp + 4), MEM32(esp + 8),
+                   MEM32(esp + 12), MEM32(esp + 16));
+            if (MEM32(esp) == 0x00CA2034u) {
+                ka_log("stk: frame-tick level ebx(left)=%u edi(this)=%08X ret=%08X",
+                       MEM32(esp + 12), MEM32(esp + 4), MEM32(esp + 16));
+                for (i = 5; i < 13; i++)
+                    ka_log("stk: +%02X = %08X", i * 4, MEM32(esp + i * 4));
+            }
+        } else {
+            ka_log("stk: esp=%08X not a guest stack", esp);
+        }
+    }
+    target = g_wd_pt ? (pthread_t)g_wd_pt : g_main_pt;
+    if (!target) { ka_log("stall: probe has no thread"); return; }
+    ka_log("stall: probe target=%s", g_wd_pt ? "holder" : "main");
     g_stall_n = 0;
-    r = pthread_kill(g_main_pt, SIGURG);
+    r = pthread_kill(target, SIGURG);
     {
         struct timespec ts = { 0, 20 * 1000 * 1000 };
         nanosleep(&ts, NULL);
