@@ -640,8 +640,20 @@ a quiet laptop speaker and obvious on anything else.
   CreateMasteringVoice(2 ch) -> RegisterForCallbacks -> GetDeviceDetails ->
   CreateSourceVoice(2 ch float mask 0x3) -> Start` from `0x0073EC80`. After
   that: no submit, no `GetState`, no destroy, for the rest of the run. An
-  XAudio2 source voice is push-only, so no event means no audio, and no event is
-  ever posted on a screen this build can reach.
+  XAudio2 source voice is push-only, so a voice that is never fed stays silent.
+* **Correction (2026-11-22): an event *does* start - the block is inside Wwise,
+  not at event posting.** In the 440 s menu/gameplay run
+  (`korra_host-20261122-000318.log`) the guest opens two streamed Wwise files at
+  the end of the boot trace, exactly when the logo movies end and the title
+  screen comes up: `sound\stream\128216764.wem` (894520 B) and
+  `sound\stream\678887150.wem` (811418 B). `tools\audio_inventory.py wem` reads
+  both as Wwise Vorbis **4 ch 32000 Hz, 30.00/30.01 s**. A streamed .wem is only
+  opened by a running event's stream manager, so Wwise is asked to play; its
+  output voice still receives nothing. Two caveats, both measured: the file
+  trace stops after 65 `CreateFileA` calls (`quirk_probe.c`), so later opens are
+  invisible, and the same folder holds `1012706428.wem` (2,985,979 B, Wwise
+  Vorbis 4 ch 48000 Hz **94.88 s**) - the `bgm_cs41_skip` intro-cutscene stream,
+  which a working cutscene must feed through this voice.
 * **The Wwise banks do load, from plain files in `GameData\sound\`.** A
   `KORRA_TRACE_FILE=1` run (`korra_host-20261121-233246.log`) shows the guest
   opening `GameData\data000.cpk`, `GameData\data001.cpk`, then
