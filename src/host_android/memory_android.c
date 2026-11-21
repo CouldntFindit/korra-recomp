@@ -263,8 +263,63 @@ void ka_pool_dump(const char *tag) {
            pool_u32(m + 0x10), cell, pool_u32(m + 0x18), pool_u32(m + 0x1C),
            pool_u32(m + 0x20), pool_u32(m + 0x44), pool_u32(m + 0x48),
            pool_u32(m + 0x4C));
+    /* sub_00847BB0 rep-movsd's the caller's struct (0xDB8AE8) over 0xCA1FCC,
+     * and cfg+0xC (CA1FD8) is the pool size the next step asks for: 0x300000
+     * from the caller, or 0x01000000 from sub_008479C0 when arg1 was NULL.
+     * The record array sub_00829140 fills says whether the request got as far
+     * as a pool record. Together they separate "the copy did not land" from
+     * "the allocator refused". */
+    {
+        char line[400];
+        int n = snprintf(line, sizeof line, "%s cfg=", tag);
+        uint32_t i;
+        for (i = 0; i < 14 && n > 0 && n < (int)sizeof line - 16; i++)
+            n += snprintf(line + n, sizeof line - (size_t)n, "%x:%08X ",
+                          i * 4, pool_u32(0xCA1FCC + i * 4));
+        ka_log("%s", line);
+        ka_log("%s pools ready=%02X n=%u cap=%u arr=%08X", tag,
+               pool_u32(0xCA1EF4) & 0xFFu, pool_u32(0xCA1EEC),
+               pool_u32(0xCA1EE8), pool_u32(0xCA1EF0));
+        {
+            uint32_t arr = pool_u32(0xCA1EF0);
+            for (i = 0; arr && pool_ok(arr) && i < 5; i++) {
+                uint32_t r = arr + i * 0x48u;
+                ka_log("%s rec[%u] %08X chunk=%08X end=%08X mode=%08X "
+                       "gran=%08X size=%08X", tag, i, r, pool_u32(r),
+                       pool_u32(r + 8), pool_u32(r + 0xC), pool_u32(r + 0x18),
+                       pool_u32(r + 0x1C), pool_u32(r + 0x44));
+            }
+        }
+        /* The caller's struct 0x7657D0 prepares (0xDB8AE8) versus a window
+         * around 0xCA1FCC, the destination of the rep movsd at 0x847C24.
+         * Both ends in one line pair: if the source is filled and the window
+         * holds no copy of it, the string move never wrote; if the pattern
+         * sits at a shifted address, the destination is off. */
+        {
+            char src[300], win[300];
+            int ns = snprintf(src, sizeof src, "%s src=", tag);
+            int nw = snprintf(win, sizeof win, "%s win=", tag);
+            uint32_t a;
+            for (i = 0; i < 14 && ns > 0 && ns < (int)sizeof src - 12; i++)
+                ns += snprintf(src + ns, sizeof src - (size_t)ns, "%x:%08X ",
+                               i * 4, pool_u32(0xDB8AE8 + i * 4));
+            ka_log("%s", src);
+            /* 0xCA1F40..0xCA2040: covers a copy shifted by up to 0x8C bytes
+             * in either direction from 0xCA1FCC. */
+            for (a = 0xCA1F40; a < 0xCA2060 && nw > 0; a += 0x30) {
+                nw = snprintf(win, sizeof win, "%s win %08X:", tag, a);
+                for (i = 0; i < 12 && nw > 0 && nw < (int)sizeof win - 12; i++)
+                    nw += snprintf(win + nw, sizeof win - (size_t)nw, " %08X",
+                                   pool_u32(a + i * 4));
+                ka_log("%s", win);
+            }
+            ka_log("%s tail CA2004=%08X 9B4394=%08X 9B4388=%08X 9B438C=%08X",
+                   tag, pool_u32(0xCA2004), pool_u32(0x9B4394),
+                   pool_u32(0x9B4388), pool_u32(0x9B438C));
+        }
+    }
     if (!pool_ok(cell)) {
-        ka_log("%s fallback cell=%08X <none> (16 MB can only come from a0)",
+        ka_log("%s fallback cell=%08X <none> (no fallback allocator)",
                tag, cell);
         pool_dump_obj(tag, "a0", pool_u32(m));
         return;
