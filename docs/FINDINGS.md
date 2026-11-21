@@ -2953,3 +2953,64 @@ screen capture, first-area fps, SAF install. Nothing was re-tested on Windows
 after these fixes.
 
 Committed: c2d05d0 (shims), 56df681 (probes).
+
+## 2026-11-22 - M4 audio acceptance with gameplay: the cutscene is a CRI movie, Wwise is still never fed
+
+Scope: `docs/audio.md` 9.4 tests 2-7, re-run with real gameplay on
+`build\run_m4c.exe` (SHA256 `7C286C2251CE8968E3E9F6D02129AA56DD03049BBC7D0E7AFC299D5131528DC7`).
+No host behaviour was changed; one logging line was added to
+`src/host/xaudio2_stub.c` (`GetState` polls at verbose 2, `459a201`).
+
+**The route, which is why tests 3-6 were "BLOCKED".** Every run ever made pressed
+A on the STORY submenu's first item, which is `Continue` - a save exists from the
+first play session, so the boot's auto-save notice is not a warning, it is a
+fact. Continue loads a checkpoint at the tutorial and never plays the intro.
+New Game is the second item: `DOWN` (0x0002), `A`, then the confirm dialog
+("Starting a New Game will reset your game progress, results, and Collection
+data. Are you sure?", YES/NO) defaults to **NO**, so `LEFT` (0x0004) then `A`,
+then the difficulty screen, then `A`. Recorded in `docs/audio.md` 10.6.
+
+**Measured, two runs (g4 181 s, g5 408 s; dumps `work\g4_newgame.wav`,
+`work\g5_area.wav`, 16-bit 48 kHz stereo, half-second blocks with a -70 dBFS
+gate):**
+
+- boot movies 0-24 s, peak -9.77 dBFS;
+- menu 25-78.5 s: **exact silence** (test 2 still FAIL);
+- intro cutscene 79-103.5 s (g4) / 77.5-103.5 s (g5): **24.5 / 26.0 s continuous,
+  peak -7.09 dBFS, RMS ~-31 dBFS** - the first non-silent gameplay-phase audio in
+  the port, and it comes from **CRI's 6 ch float movie device** through the
+  engine's own 6x2 matrix (CreateSourceVoice 6 ch at 80.19 s, first submit
+  80.72 s, destroyed 106.7 s). The 5.1 path is therefore measured, not argued;
+- everything after 104 s: exact silence for 300 s, no audio call at all. A device
+  is created at 109.87 s and destroyed 44 ms later without a source voice.
+
+**Decisive for 10.5:** the cutscene music is not `bgm_cs41_skip`. The 94.88 s
+stream `GameData\sound\stream\1012706428.wem` is never opened; the cutscene is a
+movie. And Wwise voice #1 (2 ch float, created 0.2 s, started 3.2 s from
+`0x0073E700`) receives **no `SubmitSourceBuffer`, no `Start`, and now with the new
+logging, no `GetState` at all** across menus (35-78 s), the cutscene (80-106 s)
+and 300 s after it. Wwise opens two 30 s streamed `.wem` files when the title
+appears (`128216764`, `678887150`), so events do run - the break is between
+Wwise's renderer and the voice the host provides.
+
+**Underruns:** 1 at boot, 2 at 81 s, **89 by 104 s** and constant after - 63
+`ran dry` lines between 83.8 and 106.5 s. The movie feed submits 800-frame
+buffers (16.7 ms) from a GetState loop running at the guest's ~20 fps against a
+1056-frame device buffer.
+
+**New Game does not reach the first area in this build.** After the cutscene the
+frame is pure black (mean 0.0, pixel-identical) at 134/160/185 s and at
+131/312/412 s; 17 A presses over 280 s change nothing; the guest's audio thread
+still calls `CommitChanges` ~50/s, so the process is alive; the scene probe stays
+at `flow=0x9 inst=0x1 step=0xFFFFFFFF mode=0` with the pool climbing 63 -> 91 and
+stopping. The Resume path does reach a tutorial area (dark screen, `Jump` hint),
+which is what the perf session measured as "first area".
+
+**Open, not mine to fix here:** the current build + `KORRA_PAD_AUTO` freezes the
+guest at t=54-55 s (tick 0/s, natcalls 0, all 24 guest threads parked in ntdll
+waits, sink thread alive), while the 470ab9e copy `build\run_perf.exe` survives
+the same input to 300 s (and, with START every 9 s, backs out of gameplay to the
+main menu). Not an ExitProcess (`exit_probe` printed nothing) and no fault line.
+
+Committed: 459a201 (GetState logging), 5d0698e (`docs/audio.md` 10.5, 10.5.1,
+10.6).
