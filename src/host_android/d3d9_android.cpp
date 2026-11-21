@@ -1711,6 +1711,110 @@ static int dds_upload(IDirect3DDevice9 *dev, const uint8_t *data, uint32_t size,
     return (int)hr;
 }
 
+/* DDS cube upload: the same header walk as dds_upload, plus the six-face
+ * payload. A DDS cube stores +X, -X, +Y, -Y, +Z, -Z back to back and each face
+ * carries its own mip chain, so face n starts after every mip of face n-1.
+ *
+ * Why this exists (2026-11-22): the engine resolves its technique table from
+ * pre_texture.wta/.wtp at boot, and one of those fifteen entries is a cube map.
+ * With no cube entry point the shim answered D3DERR_INVALIDCALL, the table
+ * build failed silently, [0xE4CCF4]/[0xE4CCF8] stayed {0,0}, the recorder
+ * (sub_00550280 at 0x5502FF) then passed NULL where it wanted entry 11, and
+ * the flush at sub_007492B0 faulted reading [NULL+4]. */
+static uint32_t dds_mip_bytes(uint32_t w, uint32_t h, const uint32_t *pf) {
+    if (pf[0] & 4u) {                    /* D3DDPF_FOURCC: block-compressed */
+        uint32_t block = (pf[1] == 0x31545844u /* 'DXT1' */) ? 8u : 16u;
+        return ((w + 3u) / 4u) * ((h + 3u) / 4u) * block;
+    }
+    {
+        uint32_t bpp = pf[2] ? pf[2] : 32u;
+        return (((w * bpp) + 31u) / 32u) * 4u * h;
+    }
+}
+
+static int dds_upload_cube(IDirect3DDevice9 *dev, const uint8_t *data, uint32_t size,
+                           uint32_t edge, uint32_t format, D3DPOOL pool,
+                           IDirect3DCubeTexture9 **out) {
+    const uint32_t *hdr = (const uint32_t *)(data + 4);
+    const uint32_t *pf = hdr + 19;
+    uint32_t w = edge, offset = 128, mips, face, level, avail, bytes;
+    IDirect3DCubeTexture9 *t = nullptr, *staging = nullptr, *dst;
+    HRESULT hr;
+
+    if (size < 128 || memcmp(data, "DDS ", 4) != 0) {
+        ka_log("d3dx: dds cube reject size=%u magic=%02X%02X%02X%02X", size,
+               unsigned(size > 3 ? data[0] : 0), unsigned(size > 3 ? data[1] : 0),
+               unsigned(size > 3 ? data[2] : 0), unsigned(size > 3 ? data[3] : 0));
+        return (int)0x8876086Cu;
+    }
+    if (!w || w == 0xFFFFFFFFu) w = hdr[3];            /* Size = the header's width */
+    if (format == 0) {
+        if (pf[0] & 4u)
+            format = pf[1];
+        else if (pf[0] & 0x40u)
+            format = pf[2] == 32u ? ((pf[0] & 1u) ? D3DFMT_A8R8G8B8 : D3DFMT_X8R8G8B8)
+                   : pf[2] == 24u ? D3DFMT_R8G8B8 : D3DFMT_R5G6B5;
+    }
+    /* DDSCAPS2_CUBEMAP (0x200) is at header offset 112 -> dword 27. A 2D file
+     * reaching the cube entry point is refused as D3DX does. */
+    if (!w || !(hdr[27] & 0x200u)) {
+        ka_log("d3dx: dds cube refuse w=%u caps2=%08X fmt=%u", w, hdr[27], format);
+        return (int)0x8876086Cu;
+    }
+    mips = hdr[6] ? hdr[6] : 1u;
+    ka_log("d3dx: dds cube %ux%u mips=%u pf=%08X fourcc=%08X bits=%u -> fmt=%u pool=%u",
+           hdr[3], hdr[3], mips, pf[0], pf[1], pf[2], format, (unsigned)pool);
+
+    /* Level count 1, matching dds_upload: only the top level is filled, and
+     * creating the mips unfilled would hand the sampler garbage. */
+    hr = dev->CreateCubeTexture(w, 1, 0, (D3DFORMAT)format, pool, &t, nullptr);
+    if (FAILED(hr)) {
+        ka_log("d3dx: CreateCubeTexture %ux%u fmt=%u pool=%u -> 0x%08X",
+               w, w, format, (unsigned)pool, (unsigned)hr);
+        return (int)hr;
+    }
+    dst = t;
+    if (pool == D3DPOOL_DEFAULT || pool == D3DPOOL_SCRATCH) {
+        hr = dev->CreateCubeTexture(w, 1, 0, (D3DFORMAT)format, D3DPOOL_SYSTEMMEM,
+                                    &staging, nullptr);
+        if (FAILED(hr)) {
+            ka_log("d3dx: staging CreateCubeTexture -> 0x%08X", (unsigned)hr);
+            t->Release();
+            return (int)hr;
+        }
+        dst = staging;
+    }
+    for (face = 0; face < 6 && SUCCEEDED(hr); face++) {
+        D3DSURFACE_DESC desc{};
+        D3DLOCKED_RECT lr{};
+        dst->GetLevelDesc(0, &desc);
+        hr = dst->LockRect((D3DCUBEMAP_FACES)face, 0, &lr, nullptr, 0);
+        if (FAILED(hr)) {
+            ka_log("d3dx: cube LockRect face %u pool=%u -> 0x%08X",
+                   face, (unsigned)pool, (unsigned)hr);
+            break;
+        }
+        bytes = lr.Pitch * desc.Height;
+        avail = size > offset ? size - offset : 0;
+        memcpy(lr.pBits, data + offset, bytes < avail ? bytes : avail);
+        dst->UnlockRect((D3DCUBEMAP_FACES)face, 0);
+        for (level = 0; level < mips; level++) {
+            uint32_t mw = w >> level, mh = w >> level;
+            offset += dds_mip_bytes(mw ? mw : 1u, mh ? mh : 1u, pf);
+        }
+    }
+    if (SUCCEEDED(hr) && staging) hr = dev->UpdateTexture(staging, t);
+    if (staging) staging->Release();
+    if (FAILED(hr)) {
+        ka_log("d3dx: cube upload %ux%u fmt=%u failed 0x%08X",
+               w, w, format, (unsigned)hr);
+        t->Release();
+        return (int)hr;
+    }
+    *out = t;
+    return 0;
+}
+
 /* D3DXCreateTextureFromFileInMemoryEx:
  * device, src, size, w, h, levels, usage, format, pool, filter, mipfilter,
  * colorkey, srcinfo, palette, out */
@@ -1729,8 +1833,22 @@ int ka_d3dx_texture_from_memory(void) {
 }
 
 int ka_d3dx_cube_from_memory(void) {
-    ka_log("d3dx: D3DXCreateCubeTextureFromFileInMemoryEx not implemented");
-    return (int)0x8876086Cu;
+    Obj *dev = obj_of(A32(0));
+    IDirect3DCubeTexture9 *t = nullptr;
+    int hr;
+    if (!dev || dev->kind != K_DEVICE) return (int)0x8876086Cu;
+    hr = dds_upload_cube(reinterpret_cast<IDirect3DDevice9 *>(dev->p),
+                         (const uint8_t *)P(A32(1)), A32(2), A32(3),
+                         (uint32_t)A32(6), (D3DPOOL)A32(7), &t);
+    if (FAILED(hr))
+        ka_log("d3dx: CubeTextureFromFileInMemoryEx failed 0x%08X (size %u)",
+               (unsigned)hr, A32(2));
+    /* ppCubeTexture is the last argument and the 2D entry point's minus one:
+     * this signature has no height. Returning the token in EAX instead (the
+     * mistake that cost the DirectInput shim a run) leaves the engine's slot
+     * at 0 while the HRESULT says S_OK. */
+    if (A32(13)) MEM32(A32(13)) = SUCCEEDED(hr) && t ? new_token(K_CUBETEX, t, A32(0)) : 0;
+    return hr;
 }
 
 int ka_d3dx_constant_table(void) {
