@@ -1571,29 +1571,79 @@ int ka_d3dx_create_texture(void) {
 static int dds_upload(IDirect3DDevice9 *dev, const uint8_t *data, uint32_t size,
                       uint32_t width, uint32_t height, D3DFORMAT format, D3DPOOL pool,
                       IDirect3DTexture9 **out) {
-    uint32_t w = width, h = height, levels = 1, offset = 128;
-    IDirect3DTexture9 *t = nullptr;
+    uint32_t w = width, h = height, offset = 128;
+    const uint32_t *hdr = (const uint32_t *)(data + 4);
+    const uint32_t *pf = hdr + 19;      /* DDS_PIXELFORMAT: flags, fourcc, bits, masks */
+    IDirect3DTexture9 *t = nullptr, *staging = nullptr;
     HRESULT hr;
-    if (size < 128 || memcmp(data, "DDS ", 4) != 0) return (int)0x8876086Cu;
-    {
-        const uint32_t *hdr = (const uint32_t *)(data + 4);
-        uint32_t hgt = hdr[2], wid = hdr[3];
-        if (!w) w = wid;
-        if (!h) h = hgt;
+    /* Which branch refuses, and with what: the engine's D3DX call is the same
+     * 15-argument shape on both platforms, so a refusal here has to be named
+     * by our own shim's arguments, not guessed from the guest register dump. */
+    if (size < 128 || memcmp(data, "DDS ", 4) != 0) {
+        ka_log("d3dx: dds reject size=%u magic=%02X%02X%02X%02X", size,
+               unsigned(size > 3 ? data[0] : 0), unsigned(size > 3 ? data[1] : 0),
+               unsigned(size > 3 ? data[2] : 0), unsigned(size > 3 ? data[3] : 0));
+        return (int)0x8876086Cu;
     }
+    /* D3DX_DEFAULT (0xFFFFFFFF) means "take it from the file", and so does a
+     * zero; the engine passes D3DX_DEFAULT for both axes and D3DFMT_UNKNOWN
+     * for the format. Forwarding them verbatim made CreateTexture see
+     * 4294967295x4294967295 with fmt=0 and answer D3DERR_INVALIDCALL - the
+     * measured refusal behind the sub_0053C630 fault (3 textures per boot,
+     * docs/FINDINGS.md 2026-11-21). */
+    if (!w || w == 0xFFFFFFFFu) w = hdr[3];
+    if (!h || h == 0xFFFFFFFFu) h = hdr[2];
+    /* DDS_PIXELFORMAT dwords: 0 flags, 1 fourcc, 2 bit count, 3..5 RGB masks. */
+    if ((uint32_t)format == 0) {
+        if (pf[0] & 4u)
+            format = (D3DFORMAT)pf[1];              /* DXT1/3/5 fourcc IS the D3DFORMAT */
+        else if (pf[0] & 0x40u)
+            format = pf[2] == 32u ? ((pf[0] & 1u) ? D3DFMT_A8R8G8B8 : D3DFMT_X8R8G8B8)
+                   : pf[2] == 24u ? D3DFMT_R8G8B8 : D3DFMT_R5G6B5;
+    }
+    ka_log("d3dx: dds %ux%u mips=%u pf=%08X fourcc=%08X bits=%u -> w=%u h=%u fmt=%u pool=%u",
+           hdr[3], hdr[2], hdr[6], pf[0], pf[1], pf[2], w, h, (unsigned)format, (unsigned)pool);
+    if (!w || !h) return (int)0x8876086Cu;
     hr = dev->CreateTexture(w, h, 1, 0, format, pool, &t, nullptr);
-    if (FAILED(hr)) return (int)hr;
+    if (FAILED(hr)) {
+        ka_log("d3dx: CreateTexture %ux%u fmt=%u pool=%u -> 0x%08X",
+               w, h, (unsigned)format, (unsigned)pool, (unsigned)hr);
+        return (int)hr;
+    }
+    /* A DEFAULT- or SCRATCH-pool texture cannot be locked. Fill a SYSTEMMEM
+     * copy and let UpdateTexture move it, which is what D3DX itself does. */
     {
+        IDirect3DTexture9 *dst = t;
+        if (pool == D3DPOOL_DEFAULT || pool == D3DPOOL_SCRATCH) {
+            hr = dev->CreateTexture(w, h, 1, 0, format, D3DPOOL_SYSTEMMEM, &staging, nullptr);
+            if (FAILED(hr)) {
+                ka_log("d3dx: staging CreateTexture -> 0x%08X", (unsigned)hr);
+                t->Release();
+                return (int)hr;
+            }
+            dst = staging;
+        }
         D3DSURFACE_DESC desc{};
         D3DLOCKED_RECT lr{};
-        t->GetLevelDesc(0, &desc);
-        hr = t->LockRect(0, &lr, nullptr, 0);
+        dst->GetLevelDesc(0, &desc);
+        hr = dst->LockRect(0, &lr, nullptr, 0);
         if (SUCCEEDED(hr)) {
             uint32_t bytes = lr.Pitch * desc.Height;
-            uint32_t avail = size - offset;
+            uint32_t avail = size > offset ? size - offset : 0;
             memcpy(lr.pBits, data + offset, bytes < avail ? bytes : avail);
-            t->UnlockRect(0);
+            dst->UnlockRect(0);
+        } else {
+            ka_log("d3dx: LockRect pool=%u -> 0x%08X", (unsigned)pool, (unsigned)hr);
         }
+        if (staging) {
+            if (SUCCEEDED(hr)) hr = dev->UpdateTexture(staging, t);
+            staging->Release();
+        }
+    }
+    if (FAILED(hr)) {
+        ka_log("d3dx: upload %ux%u fmt=%u failed 0x%08X", w, h, (unsigned)format, (unsigned)hr);
+        t->Release();
+        return (int)hr;
     }
     *out = t;
     return (int)hr;

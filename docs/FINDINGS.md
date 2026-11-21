@@ -2445,3 +2445,31 @@ a live run so far is either black or the launcher (the app exits during
 the run). The game still stops at thirteen presents; the frame burst is
 not yet a frame loop, so the 30 fps default and the touch->XInput mapping
 are untouched. Tested on the owner's S24 only (`<device-serial>`).
+
+## 2026-11-21 - M3: D3DX puts D3DX_DEFAULT in Width/Height, and the shim forwarded it
+
+`d3dx: TextureFromFileInMemoryEx failed 0x8876086C` was ours, not the engine's.
+Three boot textures (256x256 DXT1 43,832 B, 1024x1024 DXT5 1,048,704 B, 128x128
+DXT5 16,512 B) are loaded with Width = Height = D3DX_DEFAULT (0xFFFFFFFF),
+Format = D3DFMT_UNKNOWN (0) and Pool = D3DPOOL_DEFAULT (1). The shim passed all
+four straight to `CreateTexture`, which answered D3DERR_INVALIDCALL for a
+4294967295x4294967295 zero-format texture.
+
+Fix in `src/host_android/d3d9_android.cpp` (`dds_upload`): D3DX_DEFAULT and 0 in
+Width/Height now mean "take it from the DDS header"; a zero Format is derived
+from the header's pixelformat (DDPF_FOURCC -> the fourcc *is* the D3DFORMAT,
+DDPF_RGB -> A8R8G8B8/X8R8G8B8/R8G8B8/R5G6B5); DEFAULT/SCRATCH pools upload
+through a SYSTEMMEM staging texture and `UpdateTexture`, because a default-pool
+texture cannot be locked. The header fields are read at `hdr+19`
+(dwFlags, dwFourCC, dwRGBBitCount) - an earlier attempt read `hdr+20` and kept
+`fmt=0`, which is how the off-by-one was found.
+
+Proof, one device run (`logs/log12.txt`, 44 s): `TextureFromFileInMemoryEx
+failed = 0`, `dds 256x256 mips=9 pf=00000004 fourcc=31545844 -> w=256 h=256
+fmt=827611204 pool=1` (DXT1), `1024x1024 ... fmt=894720068` (DXT5),
+`256x16 pf=00000041 bits=32 -> fmt=21` (A8R8G8B8); `crash = 2`, `dev:17 = 13`,
+`wd: stalled = 0`, `heap exhausted = 0`, `obj: entry = 0`.
+
+Not verified: no title screen or menu is identifiable in `logs/s3.png` yet; the
+crash that follows (below) is a separate defect; the cube/volume texture vtables
+are still absent and this path did not mint one.
