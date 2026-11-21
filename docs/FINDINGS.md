@@ -2123,3 +2123,135 @@ device, not the request. The candidate branches are now:
 - The ~326 MB of giants is normal engine behaviour: Windows allocates the same
   four sizes (0x05200000, 0x00A40000, 0x04FA0000, 0x09A20000) through the real
   OS, so no shim is inflating a size.
+
+## 2026-11-21 - M3 graphics-init abort: it is CPUID, not the allocator (0x4C, not 0x34)
+
+**One line:** the device aborted framework start at `0x847BDE` - "this CPU has
+no SSE" - because `CPUID_impl` was a no-op on non-MSVC hosts. With
+`pcrecomp` Korra-0010 (`09b3465`) framework start returns 3, the 3 MB pool is
+created exactly as on Windows, and `dev:17 Present` runs for the first time on
+the phone.
+
+### The abort code was never 0x34
+
+`sub_00847BB0` has four exits, and only the last one needs the pool:
+
+```
+00847BCA  call 0x871D90            ; singleton at 0xCA2424
+00847BCF  call [eax]  slot 1 with (1)
+00847BDB  test al,al / jne 0x847BE7
+00847BDE    mov eax,0x4C ; ret     ; slot 1 answered 0
+00847BE7  call 0x828F90 / test al,al
+00847BF0    mov eax,0x4A ; ret     ; byte [0xCA1EF4] == 0  (device: 01)
+00847BF9  cmp dword [0xCA2990],0
+00847C02    mov eax,0x4B ; ret     ; 0xCA2990 == 0          (device: 21EE9028)
+00847C23  rep movsd 0xE dwords, 0xDB8AE8 -> 0xCA1FCC   ; <- never executed
+00847C48  cmp byte [0xCA2020],0 / jne 0x847C98
+00847C56  call 0x008478C0 (step 1) ; 0x34 only when THIS create fails
+```
+
+On the device the three `post:` dumps per run showed `CA1EF4=01` and
+`CA2990=21EE9028`, so 0x4A and 0x4B are out; `9B4390` stayed `FFFFFFFF`, so the
+0x34 exit was never reached either. The remaining exit is **0x4C**, and the
+structural proof is the struct copy: at the post anchor the device's `cfg=`
+block (`0xCA1FCC`, 14 dwords) was **all zeros** while the caller's `src=`
+(`0xDB8AE8`) was fully prepared - `0,FF,FF,300000,3F800000,40000,FFFFFFFF,0,1,
+40000,10000,0,0,0`. A scan of the whole 0xCA1F40..0xCA2060 window found no copy
+of it anywhere. The lifted `rep movsd` (recomp_0056.c, `_df = 1`, plain
+`memmove`) is correct, so the copy simply was not reached: execution left at
+one of the three early-outs.
+
+The previous entry's allocator analysis is therefore a **red herring for this
+blocker**: the pool create was never called on the device, and Windows' 16 MB
+vs 3 MB question never arose. The allocator facts stay in the ledger because
+they are correct and step 1 will need them the moment something fails later.
+
+### What 0x4C tests
+
+`0x871D90` lazily builds a CPU-information object at `0xCA2424`
+(vtable `0x91D994`, guard dword `0xCA2434`). `sub_00871C60` zeroes `+4/+8/+0xC`
+and then executes `cpuid` leaves 0, 1, `0x80000000`, `0x80000006`. Slot 1
+(`0x00871D70`) is four instructions wide:
+
+```
+mov eax,[ecx+4] ; and eax,[ebp+8] ; neg eax ; sbb eax,eax ; neg eax ; ret 4
+```
+
+i.e. `return (feature_word & mask) != 0`. Framework start calls it with
+mask 1, and bit 0 is set by `test edx,0x02000000` (CPUID.1.EDX bit 25, SSE);
+bits 1/2/3 come from SSE2 (EDX 26), SSE3 (ECX 0) and SSSE3 (ECX 9).
+
+### Root cause
+
+`runtime/recomp32/recomp_types.h`, `CPUID_impl`:
+
+```c
+#ifdef _MSC_VER
+    __cpuidex(info, eax_val, ecx_val); ...
+#else
+    (void)eax_val; (void)ebx_val; (void)ecx_val; (void)edx_val;   /* nothing */
+#endif
+```
+
+On arm64 the guest's registers kept their inputs, so leaf 0 returned
+max-leaf 0, `sub_00871C60` skipped leaf 1 (`jl 0x871CC9`), the feature word
+stayed 0, and slot 1 answered 0. The Windows host never saw this because it
+runs the real `cpuid`.
+
+### Fix (pcrecomp Korra-0010, `09b3465`)
+
+The non-MSVC branch now answers like a 2008-era Intel x86: vendor leaf 0
+(max leaf 0xC), leaf 1 (`family 6 model 60`, EDX `0x078BFBFF` -
+FPU..CMOV, MMX, FXSR, SSE, SSE2; ECX `0x00980201` - SSE3, SSSE3, SSE4.1,
+SSE4.2, POPCNT), leaf 7 empty, `0x80000000` = `0x80000008`, `0x80000001` =
+SYSCALL|NX|LM, brand string, `0x80000006` = 1 MB L2 / 64 B line. No CX16 and
+no AVX (neither is lifted). The `g_cpuid_*` masks still apply, so a port can
+force the older paths. LoK contains no `pmulld`/`pblendvb`/`popcnt`/`crc32`
+sites at all, so the advertised set only steers branches that are already
+lifted; SSE4.2 is advertised because Windows takes the CRT's
+`pcmpistri` path, which Korra-0004 already fixed.
+
+### Device evidence after the fix (run 2026-11-21 16:17)
+
+Same build, same APK path, one `android_run.ps1 -Seconds 25 -NoGameCopy`:
+
+- `post: 9B4390=00000003 9B44E8=00000003 CA2020=1 CA1EEC=5` - framework start
+  returned 3 and two more pool records were used.
+- `post cfg=... c:00300000 ... 34:00000003` and `post win 00CA1FD0:
+  000000FF 000000FF 00300000 ...` - the struct copy landed, `0xCA1FD8` is
+  3 MB.
+- `post a0 used[15] 2211B984 sz=3145740 own=00300000` and
+  `used[14] ... sz=2621468 own=00280010` - the very chunks Windows shows at
+  the same point (`sz=3145740 own=00300000`), i.e. the 3 MB pool came from
+  a0's 8,173,768-byte chunk and the free list re-carved to 2,284,632 bytes,
+  the same shape as the Windows reference.
+- `[import] dev:17 ... f=0x00759E70` four times between 16:17:03.190 and
+  16:17:03.366, with `Format VK_FORMAT_R8G8B8A8_UNORM`, `Present mode
+  VK_PRESENT_MODE_MAILBOX_KHR`, `Buffer size 1280x720`, `Image count 6`.
+  **This is the first Present on the phone.**
+
+Then, 13 ms after the fourth Present, a new and unrelated fault:
+
+```
+[import] tex:19 ... f=0x007567A0
+ICALL: unresolved VA 0x00000000 from 0x00756840
+[crash] signal 11 ... guest_func=0x00737970 esp=0xDEAD0000 eax=1 ebx=1 esi=0x00E1D84C edi=0xDEAD0000
+```
+
+`0x756840` calls a NULL function pointer right after a texture call
+(`0x7567A0` = a texture-stage setter). This is the next rung, not a regression:
+the fill code never ran before because framework start aborted.
+
+### Not verified
+
+- No screenshot yet: the run crashes 13 ms after the first Present, so the
+  frame was never captured. `dev:17` returning is measured; that pixels reached
+  the screen is not.
+- The CPUID object's device fields (`[0xCA2424+4]`) were not dumped directly.
+  The 0x4C exit is proven structurally (cfg all-zero + src prepared + the two
+  other exits excluded by measured globals), and the fix's effect is proven by
+  the copy landing and by Present, but the intermediate `cpuid` values were not
+  read back on the phone.
+- The new crash at `0x756840` has no diagnosis yet: the unresolved VA is 0, so
+  either a vtable slot was never lifted, an out-parameter our texture shims
+  leave NULL is being called, or a stage object was never constructed.

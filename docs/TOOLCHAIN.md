@@ -9,7 +9,7 @@ its commit `b278e8a` is not fetchable — this pin supersedes it.
 | Repo | https://github.com/sp00nznet/pcrecomp (note: `sp00nznet`, not `sp00z`) |
 | Base commit | `35548b8` — *disasm32: straight-line code longer than the scan window is decoded to its end (#50)*, upstream HEAD on 2026-10-04 |
 | Branch used here | `korra-base` (local) |
-| Branch head | **`e887ef2`** (2026-11-21) - `35548b8` + patches `0001-0014` + MP2-0001 + Korra-0001-0008 + Korra-0003b |
+| Branch head | **`09b3465`** (2026-11-21) - `35548b8` + patches `0001-0014` + MP2-0001 + Korra-0001-0008 + Korra-0003b + Korra-0010 |
 | Patch series | `nfsu2-recompiled/patches/pcrecomp/0001…0014` — all apply cleanly, in order, on `35548b8` |
 | Extra patch | `maxpayne2/patches/pcrecomp/0001-seh-frames-and-or-xor-conditions.patch` — applies cleanly on top |
 | pcrecomp `main` @ 2026-11-18 | **not usable**: only patch 0001 applies, the rest conflict (the runtime was restructured: `native32` split, `difftest.py` moved). Do not "just upgrade". |
@@ -52,6 +52,7 @@ What the patch series buys us (from its own subjects):
 | **Korra-0007** (ours, `82495cb`) | `native32.c` runtime only: the per-thread machine state is a `__declspec(thread)` pointer instead of a `TlsGetValue` slot (three API calls and a LastError clobber per bridge crossing), `mach_unlock` wakes only when a ticket is actually queued, and a waiter spins 4096 times before sleeping. **No relift** - recompile only. Measured neutral in Korra's first area (45.3 fps avg vs 44.9) |
 | **Korra-0008** (ours, `9459f22`) | `disasm32.py`: `table_entries` reads a jump table **below** its displacement as well as above it. A negative index (CRT memcpy: `jmp [ecx*4 + 0x77A8C4]`, ecx -7..0) keeps every arm below, so those switches lifted to `RECOMP_ITAIL` and resolved to nothing at runtime - Korra's memcpy remainder silently copied nothing. Guards: contiguous code run only, no entry pointing into the table itself, every arm within 0x40000 of the table. **Re-catalog + relift**: 37,029 -> **37,327** functions (+298 reachable only through those arms), 37,327/37,327 lifted, 0 failures |
 | **Korra-0003b** (ours, `e887ef2`) | `recomp_types.h` only: `recomp_bsf32`/`recomp_bsr32` return 0 with the zero-source flag set instead of shifting a zero operand forever (`while (!(v & 0x80000000u)) v <<= 1;`). Measured at function level: the old body does not return, the new one answers 0. **No relift** - recompile only |
+| **Korra-0010** (ours, `09b3465`) | `recomp_types.h` only: `CPUID_impl` on a non-MSVC host emulates leaf 0/1/7/0x80000000/0x80000001/0x80000002-4/0x80000006 instead of doing nothing. The no-op left the guest's registers at their inputs, so leaf 0 reported max-leaf 0, leaf 1 was skipped and every feature query answered 0 - which made Korra's framework start abort at `0x847BDE` with `0x4C` ("this CPU has no SSE") before its first 3 MB pool create. Advertises SSE..SSE4.2 + POPCNT, no CX16/AVX. **No relift** - recompile only. On-device: framework start 3, first `Present` |
 
 ## Local environment
 
