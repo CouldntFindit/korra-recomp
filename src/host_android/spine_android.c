@@ -489,12 +489,47 @@ static int trace_is_hot(const char *name) {
     return 0;
 }
 
+/* ---- object-table corruption probe (M3, 2026-11-21) ---------------------
+ * Two pool workers spin at 730k waits/s because their semaphore entries in
+ * g_obj (kernel32_android.c) come back with `signaled = 1` and a garbage
+ * kind: a 16-byte write lands at &g_obj[9]+4 and stays there. This keeps the
+ * last imports that are not wait/semaphore traffic, so the moment the
+ * corruption is noticed can name what ran just before it. */
+#define KA_RING 8
+static struct { const char *name; uint32_t f, fs; } g_ring[KA_RING];
+static int g_ring_i;
+
+static void ka_ring_note(const char *n) {
+    if (!n) return;
+    /* Waits, releases and events dominate; letting them in would flush the
+     * ring to eight copies of the spin itself. */
+    if ((n[0] == 'W' && n[1] == 'a') || (n[0] == 'R' && n[1] == 'e') ||
+        (n[0] == 'S' && n[1] == 'e'))
+        return;
+    g_ring[g_ring_i].name = n;
+    g_ring[g_ring_i].f = g_cur_func;
+    g_ring[g_ring_i].fs = g_fs_base;
+    g_ring_i = (g_ring_i + 1) % KA_RING;
+}
+
+void ka_ring_dump(const char *why) {
+    int k;
+    ka_log("ring: %s", why);
+    for (k = 0; k < KA_RING; k++) {
+        int j = (g_ring_i + k) % KA_RING;
+        ka_log("ring: %d %s f=0x%08X fs=%08X", k,
+               g_ring[j].name ? g_ring[j].name : "-", g_ring[j].f, g_ring[j].fs);
+    }
+}
+
 recomp_func_t recomp_lookup_import(uint32_t va) {
     if (va < KA_SHIM_BASE || va >= KA_SHIM_BASE + KA_SHIM_STEP * (uint32_t)g_shim_n)
         return NULL;
     uint32_t i = (va - KA_SHIM_BASE) / KA_SHIM_STEP;
     if (i < (uint32_t)g_shim_n && g_shim[i].va == va) {
         g_last_import_va = va;
+        ka_ring_note(g_shim[i].name);
+        ka_obj_check();
         /* A synthetic COM slot ("D3D9:5", "DInput:3", ...) may carry `this` in
          * ECX or as the first stack argument; the bridge decides per call. */
         ka_vtable_note_import(g_shim[i].name);

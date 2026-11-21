@@ -45,6 +45,8 @@ void      ka_guest_free(uint32_t va);
 /* Dumps the engine memory manager, its allocator and the fallback allocator
  * (free lists, used list); see memory_android.c. Diagnostics only. */
 void      ka_pool_dump(const char *tag);
+void      ka_ring_dump(const char *why);
+void      ka_obj_check(void);
 uint32_t  ka_guest_strdup(const char *s);
 uint32_t  ka_guest_size(uint32_t va);
 /* A fresh guest stack; returns the initial esp (top, 16-byte aligned). */
