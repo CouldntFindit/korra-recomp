@@ -11,6 +11,15 @@
  *   KORRA_PAD_BITS=0x1000  hold those buttons (XINPUT_GAMEPAD_* bits)
  *   KORRA_PAD_AUTO=1       tap A for ~120 ms every 1.2 s, START every 6 s, so a
  *                          run can be driven to the menu and beyond untouched
+ *   KORRA_PAD_TAP=44000,61000  one A press at each time (ms)
+ *   KORRA_PAD_SEQ="56000:0x1000,60000:0x1000:300,260000:0x10"
+ *                          arbitrary timeline: <ms>:<bits>[:<hold ms>, default
+ *                          150]. Lets a run walk into the first area and then
+ *                          pause/resume, which fixed A taps cannot express.
+ *   KORRA_PAD_CMD=<file>   an external driver writes "<seq> <bits> <hold ms>";
+ *                          every new seq starts one hold. For walking a menu
+ *                          after looking at the screen, where a fixed timeline
+ *                          is a guess about when the menu is ready.
  *
  * The state struct is the standard XINPUT_STATE (dwPacketNumber + GAMEPAD);
  * the engine's own remap into its 0x24-byte block happens in guest code, so
@@ -85,6 +94,73 @@ static uint16_t pad_single_taps(uint32_t ms) {
     return 0;
 }
 
+/* KORRA_PAD_SEQ=<ms>:<bits>[:<hold ms>],... - a fixed timeline of button holds
+ * on the same clock as KORRA_PAD_TAP. Anything a menu walk needs (A, START,
+ * dpad) can be scheduled, and a hold longer than a frame is still one edge
+ * because dwPacketNumber only moves when the bits change. */
+typedef struct { uint32_t at, bits, dur; } pad_event;
+static uint16_t pad_timeline(uint32_t ms) {
+    static pad_event ev[32];
+    static int n = -1;
+    if (n < 0) {
+        const char *s = getenv("KORRA_PAD_SEQ");
+        n = 0;
+        while (s && *s && n < 32) {
+            char *end;
+            unsigned long at = strtoul(s, &end, 0);
+            if (end == s) break;
+            s = end;
+            if (*s != ':' && *s != '=') break;
+            s++;
+            unsigned long bits = strtoul(s, &end, 0);
+            if (end == s) break;
+            s = end;
+            unsigned long dur = 150;
+            if (*s == ':') {
+                s++;
+                dur = strtoul(s, &end, 0);
+                if (end == s) break;
+                s = end;
+            }
+            ev[n].at = (uint32_t)at;
+            ev[n].bits = (uint32_t)bits;
+            ev[n].dur = (uint32_t)dur;
+            n++;
+            while (*s == ',' || *s == ' ') s++;
+        }
+    }
+    for (int i = 0; i < n; i++)
+        if (ms >= ev[i].at && ms < ev[i].at + (ev[i].dur ? ev[i].dur : 150))
+            return (uint16_t)ev[i].bits;
+    return 0;
+}
+
+/* KORRA_PAD_CMD=<file> - one hold per sequence number, for a driver that looks
+ * at the screen before pressing. The file is tiny; it is read every poll so the
+ * driver needs no clock agreement with the game. */
+static uint16_t pad_command_file(uint32_t now) {
+    static uint32_t seq_seen, hold_bits, hold_dur, hold_start;
+    FILE *f;
+    unsigned seq = 0;
+    unsigned long bits = 0, dur = 150;
+    const char *p = getenv("KORRA_PAD_CMD");
+    if (!p) return 0;
+    f = fopen(p, "r");
+    if (f) {
+        if (fscanf(f, "%u %li %li", &seq, &bits, &dur) >= 2 && seq != 0 &&
+            seq != seq_seen) {
+            seq_seen = seq;
+            hold_bits = (uint32_t)bits;
+            hold_dur = dur ? (uint32_t)dur : 150;
+            hold_start = now;
+        }
+        fclose(f);
+    }
+    if (seq_seen && now >= hold_start && now < hold_start + hold_dur)
+        return (uint16_t)hold_bits;
+    return 0;
+}
+
 /* Scripted taps: a fixed timeline, so a run is repeatable. A frame is ~16 ms,
  * and the engine reads the pad once per frame. The timeline starts well past
  * the intro movies (they take ~40 s on this machine), because a tap consumed by
@@ -134,6 +210,8 @@ static void shim_XInputGetState(void) {
         bits = (uint16_t)pad_held_bits();
         if (pad_auto()) bits |= pad_scripted_buttons(pad_uptime_ms());
         bits |= pad_single_taps(pad_uptime_ms());
+        bits |= pad_timeline(pad_uptime_ms());
+        bits |= pad_command_file(pad_uptime_ms());
         /* dwPacketNumber changes only when the state changes, as the real
          * XInput does: the engine uses it to detect edges, and incrementing it
          * on every poll would report a new press on every frame. */
