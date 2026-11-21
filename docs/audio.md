@@ -641,6 +641,8 @@ a quiet laptop speaker and obvious on anything else.
   CreateSourceVoice(2 ch float mask 0x3) -> Start` from `0x0073EC80`. After
   that: no submit, no `GetState`, no destroy, for the rest of the run. An
   XAudio2 source voice is push-only, so a voice that is never fed stays silent.
+  This holds through gameplay as well: see 10.5.1 for the same voice measured
+  across a menu, the intro cutscene and 300 s after it.
 * **Correction (2026-11-22): an event *does* start - the block is inside Wwise,
   not at event posting.** In the 440 s menu/gameplay run
   (`korra_host-20261122-000318.log`) the guest opens two streamed Wwise files at
@@ -688,11 +690,12 @@ Measured against `docs/audio.md` §9.4, with `KORRA_AUDIO_DUMP` and
 
 | # | test | result | numbers |
 |---|---|---|---|
-| 2 | menu music (`bgm_TitleMenu`) | **FAIL** | menu up and parked 52-105 s (`work\m4b_stop.wav`, 137.0 s, `korra_host-20261121-232611.log`); 0-30 s = movie audio (peak -11.95/-10.05/-9.77 dBFS, RMS -28.99/-27.67/-27.87), **30-137 s = digital silence (peak -240.00 dBFS, RMS -999)**. Same on the dGPU session (`work\m4b_dgpu2.wav`, 71.0 s, `korra_host-20261121-233050.log`): 0-30 s peak -9.77 dBFS, **30-71 s all-zero samples**. Sink `quiet` grows 40.1 s -> 89.1 s across the parked menu; `underruns` 1-3 total |
-| 3 | longest cue (`bgm_cs41_skip`) | **BLOCKED** | needs a posted cue to play; nothing posts |
-| 4 | one-shot over a running cue (`bgm_Levelup`) | **BLOCKED** | needs the underlying cue of test 2 first |
-| 5 | pause/resume (`bgm_Sync_Pause` / `bgm_Sync_Resume`) | **BLOCKED** | needs a cue to mute and unmute |
-| 6 | voice (`korra_vo_cont_yes`) | **BLOCKED** | needs the same event-post path (and the CPK file layer for the owning bank) |
+| 2 | menu music (`bgm_TitleMenu`) | **FAIL** | menu up and parked 52-105 s (`work\m4b_stop.wav`, 137.0 s, `korra_host-20261121-232611.log`); 0-30 s = movie audio (peak -11.95/-10.05/-9.77 dBFS, RMS -28.99/-27.67/-27.87), **30-137 s = digital silence (peak -240.00 dBFS, RMS -999)**. Same on the dGPU session (`work\m4b_dgpu2.wav`, 71.0 s, `korra_host-20261121-233050.log`): 0-30 s peak -9.77 dBFS, **30-71 s all-zero samples**. Sink `quiet` grows 40.1 s -> 89.1 s across the parked menu; `underruns` 1-3 total. Re-confirmed in the gameplay run (`work\g4_newgame.wav`): **25.0-78.5 s is exact silence** while the menu is up, until the cutscene starts |
+| 3 | longest cue (`bgm_cs41_skip`) | **FAIL**, but the 5.1 path is now proven | the intro cutscene is reached and *does* make sound - from **CRI's movie device**, not from the cue: 24.5 s (g4) and 26.0 s (g5) of continuous audio, peak **-7.09 dBFS**, RMS ~-31 dBFS, **6 ch float -> engine 6x2 matrix -> 2 ch sink**. The 94.9 s streamed `.wem` is never opened and the Wwise voice still gets no submit, so the cue itself is not exercised |
+| 4 | one-shot over a running cue (`bgm_Levelup`) | **FAIL** | no Wwise cue of any kind runs in 408 s, so there is nothing to overlay |
+| 5 | pause/resume (`bgm_Sync_Pause` / `bgm_Sync_Resume`) | **FAIL** | no Wwise cue to pause or resume; the events are Wwise commands, so a host-side observation would be a change in a stream that never starts |
+| 6 | voice (`korra_vo_cont_yes`) | **FAIL** | the tutorial area ran (Resume path, `korra_host-20261122-002131.log`) and the intro cutscene ran (New Game path): zero Wwise submits, no 32 kHz mono voice, no streamed VO open |
+| 7 | log/check | **PARTIAL** | every `CreateSourceVoice` format is logged (2 ch float mask 0x3 for Wwise, 2 ch/6 ch float mask 0x0 for CRI, tag 0xFFFE, maxratio 1.000), **0 OnVoiceError**, but underruns are **89** for the cutscene minute (63 `ran dry` lines between 83.8 and 106.5 s) against 1 at boot and 0/min afterwards |
 
 Why test 2 fails, exactly: in the whole menu session there are **4**
 `CreateSourceVoice` calls and **3** `SubmitSourceBuffer` calls. The four voices are
@@ -708,10 +711,76 @@ image (`0x00847B10`, FNV-1 over the lowercased name - it reproduces every ID in
 `Hw::Wwise::Command::PostEventWork` RTTI name has no pointer in the image. That
 remains the next lead, and it is a Wwise-internals job, not a sink job.
 
-What that means honestly: the sink is done and measured; acceptance 1 and the
-underrun half of 7 pass; 2 fails on the engine side (no event posted) and 3-6
-cannot be exercised at all. No number in this section should be read as "menu
-music works".
+What that means honestly: the sink is done and measured; acceptance 1 passes; 7
+passes on errors and formats but fails its underrun clause inside a movie minute;
+2, 3, 4, 5 and 6 fail on the engine side. No number in this section should be
+read as "menu music works".
+
+### 10.5.1 Gameplay-phase run (2026-11-22): the cutscene is CRI, Wwise is still never fed
+
+Two runs on `build\run_m4c.exe` (SHA256 `7C286C2251CE8968E3E9F6D02129AA56DD03049BBC7D0E7AFC299D5131528DC7`,
+i.e. the sink build plus the `GetState` poll logging below), driven with the
+command-file pad (`KORRA_PAD_CMD`):
+
+| run | log | dump | length |
+|---|---|---|---|
+| g4 | `korra_host-20261122-004126.log` | `work\g4_newgame.wav` | 181.0 s |
+| g5 | `korra_host-20261122-004538.log` | `work\g5_area.wav` | 408.0 s |
+
+Dumps are 16-bit PCM 48 kHz stereo; every number below is computed from the
+dump with stdlib `wave`/`array`, not from the sink's cumulative counters (the
+`[sink]` line's `peak`/`rms` are running maxima and must not be read per second).
+
+**The route that was missing.** Every earlier session pressed A on the STORY
+submenu's first item, which is `Continue` (a save from an earlier run exists, so
+the boot shows the auto-save notice). That loads a checkpoint at the tutorial
+and never plays the intro. The New Game route is:
+
+    main menu -> Story (A) -> DOWN (0x0002) -> A
+      -> "Starting a New Game will reset your game progress, results, and
+          Collection data.  Are you sure?"  (YES / NO, defaults to NO)
+      -> LEFT (0x0004) -> A -> difficulty (Casual / Normal / Extreme) -> A
+
+**What the dump holds** (g4; g5 reproduced it with 77.5-103.5 s instead of
+79.0-103.5 s):
+
+| time | dump | xa2 log |
+|---|---|---|
+| 0.0-24.0 s | boot logo movies, peak -9.77 dBFS | four CRI devices, one per movie |
+| 25.0-78.5 s | **exact silence** (no half-second block above -70 dBFS) | Wwise voice #1 alive and fed nothing; menu driven 44-78 s |
+| 79.0-103.5 s | **24.5 s continuous cutscene audio, peak -7.09 dBFS, RMS ~-31 dBFS** | new XAudio2 at 80.1 s, `CreateSourceVoice(6 ch, 48000 Hz, float, mask 0x0) -> #2 (CRI counter)`, `SetOutputMatrix 6 x 2`, first submit 80.7 s |
+| 104-181 s | **exact silence**, 138.8 s | CRI stopped/flushed/destroyed 106.6-106.7 s; a new XAudio2 at 109.9 s is destroyed **44 ms later with no source voice** |
+
+Underruns on the `[sink]` line: 1 at boot, 89 by 104 s, constant to the end of
+g5 (408 s). The 63 `ran dry` lines between 83.8 and 106.5 s are the movie feed
+missing its deadline - 800-frame buffers (16.7 ms) submitted from a GetState
+loop that runs at the guest's ~20 fps, against a 1056-frame device buffer.
+
+**Four facts this settles.**
+
+1. *The sink renders 5.1 correctly in gameplay.* The cutscene's 6 ch float
+   track, through the engine's own 6x2 matrix, gives peak -7.09 dBFS and no
+   clipping. That is test 3's format clause measured, not argued.
+2. *The intro cutscene is a CRI movie, not a Wwise cue.* Its device is the CRI
+   one (6 ch, mask 0x0, tag 0xFFFE, `cb=...CRI counter`), it is 24.5 s long, and
+   no streamed `.wem` (`1012706428.wem`, the 94.88 s `bgm_cs41_skip` stream) is
+   opened for it. Test 3 is therefore still FAIL on its own terms: the cue with
+   the 94.9 s length never plays, and the Wwise voice still receives nothing.
+3. *Wwise is never fed in any phase.* Across menus (35-78 s), the cutscene
+   (80-106 s) and 300 s after it: zero `SubmitSourceBuffer`/`Start` on the Wwise
+   voice, and - with the new logging - zero `GetState` calls on it either. The
+   Wwise output voice is created at 0.2 s, started at 3.2 s
+   (`Start(684CA610) from 0x0073E700`) and stays silent for the whole process
+   while its stream manager opens .wem files at the title screen, i.e. events do
+   run and the break is between Wwise's renderer and this voice.
+4. *The New Game path does not reach the first area in this build.* After the
+   cutscene the screen is pure black (mean 0.0 over the full frame) at 134, 160,
+   185 s (g4) and at 131, 312, 412 s (g5); 17 A presses in the last 280 s change
+   nothing; the guest's audio thread still calls `CommitChanges` ~50/s, so the
+   process is alive. The scene probe (`KORRA_TRACE_SCENE=1`) stays at
+   `flow=0x9 inst=0x1 step=0xFFFFFFFF mode=0` with the pool climbing 63 -> 91 and
+   stopping there. The 109.9 s device create/destroy with no source voice is the
+   last audio the engine attempts.
 
 ### 10.6 Running a menu session on Windows (second-session recipe)
 
@@ -737,6 +806,28 @@ focused: `reg add "HKCU\Software\Microsoft\DirectX\UserGpuPreferences" /v
 "<abs exe path>" /t REG_SZ /d "GpuPreference=2;" /f` and confirm with
 `nvidia-smi --query-compute-apps=pid,process_name`. Note the dump: movie audio
 ends at ~30 s, and everything after is exact zeros until an event is posted.
+
+**New Game, and the intro cutscene.** `KORRA_PAD_AUTO` never reaches it: its A
+presses land on the submenu's first item, `Continue`, which is a save. Drive the
+menu explicitly instead (`work\m4_drive.ps1` in this tree, or `KORRA_PAD_SEQ`
+with the same timeline). Timings are pad-clock milliseconds, measured on a
+focused 1920x1080 window:
+
+```
+44000 A     title -> main menu              (the boot movies run to ~42 s)
+47000 A     auto-save notice
+53000 A     controller notice -> main menu
+61800 A     Story
+67800 DOWN  highlight moves Continue -> New Game
+69800 A     New Game -> confirm dialog (defaults to NO)
+73200 LEFT  move to YES
+75200 A     difficulty screen
+80200 A     Casual -> the intro cutscene starts at ~80 s
+```
+
+The cutscene is a CRI movie and its audio does reach the sink (10.5.1). It is
+24.5 s, not the 94.9 s `bgm_cs41_skip` cue, and after it the screen stays black
+for 300 s with no audio call at all.
 
 ### 10.7 Reproduce on Windows
 
