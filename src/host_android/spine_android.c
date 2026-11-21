@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/system_properties.h>
 #include <time.h>
 
 #include "host_android.h"
@@ -411,7 +412,84 @@ uint32_t ka_tls_get(uint32_t idx) { return idx < 64 ? g_ts.tls[idx] : 0; }
 void ka_tls_set(uint32_t idx, uint32_t v) { if (idx < 64) g_ts.tls[idx] = v ? v : 1; }
 
 /* --------------------------------------------------------------- dispatch */
+/* Name the caller of one vtable-dispatched function.
+ *
+ * `adb shell setprop debug.korra.icall 72EED0` (hex, no 0x) makes every
+ * indirect transfer to that VA report the lifted function that performed it.
+ * A method reached only through a vtable has no static caller in the generated
+ * tree, and the crash report names the callee, not the dispatcher -- this is
+ * the one place in the runtime that sees both. Off (one property read, then a
+ * single compare) unless the property is set. */
+static uint32_t g_watch_icall_va, g_watch_icall_hits;
+static uint32_t g_watch_icallfrom_va, g_watch_from_hits;
+static int      g_watch_icall_read;
+
+static void watch_icall(uint32_t va) {
+    if (!g_watch_icall_read) {
+        char buf[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.korra.icall", buf);
+        g_watch_icall_va = (uint32_t)strtoul(buf, NULL, 16);
+        __system_property_get("debug.korra.icallfrom", buf);
+        g_watch_icallfrom_va = (uint32_t)strtoul(buf, NULL, 16);
+        g_watch_icall_read = 1;
+        if (g_watch_icall_va)
+            ka_log("[icall] watching %08X", g_watch_icall_va);
+        if (g_watch_icallfrom_va)
+            ka_log("[icall] watching calls from %08X", g_watch_icallfrom_va);
+    }
+    if (g_watch_icallfrom_va && g_cur_func == g_watch_icallfrom_va
+        && ++g_watch_from_hits <= 24)
+        ka_log("[icall] from=%08X target=%08X", g_cur_func, va);
+    if (!g_watch_icall_va || va != g_watch_icall_va) return;
+    if (++g_watch_icall_hits > 8) return;
+    {
+        /* The first three stack words are the callee's arguments, already
+         * pushed: an indirect call has no symbol at the site, so this is the
+         * only place they can be read. */
+        uint32_t *st = (uint32_t *)((char *)g_mem_base + g_esp);
+        ka_log("[icall] target=%08X from=%08X esp=%08X ebp=%08X"
+               " args=%08X %08X %08X",
+               va, g_cur_func, g_esp, g_ebp, st[0], st[1], st[2]);
+    }
+}
+
+/* "debug.korra.watchlog <hex>": sample eight dwords at that guest address on
+ * every indirect transfer and log each change with the lifted function that
+ * was running when it first appeared. A field reached only through a base
+ * register has no literal address in the generated tree, so the writer cannot
+ * be found by grep -- this names the function that stored it. Off (one
+ * property read, then one load and compare) unless the property is set. */
+static uint32_t g_watchlog_va, g_watchlog_hits;
+static uint32_t g_watchlog_last[8];
+static int      g_watchlog_read;
+
+static void watch_log(void) {
+    if (!g_watchlog_read) {
+        char buf[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.korra.watchlog", buf);
+        g_watchlog_va = (uint32_t)strtoul(buf, NULL, 16);
+        g_watchlog_read = 1;
+        if (g_watchlog_va) {
+            uint32_t *w = (uint32_t *)((char *)g_mem_base + g_watchlog_va);
+            for (int i = 0; i < 8; i++) g_watchlog_last[i] = w[i];
+            ka_log("[wlog] watching %08X start=%08X %08X %08X %08X",
+                   g_watchlog_va, w[0], w[1], w[2], w[3]);
+        }
+    }
+    if (!g_watchlog_va) return;
+    uint32_t *w = (uint32_t *)((char *)g_mem_base + g_watchlog_va);
+    for (int i = 0; i < 8; i++) {
+        if (w[i] == g_watchlog_last[i]) continue;
+        if (++g_watchlog_hits <= 400)
+            ka_log("[wlog] +%02X = %08X (was %08X) from=%08X", i * 4, w[i],
+                   g_watchlog_last[i], g_cur_func);
+        g_watchlog_last[i] = w[i];
+    }
+}
+
 recomp_func_t recomp_lookup(uint32_t va) {
+    watch_icall(va);
+    watch_log();
     uint32_t lo = 0, hi = recomp_dispatch_count;
     while (lo < hi) {
         uint32_t mid = lo + (hi - lo) / 2, m = recomp_dispatch_table[mid].address;
