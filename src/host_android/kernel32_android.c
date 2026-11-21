@@ -865,10 +865,24 @@ static void k_WaitForSingleObject(void) {
             if (n2 < 40) {
                 n2++;
                 ka_log("wait: h=%08X woke after %u polls fs=%08X", h, waited, g_fs_base);
-                /* Same 40 wakes, so the two lines pair up: what the slot held
-                 * when its worker was let through. A fn of zero here, on a
-                 * post the pump just made, is the device bug itself. */
-                slot_dump(h, ka_thread_self_param());
+            }
+        }
+        /* What the slot held when its worker was let through. This cannot ride
+         * on the 40-wake budget above: the file pool's early wakes spend it long
+         * before the asset pool's critical one. Dump when the block names a
+         * semaphore this host created, and always when its job function is
+         * zero - that is the device bug itself. */
+        {
+            uint32_t sp = ka_thread_self_param();
+            if (sp >= KA_HEAP_BASE && sp < KA_HEAP_END) {
+                uint32_t post = MEM32(sp + 8), fn = MEM32(sp + 0x10);
+                int named = (fn == 0);
+                for (int i = 0; !named && i < g_sem_n; i++)
+                    if (g_sem_rec[i].h == post) named = 1;
+                if (named) {
+                    static int n3;
+                    if (n3 < 400) { n3++; slot_dump(h, sp); }
+                }
             }
         }
         RET(0, 2);
