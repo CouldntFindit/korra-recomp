@@ -227,6 +227,26 @@ void r_GetType() {    switch (self_kind()) {
 }
 
 /* IDirect3DBaseTexture9 */
+/* SetLOD/GetLOD are slots 11 and 12 - the two the table was missing, which
+ * shifted every derived texture method by two: the engine's LockRect (slot 19)
+ * landed on AddDirtyRect, and UnlockRect (slot 20) was past the end of the
+ * table, so the guest called a NULL function pointer (ICALL unresolved VA 0
+ * from 0x756840, signal 11, 13 ms after the first Present). */
+void bt_SetLOD() {
+    Obj *o = self_obj();
+    if (o && o->kind == K_TEXTURE)
+        reinterpret_cast<IDirect3DTexture9 *>(o->p)->SetLOD(A32(0));
+    RET(0, 1);
+}
+void bt_GetLOD() {
+    Obj *o = self_obj();
+    if (!o) RET(0, 0);
+    if (o->kind == K_TEXTURE)
+        RET(reinterpret_cast<IDirect3DTexture9 *>(o->p)->GetLOD(), 0);
+    if (o->kind == K_CUBETEX)
+        RET(reinterpret_cast<IDirect3DCubeTexture9 *>(o->p)->GetLOD(), 0);
+    RET(0, 0);
+}
 void bt_GetLevelCount() {
     Obj *o = self_obj();
     if (!o) RET(0, 0);
@@ -1122,6 +1142,9 @@ int build_vtable(Kind kind, const char *prefix, const Slot *shared, const Slot *
     }
     g_vt[kind][0] = vt;
     g_vt_built[kind] = 1;
+    /* Slots past n are left 0, so a call to one dispatches to VA 0 (ICALL
+     * unresolved + signal 11). Log the count so a short table is visible. */
+    ka_log("d3d9: vtable %s has %d slots", prefix, n);
     return n;
 }
 
@@ -1381,9 +1404,12 @@ int ka_d3d9_init(void) {
     build_vtable(K_DEVICE, "dev", kBase, kDevice);
     build_vtable(K_SWAPCHAIN, "sc", kBase, kSwapChain);
     /* A texture's vtable is IUnknown + IDirect3DResource9 + IDirect3DBaseTexture9
-     * (GetLevelCount..GenerateMipSubLevels) + IDirect3DTexture9. DXVK's layout is
-     * the d3d9.h one, and the base/resource slots are answered generically. */
+     * (SetLOD, GetLOD, GetLevelCount..GenerateMipSubLevels = 6 entries) +
+     * IDirect3DTexture9. DXVK's layout is the d3d9.h one, and the base/resource
+     * slots are answered generically. */
     static const Slot texBase[] = {
+        S("SetLOD", bt_SetLOD),
+        S("GetLOD", bt_GetLOD),
         S("GetLevelCount", bt_GetLevelCount),
         S("SetAutoGenFilterType", bt_SetAutoGenFilterType),
         S("GetAutoGenFilterType", bt_GetAutoGenFilterType),
