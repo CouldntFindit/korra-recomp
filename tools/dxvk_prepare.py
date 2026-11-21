@@ -15,6 +15,15 @@ The replacements are the portable subset the arm64 build actually needs:
                     are), so the upstream VK_TRUE would fail vkCreateDevice.
   log.cpp           warnings/errors also go to logcat under "DXVK"
   vulkan_presenter  null-guard vkDestroySwapchainKHR/vkDestroySurfaceKHR
+  d3d9_swapchain    swapchain-churn counters (present / acquire-fail /
+                    present-fail / recreate), M3 instrumentation
+  vulkan_presenter  the surface caps dump the churn verdict needs
+  d3d9_swapchain    a present result of VK_SUBOPTIMAL_KHR / OUT_OF_DATE_KHR is
+  vulkan_presenter  only fatal when the surface really changed
+                    (isSwapChainStale); the Xclipse driver reports suboptimal
+                    on every present while the surface's transform hint differs
+                    from the chain's preTransform, and honouring it costs a
+                    swap chain per frame
 
 Shader headers: glslc (shipped with the NDK) compiles every built-in GLSL
 shader into generated/<name>.h as `const uint32_t <name>[]`, which is what
@@ -161,6 +170,194 @@ def patch(tree: pathlib.Path) -> None:
                  "    if (m_surface != VK_NULL_HANDLE)\n"
                  "      m_vki->vkDestroySurfaceKHR(m_vki->instance(), m_surface, nullptr);\n"
                  "    m_surface = VK_NULL_HANDLE;")
+
+    # --- M3 swapchain churn instrumentation ---------------------------------
+    # One "swap chain properties" block means one real vkCreateSwapchainKHR.
+    # log12 had 1,314 of them in 44 s, byte-identical after the first frame, so
+    # something recreates the chain every Present. Both of DXVK's triggers are
+    # silent; name the one that fires before changing anything. Rate limited:
+    # the first 5 and then every 500th, so a 22 s run stays readable.
+    replace_once(tree, "src/d3d9/d3d9_swapchain.cpp",
+                 "    for (uint32_t i = 0; i < SyncInterval || i < 1; i++) {\n"
+                 "      SynchronizePresent();",
+                 "    for (uint32_t i = 0; i < SyncInterval || i < 1; i++) {\n"
+                 "      SynchronizePresent();\n"
+                 "\n"
+                 "      static uint32_t s_swcPresent = 0;\n"
+                 "      ++s_swcPresent;\n"
+                 "      if (s_swcPresent <= 5 || !(s_swcPresent % 500))\n"
+                 "        Logger::info(str::format(\"swapchain: present n=\", s_swcPresent,\n"
+                 "          \" syncInterval=\", int(SyncInterval),\n"
+                 "          \" lastResult=\", int(m_presentStatus.result)));")
+
+    replace_once(tree, "src/d3d9/d3d9_swapchain.cpp",
+                 "      while (status != VK_SUCCESS && status != VK_SUBOPTIMAL_KHR) {\n"
+                 "        RecreateSwapChain(m_vsync);",
+                 "      while (status != VK_SUCCESS && status != VK_SUBOPTIMAL_KHR) {\n"
+                 "        static uint32_t s_swcAcquireFail = 0;\n"
+                 "        ++s_swcAcquireFail;\n"
+                 "        if (s_swcAcquireFail <= 5 || !(s_swcAcquireFail % 500))\n"
+                 "          Logger::warn(str::format(\"swapchain: acquire failed n=\",\n"
+                 "            s_swcAcquireFail, \" status=\", int(status),\n"
+                 "            \" syncInterval=\", int(SyncInterval)));\n"
+                 "        RecreateSwapChain(m_vsync);")
+
+    replace_once(tree, "src/d3d9/d3d9_swapchain.cpp",
+                 "    VkResult status = m_device->waitForSubmission(&m_presentStatus);\n"
+                 "\n"
+                 "    if (status != VK_SUCCESS)\n"
+                 "      RecreateSwapChain(m_vsync);",
+                 "    VkResult status = m_device->waitForSubmission(&m_presentStatus);\n"
+                 "\n"
+                 "    // Samsung's Xclipse driver answers vkQueuePresentKHR with\n"
+                 "    // VK_SUBOPTIMAL_KHR on every present while the surface's transform\n"
+                 "    // hint (ROTATE_90: the panel is portrait-native and the activity\n"
+                 "    // landscape) differs from the swap chain's preTransform (IDENTITY,\n"
+                 "    // which is what makes the compositor rotate the frame upright).\n"
+                 "    // Nothing about the surface changed, and the frame does reach the\n"
+                 "    // screen, so recreating the whole swap chain here costs 30 swap\n"
+                 "    // chains a second and fixes nothing. Ask the surface instead, and\n"
+                 "    // only recreate when it really moved.\n"
+                 "    if ((status == VK_SUBOPTIMAL_KHR || status == VK_ERROR_OUT_OF_DATE_KHR)\n"
+                 "     && !m_presenter->isSwapChainStale()) {\n"
+                 "      static uint32_t s_swcSpuriousSuboptimal = 0;\n"
+                 "      if (!s_swcSpuriousSuboptimal++)\n"
+                 "        Logger::warn(str::format(\"swapchain: present returned \", int(status),\n"
+                 "          \" but the surface is unchanged; keeping the swap chain\"));\n"
+                 "      status = VK_SUCCESS;\n"
+                 "    }\n"
+                 "\n"
+                 "    if (status != VK_SUCCESS) {\n"
+                 "      static uint32_t s_swcPresentFail = 0;\n"
+                 "      ++s_swcPresentFail;\n"
+                 "      if (s_swcPresentFail <= 5 || !(s_swcPresentFail % 500))\n"
+                 "        Logger::warn(str::format(\"swapchain: present failed n=\",\n"
+                 "          s_swcPresentFail, \" status=\", int(status)));\n"
+                 "      RecreateSwapChain(m_vsync);\n"
+                 "    }")
+
+    # Count the creations themselves, so "trigger fired" and "chain created"
+    # can be compared in the same log.
+    replace_once(tree, "src/d3d9/d3d9_swapchain.cpp",
+                 "  void D3D9SwapChainEx::RecreateSwapChain(BOOL Vsync) {\n"
+                 "    // Ensure that we can safely destroy the swap chain",
+                 "  void D3D9SwapChainEx::RecreateSwapChain(BOOL Vsync) {\n"
+                 "    static uint32_t s_swcRecreate = 0;\n"
+                 "    ++s_swcRecreate;\n"
+                 "    if (s_swcRecreate <= 5 || !(s_swcRecreate % 500))\n"
+                 "      Logger::warn(str::format(\"swapchain: recreate n=\", s_swcRecreate,\n"
+                 "        \" vsync=\", int(Vsync)));\n"
+                 "\n"
+                 "    // Ensure that we can safely destroy the swap chain")
+
+    # The surface's caps are the suspects: Android reports the panel's
+    # currentTransform, and the presenter hard-codes IDENTITY.
+    replace_once(tree, "src/vulkan/vulkan_presenter.cpp",
+                 "    if ((status = getSupportedFormats(formats, desc)) != VK_SUCCESS)\n"
+                 "      return status;",
+                 "    {\n"
+                 "      static VkSurfaceTransformFlagBitsKHR s_swcLastTransform =\n"
+                 "        (VkSurfaceTransformFlagBitsKHR)0;\n"
+                 "      static uint32_t s_swcLastCaps[5] = { 0, 0, 0, 0, 0 };\n"
+                 "      if (caps.currentTransform != s_swcLastTransform\n"
+                 "       || caps.currentExtent.width != s_swcLastCaps[0]\n"
+                 "       || caps.currentExtent.height != s_swcLastCaps[1]\n"
+                 "       || caps.minImageCount != s_swcLastCaps[2]\n"
+                 "       || caps.maxImageCount != s_swcLastCaps[3]\n"
+                 "       || caps.supportedCompositeAlpha != s_swcLastCaps[4]) {\n"
+                 "        s_swcLastTransform = caps.currentTransform;\n"
+                 "        s_swcLastCaps[0] = caps.currentExtent.width;\n"
+                 "        s_swcLastCaps[1] = caps.currentExtent.height;\n"
+                 "        s_swcLastCaps[2] = caps.minImageCount;\n"
+                 "        s_swcLastCaps[3] = caps.maxImageCount;\n"
+                 "        s_swcLastCaps[4] = caps.supportedCompositeAlpha;\n"
+                 "        Logger::info(str::format(\"Presenter: surface caps:\",\n"
+                 "          \"\\n  currentTransform:       \", int(caps.currentTransform),\n"
+                 "          \"\\n  supportedTransforms:    \", int(caps.supportedTransforms),\n"
+                 "          \"\\n  currentExtent:          \", caps.currentExtent.width,\n"
+                 "            \"x\", caps.currentExtent.height,\n"
+                 "          \"\\n  minImageCount:          \", caps.minImageCount,\n"
+                 "          \"\\n  maxImageCount:          \", caps.maxImageCount,\n"
+                 "          \"\\n  minImageExtent:         \", caps.minImageExtent.width,\n"
+                 "            \"x\", caps.minImageExtent.height,\n"
+                 "          \"\\n  maxImageExtent:         \", caps.maxImageExtent.width,\n"
+                 "            \"x\", caps.maxImageExtent.height,\n"
+                 "          \"\\n  supportedCompositeAlpha:\", caps.supportedCompositeAlpha));\n"
+                 "      }\n"
+                 "    }\n"
+                 "\n"
+                 "    if ((status = getSupportedFormats(formats, desc)) != VK_SUCCESS)\n"
+                 "      return status;")
+
+    # H1 measured: preTransform = the surface's currentTransform does stop the
+    # churn, but it also rotates the picture 90 degrees, because the compositor's
+    # rotation is exactly what makes the game's landscape frame upright on this
+    # portrait-native panel (A/B: the matched chain's frame equals the churned
+    # chain's frame rotated 90). So preTransform stays IDENTITY and the spurious
+    # OUT_OF_DATE is handled in SynchronizePresent instead, gated on a real
+    # surface change. The presenter needs to answer "did the surface change?".
+    replace_once(tree, "src/vulkan/vulkan_presenter.h",
+                 "    PresenterInfo info() const;",
+                 "    PresenterInfo info() const;\n"
+                 "\n"
+                 "    /**\n"
+                 "     * \\brief Checks whether the swap chain is actually stale\n"
+                 "     *\n"
+                 "     * Re-queries the surface capabilities and compares them with the\n"
+                 "     * ones the swap chain was created against. Some Android drivers\n"
+                 "     * return VK_ERROR_OUT_OF_DATE_KHR from present while the surface\n"
+                 "     * is unchanged, because the surface's transform hint (the display\n"
+                 "     * rotation) differs from the swap chain's preTransform.\n"
+                 "     * \\returns \\c true if the swap chain must be recreated\n"
+                 "     */\n"
+                 "    bool isSwapChainStale();")
+
+    replace_once(tree, "src/vulkan/vulkan_presenter.h",
+                 "    PresenterDevice   m_device;\n"
+                 "    PresenterInfo     m_info;",
+                 "    PresenterDevice   m_device;\n"
+                 "    PresenterInfo     m_info;\n"
+                 "\n"
+                 "    // Capabilities the swap chain was created against, so a present\n"
+                 "    // result can be told apart from a genuine surface change.\n"
+                 "    VkSurfaceCapabilitiesKHR m_caps = { };")
+
+    replace_once(tree, "src/vulkan/vulkan_presenter.cpp",
+                 "  PresenterInfo Presenter::info() const {\n"
+                 "    return m_info;\n"
+                 "  }",
+                 "  PresenterInfo Presenter::info() const {\n"
+                 "    return m_info;\n"
+                 "  }\n"
+                 "\n"
+                 "\n"
+                 "  bool Presenter::isSwapChainStale() {\n"
+                 "    if (!m_swapchain || !m_surface)\n"
+                 "      return true;\n"
+                 "\n"
+                 "    VkSurfaceCapabilitiesKHR caps;\n"
+                 "    if (m_vki->vkGetPhysicalDeviceSurfaceCapabilitiesKHR(\n"
+                 "        m_device.adapter, m_surface, &caps) != VK_SUCCESS)\n"
+                 "      return true;\n"
+                 "\n"
+                 "    return caps.currentExtent.width  != m_caps.currentExtent.width\n"
+                 "        || caps.currentExtent.height != m_caps.currentExtent.height\n"
+                 "        || caps.currentTransform     != m_caps.currentTransform\n"
+                 "        || caps.minImageCount        != m_caps.minImageCount;\n"
+                 "  }")
+
+    replace_once(tree, "src/vulkan/vulkan_presenter.cpp",
+                 "    // Invalidate indices\n"
+                 "    m_imageIndex = 0;",
+                 "    m_caps = caps;\n"
+                 "\n"
+                 "    // Invalidate indices\n"
+                 "    m_imageIndex = 0;")
+
+    replace_once(tree, "src/vulkan/vulkan_presenter.cpp",
+                 "      \"\\n  Exclusive FS: \", desc.fullScreenExclusive));",
+                 "      \"\\n  Exclusive FS: \", desc.fullScreenExclusive,\n"
+                 "      \"\\n  Pre transform:\", int(swapInfo.preTransform)));")
 
 
 def generate_shaders(tree: pathlib.Path, glslc: pathlib.Path) -> int:

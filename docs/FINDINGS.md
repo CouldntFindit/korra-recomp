@@ -2483,10 +2483,21 @@ MAILBOX, 1280x720) with the build from commit 2c4126f.
 stops at 12,000 lines (g_trace_left in spine_android.c; logs/log12.txt, line 14,757
 carries "(trace limit; set KORRA_TRACE_IMPORTS=0 to silence)"). Every "dev:17 = N"
 figure in this file therefore counts presents only until the trace budget ran out,
-not presents in the run. The real count is DXVK's own per-present block
+not presents in the run. The real present rate is DXVK's own per-present block
 ("Presenter: Actual swap chain properties", 7 lines): 1,314 of them in a 44 s run,
 i.e. about 30 fps sustained on the device. The 30 fps default limiter works and the
 frame loop is not stalling; the "bursty presents" reading was the trace cap.
+
+**Correction (2026-11-21, later the same day).** Those 1,314 blocks were *not*
+per-present logging. The block is emitted immediately above
+`vkCreateSwapchainKHR` inside `Presenter::recreateSwapChain`
+(`vulkan_presenter.cpp:104-236`), which destroys the old chain first - so one block
+is one real swap chain creation, and the game was rebuilding its swap chain on
+every single Present while reporting identical properties
+(R8G8B8A8_UNORM, MAILBOX, 1280x720). The 30 fps figure was still right, but it was
+30 fps *with* a swap chain per frame. Cause and fix are in the entry below
+("the swap chain is no longer rebuilt on every present"); with the fix a 32 s run
+creates 3 swap chains instead of ~1,000.
 
 **2. The run now ends in a guest fault at about 1,300 frames.** After the D3DX fix
 (2c4126f) nothing refuses in the log before the fault: no missing shim, no failed
@@ -2517,3 +2528,49 @@ Not verified: that +0x30 is meant to be non-NULL on Windows (the Windows referen
 run reaches the menu without this fault, but +0x30 was not sampled); the steady-state
 frame rate after this fault is fixed; the "lifecycle: pause / low memory" kill seen in
 earlier runs is untouched by this entry.
+
+## 2026-11-21 - M3: the swap chain is no longer rebuilt on every present
+
+The 1,314 creations in log12 carried identical properties every time, so the
+`m_dirty` path at Present entry was not the trigger (window, vsync and dialog
+stable; `UpdatePresentRegion` false after the first frame). That left the two
+silent failure loops. The pinned DXVK tree now logs both, plus a surface-caps dump
+that only prints when the caps change (`tools/dxvk_prepare.py`, so it is
+reproducible): 22 s on the device, `logs/log.txt`, 615 creations.
+
+- The site is `SynchronizePresent`: `vkQueuePresentKHR` returns
+  **VK_SUBOPTIMAL_KHR (`1000001003`)** on every present, and DXVK recreates the
+  chain on any non-`VK_SUCCESS` result. The acquire prefetch stayed successful;
+  the single `VK_ERROR_NATIVE_WINDOW_IN_USE_KHR` at startup recovered by itself.
+- Surface caps: `currentTransform = ROTATE_90 (2)` with `supportedTransforms =
+  511`, `currentExtent 1280x720`, `minImageCount 4` (5 after the first present),
+  `maxImageCount 64`, `supportedCompositeAlpha 8`. The S24 panel is
+  portrait-native and the activity is `sensorLandscape`, so the hint is the
+  display rotation.
+- **H1, the assumed fix, is wrong for the picture.** `preTransform =
+  caps.currentTransform` (the brief's suggestion) does stop the churn - 3
+  creations, 0 present failures - but the frame comes out rotated 90 degrees:
+  the matched-preTransform splash is the churned splash rotated 90 (mean abs
+  difference 0.8/255 rotated, 15.2 unrotated). The compositor's rotation is
+  exactly what makes the game's landscape frame upright on this panel, so
+  `preTransform` has to stay `IDENTITY`. (`ANativeWindow_setBuffersTransform`
+  with `TRANSFORM_IDENTITY` changed nothing: caps still report transform 2 and the
+  picture still matched H1 frame for frame.)
+- **H2, the fix: the result code is the lie, not the surface.** Keep
+  `preTransform = IDENTITY` and only honour `VK_SUBOPTIMAL_KHR` /
+  `VK_ERROR_OUT_OF_DATE_KHR` from present when the surface really changed.
+  `Presenter::isSwapChainStale()` re-queries the capabilities and compares extent,
+  transform and `minImageCount` with the ones the chain was created against; the
+  recreate path is untouched for every other failure.
+
+Measured with H2 (`logs/log_h3.txt`, 32 s, 2,290 frames until the NULL fault
+below): **3 swap chain creations** (down from ~1,000), 2 recreates (the
+first-Present dirty path, and the `NATIVE_WINDOW_IN_USE` recovery), 0 present
+failures, one warn line naming the ignored result, and the splash frame pixel
+identical to the pre-fix picture. The run ends in the same NULL fault at ~2,300
+frames, so the churn is no longer what limits it.
+
+Not verified: a >2 minute run (the NULL fault still ends it); a genuinely stale
+surface (the staleness check covers it by construction, but nothing has exercised
+it - rotating the device is the obvious test); the first-area frame rate.
+

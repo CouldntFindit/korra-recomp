@@ -134,3 +134,27 @@ lib/arm64-v8a/libkorra.so                   73 KB, PT_LOAD aligned 0x4000
 
 Android-specific plan, shell choice, DXVK path and the `pcmpistri` assessment:
 `docs/ANDROID_BRINGUP.md`.
+
+## DXVK-native prepare series (M3, pinned 2026-11-21)
+
+Base: `dxvk-native` at **`c8dc91fabd00cac11d697ccf07426e798393cd40`**
+(native-1.9.2b, flibitijibibo), kept at
+`recomp-work\reference\dxvk-native` (sibling of this repo, never inside it).
+There is no fork and no hand edit: every change below is a string replacement in
+`tools\dxvk_prepare.py`, applied to the clean pin, and the script's own SHA-256 is
+written to `<tree>\ANDROID_PREPARE_SHA256` (currently `e195396ebfe88398…`), which
+`dxvk_android/CMakeLists.txt` requires. Re-running the script on an already
+prepared tree is safe; a replacement whose `new` text is already there is skipped.
+
+| Patch | Files | Effect |
+|---|---|---|
+| **DXVK-A001** | `util_bit.h`, `sync_spinlock.h`, `util_vector.h` | arm64 portability: x86 asm/intrinsics behind an x86 guard, `__builtin_ctz`, `_mm_pause` -> `yield`, SSE `replaceNaN` -> scalar |
+| **DXVK-A002** | `d3d9_device.cpp` | the nine core feature bits are `supported.core.features.X` instead of `VK_TRUE` (Xclipse 940 reports `textureCompressionBC = 0`; the upstream value fails `vkCreateDevice`) |
+| **DXVK-A003** | `util/log/log.cpp` | warn/error mirrored to logcat as `DXVK` |
+| **DXVK-A004** | `vulkan/vulkan_presenter.cpp` | `vkDestroySwapchainKHR` / `vkDestroySurfaceKHR` null-guarded, `m_surface` reset, so a half-created presenter does not destroy twice |
+| **DXVK-A005** | `d3d9/d3d9_swapchain.cpp`, `vulkan/vulkan_presenter.{h,cpp}` | present churn: rate-limited diagnostics, the on-change surface caps dump, and `Presenter::isSwapChainStale()` - `VK_SUBOPTIMAL_KHR`/`VK_ERROR_OUT_OF_DATE_KHR` from present only recreates when the surface's extent, transform or `minImageCount` actually moved. Without it the Xclipse driver's per-present `VK_SUBOPTIMAL_KHR` (the surface's `ROTATE_90` hint vs the chain's `IDENTITY` preTransform) rebuilt the swap chain on every frame. `preTransform` stays `IDENTITY`: matching `currentTransform` also rotates the picture 90 degrees. See `docs/FINDINGS.md`, 2026-11-21 |
+
+`dxvk_android\` (this repo) adds the platform glue the series does not cover:
+`android_wsi.cpp` implements the `wsi::` contract over `ANativeWindow`, and the
+CMake target links `vulkan android log`.
+
