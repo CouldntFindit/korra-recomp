@@ -14,8 +14,10 @@ side (Win32, D3D9 surface, XInput, XAudio2, CRI/Wwise audio, Steam stubs).
 
 > **Work in progress.** The Windows path now boots, renders and plays: no Steam,
 > text renders, and the first area runs at 39-58 fps (30 fps cap is the Android
-> default). The Android port is next; there are no releases and no playable
-> Android build yet. The milestone table below is the source of truth.
+> default). On Android, the game now clears its entire graphics init and
+> presents rendered frames on a Galaxy S24 (Xclipse 940, stock driver) — the
+> title screen and a playable build are still ahead. The milestone table and
+> timeline below are the source of truth.
 
 > **This repository contains no game content.** You must own and supply your own
 > copy of the PC game. Builds are produced locally by each builder from their own
@@ -23,14 +25,14 @@ side (Win32, D3D9 surface, XInput, XAudio2, CRI/Wwise audio, Steam stubs).
 
 ## Status
 
-*Last updated 2026-11-20. Current focus: M3 — first arm64 frame on a device.*
+*Last updated 2026-11-21. Current focus: M3 — title screen, then the first playable area on the device.*
 
 | Milestone | What it means | State |
 |---|---|---|
 | M0 | Environment, toolchain pin, repo bootstrap, PE gate | **done** (2026-11-19) |
 | M1 | Seeds + function catalog + full lift to C | **done**: 37,327/37,327 functions, 0 lift failures — see [`docs/LIFT_REPORT.md`](docs/LIFT_REPORT.md) |
 | M2 | Boots to the main menu on Windows (no Steam, silent, movies skipped) | **done (2026-11-20)** — boots without Steam, text renders, new game runs into the first area at 39-58 fps uncapped; the crash and missing-text defects had one cause (the lifter's `pcmpistri` flag model). Log: [`docs/FINDINGS.md`](docs/FINDINGS.md) |
-| M3 | Boots and plays the first area on an Android arm64 device | **in progress** - device + Vulkan probe measured on the S24 (Xclipse 940, Vulkan 1.3.304; BC feature absent, D24S8 unsupported), `pcmpistri`/`FCOMI` proven on arm64 silicon, Android host + D3D9→DXVK bridge written and compiling; the first device boot is pending ([`docs/ANDROID_BRINGUP.md`](docs/ANDROID_BRINGUP.md)) |
+| M3 | Boots and plays the first area on an Android arm64 device | **in progress** — **first device frame 2026-11-21**: the S24 (Exynos 2400, Xclipse 940, stock Vulkan driver) runs the game's full graphics init through DXVK-native (MAILBOX present mode), 191/191 imports bound, 37,327 functions dispatched, rendered frames presenting ([`docs/ANDROID_BRINGUP.md`](docs/ANDROID_BRINGUP.md)). Remaining to the gate: title screen, SAF GameData install, touch → XInput, first playable area at 30 fps |
 | M4 | Audio: Wwise + CRI behind a host mixer | spec ready ([`docs/audio.md`](docs/audio.md)), implementation not started |
 | M5 | Gameplay validation, framerate hooks, full playthrough | not started |
 
@@ -47,6 +49,15 @@ Parallel research tracks (each has its own document):
 Exact toolchain pin and per-milestone findings: [`docs/TOOLCHAIN.md`](docs/TOOLCHAIN.md),
 [`docs/FINDINGS.md`](docs/FINDINGS.md). Working rules for contributors and
 agents: [`AGENTS.md`](AGENTS.md).
+
+## Timeline
+
+| Date | Milestone |
+|---|---|
+| 19.11.2026 | Project bootstrap: `LoK.exe` triaged (PE32 x86, no DRM), pcrecomp pinned as `korra-base`, the full binary lifted to portable C with zero lift failures; repository published as work-in-progress |
+| 20.11.2026 | Windows gate (M2) passed: boots without Steam, text renders, the first area playable at 39-58 fps uncapped; lifter defects fixed on the way (`pcmpistri` flags, jump-table arms, Steam stats ABI) |
+| 20.11.2026 | Android scaffold merged: GameActivity shell, SAF install flow, DXVK-native preparation, guest-memory window |
+| 21.11.2026 | **First frame on the S24**: full graphics init over Vulkan — 191/191 imports bound, 37,327 functions dispatched, first `Present` with rendered content; fixed en route: emulated CPUID (Korra-0010), asset-pool teardown join, texture vtable slots, critical-section deadlock, object-table overflow, per-frame staging leak |
 
 ## Building
 
@@ -76,7 +87,8 @@ build\korra_recomp.exe "D:\Games\The Legend of Korra"
 Requirements: Python 3.12+ with `capstone` and `pefile` for the committed tools
 (`unicorn` / `keystone-engine` are used by pcrecomp's own self-checks); Visual
 Studio 2022 with the x86 C++ toolset for the Windows host; Android NDK r27+ for
-the Android target (not set up yet). Details in
+the Android target (r28c is the tested version; setup and versions in
+[`docs/TOOLCHAIN.md`](docs/TOOLCHAIN.md)). Details in
 [`docs/TOOLCHAIN.md`](docs/TOOLCHAIN.md).
 
 ## Publishing
