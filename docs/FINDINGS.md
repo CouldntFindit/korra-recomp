@@ -2710,3 +2710,117 @@ has no XAudio2 shim at all yet, so M3's job is the device; the sink is ready.
 sections 10/11/12 are now 11/12/13, with every `§` reference in the document
 rewritten to match. Any older note that cites "audio.md section 12" means the
 second-session verification, which is now section 13.
+
+## 2026-11-21 - M3 Task 2: the field is real, Windows names its writer, and a NULL slot alone does not fault
+
+The previous Task-2 entry said "`[0xE4D064 + 0x30]` is never written by any guest
+code". **Wrong, and the mistake was the probe, not the game.** The device sampler
+logs a watched dword only when its *value changes*; a slot that is written with
+the same value every time is invisible to it. Three phone-free probes settled the
+question on the Windows host, which is the reference this build is compared
+against.
+
+**1. The writer of `0xE4D094` is `sub_00748CB0`, and the store is a 5x `movq`.**
+`src/host/wprot_probe.c` (new, `KORRA_WPROT=<hex VA>`) makes the page holding the
+dword read-only, catches the write fault in a vectored handler, single-steps the
+store with `EFlags.TF`, and logs the lifted function that contains it. Every line
+of a 100 s run reads `writer=00748CB0`. A `MEM32(x + 0x30) = ...` grep cannot see
+it because the engine copies a 0x28-byte descriptor with five qword moves
+(`0x00748D9D`-`0x00748DCB`): `[edi+0..0x20]` -> `[ctx+0x30..0x58]`. So
+`ctx+0x30` is a **technique pointer** and `ctx+0x34` is its **valid** flag, written
+as one 8-byte pair; `{0, 1}` is a legitimate engine state (`sub_00748A30`, which
+0x748A9A calls with a NULL technique). The descriptor is built by
+`sub_00748AB0(ctx, technique, arg2)` and the technique is never computed by the
+renderer: it is one of the engine's technique-table globals - `0xCA39E8`,
+`0xCA3A00`, `0xCA39F4`, `0xCA39FC`, `0xCA39DC`, `0xE1DAA0` - read at the call
+sites in `recomp_0016.c` (0x54D8xx-0x54E7xx). The Windows values the sampler
+reported are exactly that table: `0xE1DA54`, `0xE1DA6C` (= `0xE1DA54 + 0x18`,
+the 0x18-stride array element `sub_005599D0` selects), `0x9DF3D8`, `0x9DF450`,
+`0x9DF480`, `0xE1D860`.
+
+**2. The table that fills them is per-frame, and the frame setup has a skip
+gate.** `sub_005599D0` is called from one site only, `0x00541578` inside
+`sub_00541510` (`recomp_0016.c:45150-45245`), and it writes the whole technique
+table with literal pointers. `sub_00541510` reaches it only if this is false:
+
+```c
+eax = [0xE4D060];
+if (eax && [eax+0x28] && (icall [[[eax+0x28]] + 0x88])() != 0) return;  /* skip */
+```
+
+`[eax+0x28]` is the device-state manager; slot 34 is `sub_0075A140`, a one-line
+getter `return [this+0x6C]`, and `[mgr+0x6C]` is the manager's **"device is lost -
+skip the frame"** flag: `sub_00759C90` (its slot 3) sets it when the stored status
+equals `D3DERR_DEVICELOST (0x88760868)` or `D3DERR_DEVICENOTRESET (0x88760869)`,
+and `sub_00759D10` (slot 4) is its SUCCEEDED companion. When the flag is up, the
+technique table is not initialised, `sub_00552290`/`sub_00778550`/`sub_0055C7C0`/
+`sub_00541590`/`sub_00553FA0` do not run either.
+
+**3. The reference values, measured.** `src/host/gate_probe.c` (new, `KORRA_GATE=1`)
+prints one line a second: `m=[0xE4D060] mgr=[m+0x28] flag=[mgr+0x6C]
+status=[[mgr+0x24]] ctx30=[0xE4D094] tce=[0xCA3CE0]`. Clean 50 s run
+(`korra_host-20261121-203324.log`, zero `[crash]`): `flag=1` only while the device
+is coming up (seconds 3-5), then **`flag=0` forever**, `tce=0` (bit 24 recording
+never sets, so the flush `0x74F740` runs **every frame**), and `ctx30` cycling
+over `0x9DF3D8 / 0x00E1DA6C / 0x00E1DA54 / 0`. With `KORRA_ICALLFROM=74F740` the
+same walk was dispatched 200+ times in 55 s to many different pass functions
+(`0x401020`, `0x5501A0`, `0x54D2D0`, `0x5506A0`, `0x54DCC0`, `0x550AA0`), so the
+flushed entry is the ordinary path, not a boot-time rarity; and `KORRA_WPROT`
+counted 200+ technique installs in the same window, all non-zero. Android's
+"never written, only `+0x34` toggles" is therefore consistent with the install
+*running* while the technique it copies is NULL.
+
+**4. A NULL slot is necessary but not sufficient.** `KORRA_GATE_FORCE=1` holds
+`[mgr+0x6C] = 1`, and `KORRA_GATE_AT=<ms>` starts doing so after a normal load.
+Shut from t=0: 50 s, `flag=1`, `ctx30=0`, no crash (the game never reaches a level
+load, so nothing is queued). Shut at t=25 s after a normal 25 s: 75 s with
+`flag=1`, `ctx30=0`, `tce=0` and the per-frame flush, **still no crash**. So the
+device fault needs the entry `{fn=0x74F8F0, key=0x6B100000}` to be *in the queue*
+at the same time the slot is NULL - on Windows the two never coincide.
+
+**5. Layer decision, and why no fix is committed.** The lift, the runtime and the
+generated tree are identical on both platforms: `android/app/src/main/cpp/CMakeLists.txt`
+compiles `${KORRA_REPO_ROOT}/src/recomp/gen/*.c` with the same pinned pcrecomp
+headers. So the divergence is in `src/host_android/` or in DXVK, and three
+candidates remain, none distinguishable without the phone:
+
+- the frame-setup skip flag `[mgr+0x6C]` is 1 on the device (then the table is
+  never initialised);
+- the technique install's own gate `sub_00756B00` (vtable slot 0x3C of the device
+  object, measured target = `0x756B00`) returns 0 there: it bails if `[this+4]`
+  is NULL or if any of four `sub_00756600` resolutions fail, and those use COM
+  calls at `[ecx+0x14]` and `[ecx+0x94]` whose failures are tested with `js`, i.e.
+  a negative HRESULT from a host answer;
+- `sub_005599D0` runs and the six reset siblings
+  (`0x556330/0x5563C2/0x556421/0x556480/0x55667B/0x55675C`) empty the table again
+  before the flush.
+
+A guest-side patch would be a guess about which of the three it is, so none was
+made. `d_TestCooperativeLevel` in `src/host_android/d3d9_android.cpp` already
+answers `D3D_OK`, so that particular shim is not the lier without measurement.
+
+**6. New debug tooling, all off unless the environment asks for it.**
+`src/host/wprot_probe.c` (`KORRA_WPROT=<hex VA>`: the exact lifted function that
+stores to a dword - page-read-only, vectored handler, TrapFlag single-step);
+`src/host/gate_probe.c` (`KORRA_GATE=1` census of `flag`/`status`/`ctx30`/`tce`,
+`KORRA_GATE_FORCE=<n>` and `KORRA_GATE_AT=<ms>` to hold the gate shut, diagnostic
+only); `KORRA_ICALLFROM=<hex VA>` in `src/host/watch_probe.c` (every indirect
+transfer *dispatched from* a VA - the target-filter `KORRA_ICALL` cannot see a
+vtable slot whose target lives on a heap object). The `[wlog]` line cap went from
+400 to 3000, because 400 lines hid the interesting second.
+
+**Verified:** the Windows build still boots, creates the device, draws and walks
+the pass queue every frame (clean 50 s reference, zero `[crash]`), so the M2 gate
+state is unchanged by this session; `tests/sync_codeberg_selftest.ps1` 9/9;
+`selftest_host_shims` 60 passed / 0 failed when linked against the parallel
+session's `wasapi_sink.c` (`scripts/run_selftest.ps1` itself is temporarily red
+because their in-progress `xaudio2_stub.c` calls `korra_audio_sink_*`, which only
+that untracked file defines - not this session's change).
+
+**What only a device can prove**, in one run when the phone is back: is `flag`
+(`[mgr+0x6C]`) 0 there, is `[0xCA39E8]` non-zero there, and does
+`[0xE4D094]` change? The three answers pick one of the three candidates above and
+name the fix. Until then Task 2 is **named, not fixed**, and this entry
+supersedes the two Task-2 readings above ("never written" and "would have bailed
+anyway" - the second is right about the *bail*, wrong about it happening before
+the deref).
