@@ -2027,3 +2027,99 @@ device log was already built with the guard, so there is no before/after device
 run for it. It is deliberately not numbered Korra-0009, which stays reserved for
 the spin gate.
 
+
+## 2026-11-21 - M3 graphics-init abort: Windows ground truth names the 3 MB pool, not 16 MB
+
+Taking over the on-device abort (Android framework start `sub_00847BB0` returns
+0x34) with a Windows parity probe, because on Windows the host calls the real OS
+and the same boot reaches the menu.
+
+### What the probe is
+
+`src/host/m3_probe.c`, compiled into the Windows host, off unless
+`KORRA_TRACE_M3=1`. It chains the runtime's `native32_pre_hook` /
+`native32_post_hook` and prints the same snapshots the Android host prints in
+`u_GetForegroundWindow` ("pre:") and `u_ClipCursor` ("post:"), plus:
+
+- `cfg=` - the whole 0x38-byte config block at 0xCA1FCC, not just 0xCA1FD8;
+- `mgr=`, `fallback cell=`, `a0=` and `fb=` with the cumulative allocator
+  fields (+38/+3C/+40/+44/+48/+54/+58/+5C), every non-empty free class, the
+  total free nodes/sum/largest and the used-chunk walk - the same lines
+  `ka_pool_dump()` prints on the device;
+- `budget 0x... -> 0x...` - 0xCA1FD8 polled at every import dispatch, so the
+  writer is bracketed between two import boundaries (g_cur_func names the
+  function);
+- `giant:` for any VirtualAlloc/HeapAlloc of 4 MB or more.
+
+`--poison` is not used: it needs a `-DRECOMP_TRACE` build and only samples one
+dword at import dispatches anyway; the probe's own poll is the same measurement
+without the second build.
+
+### The chain, read from the binary
+
+Callers are unique (decoded per catalog function, direct `call rel32`):
+
+    0x0076486C -> 0x007657D0 -> 0x00847A30 (GetForegroundWindow)
+                -> 0x00847BB0(0xDB8AE8, 0xDB8AA0) -> 0x008478C0 -> 0x00829140
+
+`sub_007657D0` is the answer to "who writes 0xCA1FD8":
+
+    007657D4  push 0xDB8AE8 ; call 0x8479C0     ; defaults into the struct
+    007657E3  mov dword ptr [0xDB8AF4], 0x300000 ; +0xC = 3 MB, HARD-CODED
+    007657F7  call 0x847A30                     ; GetForegroundWindow
+    00765806  mov dword ptr [0xDB8AC8], 0x280000
+    00765810  call 0x847BB0                     ; framework start
+
+and `sub_00847BB0` copies its argument over 0xCA1FCC (0x847C24, `rep movsd`
+0xE dwords), so 0xCA1FCC+0xC - i.e. 0xCA1FD8 - is 0x00300000 at the decision.
+`sub_008479C0` (the defaults filler) is what puts 0x01000000 there when the
+caller passes NULL, which is the only path that would ask for 16 MB.
+
+Windows reference state at the post anchor (20 s run, menu reached):
+
+    cfg=0:00000000 4:000000FF 8:000000FF c:00300000 10:3F800000 14:00040000
+        18:FFFFFFFF 1c:00000000 20:00000001 24:00040000 28:00010000
+        2c:00000000 30:00000000 34:00000003
+    post: slot(9B4390)=3  budget=0x00300000
+    a0: +58=19, free[71] (fl=17 sl=3) n=1 largest=8173768
+    fb: +58=19, free[73] (fl=18 sl=1) n=1 largest=11594904
+
+### The class arithmetic, from the real instruction bytes
+
+`sub_0073E9C0` smears the request (`edx|>>1|>>2|>>4|>>8|>>16`), takes
+`popcount` (0x73E4A0 is a literal bit count, not bsr), `p = popcount`, adds
+`1 << (p-2)` to the request and calls `0x73E500`, which returns
+`fl = max(p-6, 0)` and `sl = (index & (2^(p-1)-1)) >> (p-3)`; the free head is
+`[pool+0x40][sl + fl*4]`. The refusal is `fl >= [pool+0x58]` (0x73EA9D ->
+0x73EC66, a plain `xor eax,eax; ret 0xc`).
+
+- 3 MB with align 0x40: esi=0x300043, p=22, class (fl=17, sl=3) = index 71 -
+  exactly where a0 holds its 8,173,768-byte chunk. **Served.**
+- 16 MB: esi=0x01000043, p=25, fl=21 >= 19. **Refused without a search.**
+
+### Correction to the takeover brief
+
+The brief says the device asks for 16 MB because 0xCA1FD8 is 0. That is wrong:
+0xCA1FD8 is 0 at the pre anchor on **both** platforms (the struct copy happens
+after GetForegroundWindow), and the 0x300000 is a guest immediate, not a config
+read or a host value, so the device asks for 3 MB too. The exit-time
+`state: CA1FD8=00000000` proves nothing either: the later `post:` dumps show the
+manager and the pool globals are zeroed during teardown, which is what the
+ExitProcess snapshot sees.
+
+So the device fails at class 71 (3 MB) in a0, and Windows serves the same
+request from a single free chunk. What differs is the allocator's *state* on the
+device, not the request. The candidate branches are now:
+(a) device `[a0+0x58]` below 17,
+(b) device free list has no usable node at index 71 (different carve),
+(c) the list was corrupted by a guest write from one of our shims.
+`ka_pool_dump()` answers all three in one device run.
+
+### Not verified
+
+- The device-side 3 MB request is inferred from the guest code path (unique
+  callers, unconditional stores). The device has not yet printed `cfg=` at the
+  post anchor.
+- The ~326 MB of giants is normal engine behaviour: Windows allocates the same
+  four sizes (0x05200000, 0x00A40000, 0x04FA0000, 0x09A20000) through the real
+  OS, so no shim is inflating a size.
