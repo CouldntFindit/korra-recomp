@@ -2647,3 +2647,66 @@ a live frame).
 Not verified: what Windows holds at `+0x30` (the oracle run above); whether the
 crash also happens on Windows; that the entry is present on Windows at the same
 frame count; the first-area frame rate; anything after frame 2,321.
+
+
+## 2026-11-21 - M4 audio: the Windows sink, the matrix that *was* the mix, and the event still not posted
+
+Route A is now code, not a plan. The lifted engine keeps Wwise/CRI and mixes;
+the host supplies `IXAudio2` 2.7 (`src/host/xaudio2_stub.c`, now a real mixer)
+and one output thread (`src/host/wasapi_sink.c`, WASAPI shared, event-driven,
+`AUTOCONVERTPCM`, with waveOut and a QPC-paced null backend behind it). The
+contract is `src/host/audio_sink.h`; run it from `build\run_m4.exe`.
+
+**Acceptance test 1 passes, with numbers.** Run
+`KORRA_XA2_VERBOSE=1 KORRA_AUDIO_DUMP=work\m4_final.wav build\run_m4.exe`,
+log `korra_host-20261121-204119.log`: sink `WASAPI shared: 2 ch, 48000 Hz,
+32 bits, buffer 1056 frames (22.0 ms), engine-converted 48k float`, first
+audible block at 0.032 s, dump **59.0 s**, overall RMS **-31.1 dBFS**, steady
+window 3-22 s RMS **-26.8 dBFS**, peak **-9.77 dBFS** (no clipping), underruns
+4 (first feed at 5.9 s and the 21.7/21.9/22.2 s movie device teardown) - **0
+per minute between 6 s and 21 s**, 0 `OnVoiceError`. Threshold was RMS >
+-40 dBFS. The dump is 48 kHz 16-bit stereo and its header is patched once a
+second, so a killed run still yields a readable file.
+
+**The defect worth the session: `SetOutputMatrix` is the mix.** The first dump
+measured RMS -16.1 dBFS with **peak 0.0 dBFS** - clipped. The mixer had treated
+`SetOutputMatrix` as a no-op ("CRI computes the downmix itself") and applied
+its own invented 0.7071/0.5 coefficients on top. The engine really installs a
+2x2 matrix for its stereo voice and a 6x2 for the 5.1 voice; storing and
+applying them moved the peak from +2.7 dBFS to -9.77 dBFS. An 11 dB error that
+a laptop speaker hides and a measurement does not.
+
+**Which device the game uses, measured (72 s, verbose 3).** DirectSound8 is
+never created; the only non-XAudio2 `CoCreateInstance` in the run is
+`MMDeviceEnumerator` at boot (`0x008701F0`, a notification client, not a
+stream). Movie/boot audio is CRI's device: a full create/teardown per movie
+about 6.5 s apart, and that is the audio from 0 to 25 s. The Hw/Wwise device is
+created, `CreateMasteringVoice(2 ch)`, `RegisterForCallbacks`,
+`CreateSourceVoice(2 ch float mask 0x3)`, `Start` from `0x0073EC80` - and then
+it is never submitted to, never queried, never destroyed. An XAudio2 source
+voice is push-only, so no event means no audio.
+
+**So tests 2-6 remain unproven, and the reason is upstream of audio.** No
+Wwise event is posted on any screen this build reaches. The title screen runs
+at 29-30 fps with the pad polled and posts nothing; pressing A leaves the title
+around 40 s onto a static black screen at ~57 ticks/s with `present=0/s` - the
+frame-pass-queue fault at the end of this file, not a sink defect. Posting
+events from the host is also not yet possible: the image's only name hash
+(`0x00847B10`) is FNV-1 over the lowercased name and reproduces every ID in
+`docs/audio.md` 9.4 exactly, but it is reached only from wide-string filename
+helpers (`0x007685C0`, `0x00768C60`, callers `0x007672A2`, `0x00766E02`), and
+the `Hw::Wwise::Command::PostEventWork` RTTI name (file offset `0x5F178C`) has
+no pointer anywhere in the image. That is the next lead.
+
+**Android side: written, compile-checked, never run.** `src/host/aaudio_sink.c`
+(AAudio exclusive then shared, 48 kHz stereo float, I16 conversion, WAV dump)
+compiles clean with NDK 28.2.13676358 for `aarch64-linux-android26`; it is not
+in any CMake target and has never touched a device. `docs/AUDIO_ANDROID.md` is
+the hand-off: the contract, the eight XAudio2 semantics that cost defects on
+Windows, the exact integration steps, and the pitfall list. The Android host
+has no XAudio2 shim at all yet, so M3's job is the device; the sink is ready.
+
+**Docs moved.** `docs/audio.md` gained section 10 (this status) and the old
+sections 10/11/12 are now 11/12/13, with every `§` reference in the document
+rewritten to match. Any older note that cites "audio.md section 12" means the
+second-session verification, which is now section 13.

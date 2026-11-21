@@ -210,7 +210,7 @@ needed.
   exe: `bgm_sync_ssbgm1`. Values include `NORMAL`/`Normal` and `Prologue`
   (recovered by hash). These are what the game posts during play — useful as M5
   hooks when checking "is the right cue playing". **[V ids, H meaning]**
-  *Refined in §12.2d: the switch containers use **14 distinct** groups (18
+  *Refined in §13.2d: the switch containers use **14 distinct** groups (18
   argument instances), none named; `bgm_sync_ssbgm1` is one of the 11 global
   **state** groups from `Init.bnk`, not a switch group.*
 
@@ -323,7 +323,7 @@ prefetch head (no `stream\<id>.wem`), so no local length exists.
 | `bgm_pstart` | 1551659340 | 0 | 0.0 |
 
 Verified count: **97 named events** (of 295). The six `AvatarState_*` rows are
-the only non-`bgm_` names in this bank. Regenerate with the commands in §10;
+the only non-`bgm_` names in this bank. Regenerate with the commands in §11;
 do not hand-edit this table.
 
 ---
@@ -463,11 +463,11 @@ The engine creates its audio device through **COM**, not through an import: the
 2014 triage (§2 of the plan) found no `XAudio2_*.dll` import and flagged
 `ole32!CoCreateInstance` as the instantiation path. So M4 = a COM server.
 
-**Resolved (§12.2a): the binary asks for the XAudio2 2.7 pair** —
+**Resolved (§13.2a): the binary asks for the XAudio2 2.7 pair** —
 `CLSID_XAudio2 {5a508685-a254-4fba-9b82-9a24b00306af}` (and its `_Debug`
 variant), `IID_IXAudio2 {8bcf1f58-9fe7-4583-8ac6-e2adc465c8bb}`, all three present
 in `.rdata`; the 2.8 IID is absent. The 2.7 vtable has three extra head methods,
-see the layout in §12.2a - laying it out from a 2.8 header shifts every call by
+see the layout in §13.2a - laying it out from a 2.8 header shifts every call by
 three slots. Still log every call by vtable index at M2.9 to pin the voice
 interfaces.
 
@@ -561,7 +561,125 @@ Every ID below is from the verified table in §4.1 / §5.
 
 ---
 
-## 10. Reproduction recipes
+## 10. M4 status: the Windows sink, as built and measured (2026-11-21)
+
+Route A is implemented, not proposed: the lifted engine keeps its own Wwise/CRI
+mixer, and the host supplies only the sink. The XAudio2 2.7 device the engine
+asks for is `src/host/xaudio2_stub.c`; the output stage is
+`src/host/wasapi_sink.c`; the contract between them is `src/host/audio_sink.h`.
+The Android twin (`src/host/aaudio_sink.c`) is written but never ran on a
+device - `docs/AUDIO_ANDROID.md` is the hand-off.
+
+### 10.1 Shape
+
+```
+engine thread                 xaudio2_stub.c (mixer)        sink thread (WASAPI)
+ SubmitSourceBuffer   ->  slice queue {start,end,data,ctx}
+ GetState/OnBufferEnd <-  retire, SamplesPlayed, counter  <-  render(frames)
+```
+
+* The sink owns one thread. It asks the mixer for exactly the frames the device
+  wants, event-driven (`AUDCLNT_STREAMFLAGS_EVENTCALLBACK`), shared mode,
+  float32 stereo 48 kHz, with `AUTOCONVERTPCM | SRC_DEFAULT_QUALITY` so a
+  device that is not 48 kHz still works. Buffer measured: **1056 frames
+  (22.0 ms)**. Fallbacks: `GetMixFormat` + local resampler, then waveOut, then a
+  real-time null backend (so a dump is still produced with no sound card).
+* The mixer resamples 32 kHz sources, downmixes 1/3/4/5/6/7/8 channels to
+  stereo, applies per-voice volume and the engine's own output matrix, and
+  retires slices as they play. Retirement performs the guest `OnBufferEnd` body
+  (`*(u32 *)pBufferContext += 1`) - CRI blocks on that counter otherwise.
+* The sink starts lazily on the first `SubmitSourceBuffer` with real frames,
+  because the game creates and destroys an entire XAudio2 device per movie.
+* No guest code is ever entered from the mixer or the sink thread.
+
+### 10.2 Measured (acceptance 1 and the underrun half of 7)
+
+Run: `build\run_m4.exe`, `KORRA_XA2_VERBOSE=2`,
+`KORRA_AUDIO_DUMP=work\m4_matrix.wav`, 70 s, log
+`korra_host-20261121-203054.log`.
+
+| metric | value |
+|---|---|
+| sink opened | `WASAPI shared: 2 ch, 48000 Hz, 32 bits, buffer 1056 frames (22.0 ms)` |
+| first audible block | 0.032 s |
+| dump | 70.0 s, 16-bit 48 kHz stereo |
+| dump RMS | **-28.14 dBFS** (threshold: > -40 dBFS) |
+| dump peak | **-9.77 dBFS** (no clipping) |
+| steady-state window 3-22 s | RMS -26.85 dBFS, peak -9.77 dBFS |
+| underruns | 4 total: 5.9 s (first feed) and 21.7/21.9/22.2 s (movie device teardown); **0/min between 6 s and 21 s** |
+| `OnVoiceError` | 0 |
+| `CreateSourceVoice` formats logged | 2 ch float mask 0x0; 2 ch float mask 0x3; 6 ch float (5.1) |
+
+Silence is not success, and this is not silence: 25 s of engine-mixed PCM at
+about -27 dBFS RMS. The audio after 25 s is absent because the engine posts no
+event (10.5), not because the sink failed - the sink keeps running and logs
+`quiet` growing one second per second.
+
+### 10.3 The one defect that mattered: `SetOutputMatrix`
+
+The first dump measured RMS -16.06 dBFS and **peak 0.0 dBFS** - clipped. The
+mixer had treated `IXAudio2Voice::SetOutputMatrix` as a no-op and applied its
+own invented 0.7071/0.5 downmix coefficients on top of the engine's downmix.
+The engine installs a 2x2 matrix for its stereo voice and a 6x2 for the 5.1
+voice, and those levels are the mix. Storing and applying them moved the peak
+from +2.7 dBFS to -9.77 dBFS - an 11 dB error that would have been inaudible on
+a quiet laptop speaker and obvious on anything else.
+
+### 10.4 Which audio device the game really uses
+
+* **DirectSound8 is never created.** In a 72 s verbose-3 run the only
+  non-XAudio2 `CoCreateInstance` is `MMDeviceEnumerator` at boot
+  (`0x008701F0`, the guest's device-notification client) - not a stream. All
+  playback goes through the XAudio2 shim.
+* **Movie/boot audio is CRI's device** (`NcVoice`): one full device
+  create/teardown per movie, about 6.5 s apart, ending with
+  `DestroyVoice` + `UnregisterForCallbacks` + `Release`. That is the audio
+  heard from 0 to 25 s.
+* **The Hw/Wwise device is created, its voice started, and then never fed.**
+  Boot order: `CoCreateInstance -> Initialize(0,0xFFFFFFFF) ->
+  CreateMasteringVoice(2 ch) -> RegisterForCallbacks -> GetDeviceDetails ->
+  CreateSourceVoice(2 ch float mask 0x3) -> Start` from `0x0073EC80`. After
+  that: no submit, no `GetState`, no destroy, for the rest of the run. An
+  XAudio2 source voice is push-only, so no event means no audio, and no event is
+  ever posted on a screen this build can reach.
+
+### 10.5 Not proven: acceptance tests 2-6
+
+Tests 2-6 need a posted Wwise event, and the Windows host cannot reach a screen
+that posts one. The title screen (`PRESS ANY BUTTON`) appears around 35-45 s,
+runs at 29-30 fps with the pad polled, and posts nothing. Pressing A leaves the
+title around 40 s onto a static black screen while the process stays alive at
+~57 ticks/s with `present=0/s` - the M3 frame-pass-queue fault described at the
+end of `docs/FINDINGS.md`, upstream of audio. Posting the events from the host
+instead is not yet possible either: the only name-hash in the image
+(`0x00847B10`, FNV-1 over the lowercased name - it reproduces every ID in §9.4
+exactly) is reached only from wide-string filename helpers, and the
+`Hw::Wwise::Command::PostEventWork` RTTI name has no pointer in the image. That
+is the next lead, and it is a Wwise-internals job, not a sink job.
+
+What that means honestly: the sink is done and measured; the §9.4 *event* tests
+are blocked by the same thing that blocks the menu, and no number in this
+section should be read as "menu music works".
+
+### 10.6 Reproduce on Windows
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_host.ps1 -Jobs 8
+Copy-Item build\korra_recomp.exe build\run_m4.exe -Force
+$env:KORRA_XA2_VERBOSE='1'
+$env:KORRA_AUDIO_DUMP="$PWD\work\m4_audio.wav"
+$env:KORRA_AUDIO_LOG='1'
+build\run_m4.exe "The Legend of Korra"      # logs to <game>\korra_host-*.log
+```
+
+Then measure the dump (`RMS > -40 dBFS` is the pass line) and read the
+`[sink]` lines: one per second with `frames/peak/rms/quiet/underruns`. Drop the
+sink in with `KORRA_AUDIO_BACKEND=null` to compare against the M2.9 clock, or
+`KORRA_NO_AUDIO=1` to remove the shim entirely.
+
+---
+
+## 11. Reproduction recipes
 
 ```powershell
 # self-check: re-derive every claim in this document (25 assertions, exits non-zero on drift)
@@ -593,7 +711,7 @@ python wwiser.py -d xml -dn bgm.xml "…\sound\bgm\BGM.bnk"
 
 ---
 
-## 11. Open questions
+## 12. Open questions
 
 1. **`core.bnk`** (in `data000.cpk`): size, event count, whether it uses the same
    Wwise version. Blocks the other 2,286 events → Track B.
@@ -604,16 +722,16 @@ python wwiser.py -d xml -dn bgm.xml "…\sound\bgm\BGM.bnk"
 4. Does the engine create **more than one** mastering voice (e.g. a CRI one for
    `NcVoice`, never used because it has no content)? Check the COM call log during
    M2.9 — if a second device is created and never fed, stub it immediately and log it.
-   *(The CLSID/interface family is settled in §12.2a — 2.7, normal + debug; the
+   *(The CLSID/interface family is settled in §13.2a — 2.7, normal + debug; the
    "how many devices" half still needs the runtime log.)*
 
 ---
 
-## 12. Second-session verification (2026-11-19)
+## 13. Second-session verification (2026-11-19)
 
 This section was added by a **second, independent** session before M4 starts
 using this document. Nothing above was rewritten; three short additions were
-inserted instead (§4 sync-group note, §9.1 XAudio2 version, §11 item 4 pointer).
+inserted instead (§4 sync-group note, §9.1 XAudio2 version, §12 item 4 pointer).
 Method differs on purpose - own HIRC resolver over a `wwiser -d xml` dump, own
 RIFF/DIDX/`.wai` parsers, `vgmstream-cli r2168` as the only decode oracle - so
 that agreement is evidence and not a copy.
@@ -654,7 +772,7 @@ Decoded sample set (peak / RMS of the whole file, 16-bit WAV from vgmstream):
 ### 12.2 New facts and corrections
 
 **(a) The XAudio2 version is 2.7 - GUIDs located in `LoK.exe` [V].** This closes
-the `[H until then]` in §9.1 and most of §11 item 4 without runtime logging:
+the `[H until then]` in §9.1 and most of §12 item 4 without runtime logging:
 
 | constant | GUID | file offset |
 |---|---|---|
@@ -696,7 +814,7 @@ different output stage. [H on the registry outcome, V on the GUIDs]
 |---|---|---|
 | `fVolumeThreshold` | -80 dB | voices below this are culled by the engine, not by the host |
 | `maxNumVoicesLimitInternal` | **256** | upper bound of concurrent voices the graph can ask for; size ring buffers/pools for this |
-| `ulNumStateGroups` | 11 | global state groups (§12.2d names one) |
+| `ulNumStateGroups` | 11 | global state groups (§13.2d names one) |
 | transitions | 9 explicit, defaults 1000 ms, one group 3000 ms, one 0 ms | music bed crossfades are engine-side |
 
 Exact STMG layout for anyone parsing it without wwiser: `f32 fVolumeThreshold`
@@ -764,7 +882,7 @@ that is not a prefix head. The other 24 are ~34-56 KB heads.
 
 ### 12.4 What this changes for M2.9 / M4
 
-* Implement the **2.7** `IXAudio2` layout from §12.2a verbatim, with a
+* Implement the **2.7** `IXAudio2` layout from §13.2a verbatim, with a
   name-per-slot dispatch table so every call logs `index + name + args`. That
   turns the first M2.9 run into a call trace instead of a debug session, and it
   is where any remaining uncertainty about the voice interfaces is settled.
@@ -778,4 +896,4 @@ that is not a prefix head. The other 24 are ~34-56 KB heads.
   25 s placeholder cues.
 * Still open after this session: `core.bnk` contents/size (Track B), the `.wai`
   flag bits, and whether the engine constructs a second (CRI) mastering voice
-  that is never fed - all three stay as §11 items 1-4.
+  that is never fed - all three stay as §12 items 1-4.

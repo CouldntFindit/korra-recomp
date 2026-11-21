@@ -311,3 +311,40 @@ Append only; newest last. Format: date — attempt — outcome — next idea.
 - A change is done when a build ran and the log/screenshot proves it. State what
   was *not* verified.
 - Keep the status table in `README.md` honest.
+
+- 2026-11-21 — "WASAPI is not available on this machine" — **it was never
+  tried.** `sink_thread` switched on `KORRA_AUDIO_BACKEND` with
+  `case WASAPI: ... default: break;`, and the auto value is -1, so it fell
+  straight to the `falling back to waveOut` line without attempting WASAPI at
+  all. A missing log line was the only symptom; the backend itself works
+  (shared, event-driven, `AUTOCONVERTPCM`, 1056-frame buffer, 22 ms). Log the
+  backend you *chose* before opening it, and never let `default:` mean
+  "do nothing".
+- 2026-11-21 — treating `IXAudio2Voice::SetOutputMatrix` as a no-op because
+  "CRI computes the downmix itself" — **the engine's matrix is the mix.** With
+  invented 0.7071/0.5 coefficients the dump measured RMS -16.1 dBFS and peak
+  **0.0 dBFS** (clipped); storing the engine's 2x2 (stereo voice) and 6x2 (5.1
+  voice) matrices and applying them gives peak -9.8 dBFS. 11 dB of error that
+  only a measurement caught. Install the levels, do not re-derive them.
+- 2026-11-21 — a log line written as prefix + body in two `fwrite`s — the sink
+  thread and the guest thread interleaved them into lines like
+  `[xa2] [xa2] SubmitSourceBuffer... voice ... ran dry`. Same lesson as the
+  runtime trace earlier: build the whole line in one buffer and write it once
+  (`vsnprintf` + one `fwrite` + `fflush`).
+- 2026-11-21 — "the title screen is silent, so the sink is broken" — **it is
+  not the sink.** The Hw/Wwise device is created, its 2 ch float voice is
+  started from `0x0073EC80`, and then nothing is ever submitted to it: no
+  event is posted on any screen this build reaches, and an XAudio2 source voice
+  is push-only. The movie/boot audio (CRI's device, a full create/teardown per
+  movie) is the only thing the engine feeds, and it comes out at -26.8 dBFS RMS
+  through the sink. Do not chase Wwise silence until something posts an event.
+- 2026-11-21 — finding Wwise's `PostEvent` by its name hash — **closed, not
+  solved.** Event IDs are FNV-1 over the lowercased name and `0x00847B10`
+  reproduces every ID in `docs/audio.md` 9.4 exactly, but its only callers are
+  wide-string filename helpers (`0x007685C0`/`0x00768C60` via `0x007672A2`,
+  `0x00766E02`) with extension stripping - the file/package layer, not events.
+  The `Hw::Wwise::Command::PostEventWork` RTTI name (file offset `0x5F178C`,
+  followed by `StopEventWork`, `ObjectSwitchWork`, `ReleaseEventWork`) has no
+  pointer to it anywhere in the image, so there is no TypeDescriptor chain to
+  follow. Next: locate the class through its code (the command queue's vtable),
+  not through RTTI.
