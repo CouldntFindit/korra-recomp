@@ -33,7 +33,7 @@ side (Win32, D3D9 surface, XInput, XAudio2, CRI/Wwise audio, Steam stubs).
 | M1 | Seeds + function catalog + full lift to C | **done**: 37,327/37,327 functions, 0 lift failures — see [`docs/LIFT_REPORT.md`](docs/LIFT_REPORT.md) |
 | M2 | Boots to the main menu on Windows (no Steam, silent, movies skipped) | **done (2026-11-20)** — boots without Steam, text renders, new game runs into the first area at 39-58 fps uncapped; the crash and missing-text defects had one cause (the lifter's `pcmpistri` flag model). Log: [`docs/FINDINGS.md`](docs/FINDINGS.md) |
 | M3 | Boots and plays the first area on an Android arm64 device | **in progress** — **first device frame 2026-11-21**: the S24 (Exynos 2400, Xclipse 940, stock Vulkan driver) runs the game's full graphics init through DXVK-native (MAILBOX present mode), 191/191 imports bound, 37,327 functions dispatched, rendered frames presenting ([`docs/ANDROID_BRINGUP.md`](docs/ANDROID_BRINGUP.md)). Remaining to the gate: title screen, SAF GameData install, touch → XInput, first playable area at 30 fps |
-| M4 | Audio: Wwise + CRI behind a host mixer | spec ready ([`docs/audio.md`](docs/audio.md)), implementation not started |
+| M4 | Audio: Wwise + CRI behind a host mixer | **sink done + measured (2026-11-21)** - engine keeps its Wwise/CRI mixer; host supplies XAudio2 2.7 + a WASAPI sink. Acceptance 1 passes (RMS -28.14 dBFS, peak -9.77 dBFS); test 2 fails because no Wwise event is posted, tests 3-6 blocked - [`docs/audio.md`](docs/audio.md) |
 | M5 | Gameplay validation, framerate hooks, full playthrough | not started |
 
 Parallel research tracks (each has its own document):
@@ -43,7 +43,7 @@ Parallel research tracks (each has its own document):
 | A | Audio stack inventory → the M4 spec | **done + independently confirmed** (44/44 assertions) — [`docs/audio.md`](docs/audio.md) |
 | B | CPK archives + USM movies → M2.10 and optional movies | **done + independently confirmed** (45/45) — [`docs/assets.md`](docs/assets.md) |
 | C | Ghidra subsystem triage → M2 hooks and M5 frame pacing | **done** — [`docs/quirks.md`](docs/quirks.md) |
-| D | Host shims: `steam_api` + silent XAudio2 2.7 COM | **done**, selftest 54/54 — [`docs/xaudio2_callsites.md`](docs/xaudio2_callsites.md) |
+| D | Host shims: `steam_api` + XAudio2 2.7 COM + WASAPI sink | **done**, selftest 60/60 - [`docs/xaudio2_callsites.md`](docs/xaudio2_callsites.md) |
 | E | Publishing: mirror script, README/notices upkeep | **done** — [`docs/PUBLISHING.md`](docs/PUBLISHING.md) |
 
 Exact toolchain pin and per-milestone findings: [`docs/TOOLCHAIN.md`](docs/TOOLCHAIN.md),

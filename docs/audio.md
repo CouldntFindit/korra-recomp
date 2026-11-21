@@ -701,7 +701,7 @@ underrun half of 7 pass; 2 fails on the engine side (no event posted) and 3-6
 cannot be exercised at all. No number in this section should be read as "menu
 music works".
 
-### 10.7 Running a menu session on Windows (second-session recipe)
+### 10.6 Running a menu session on Windows (second-session recipe)
 
 The title screen only presents when the game owns the foreground, and the
 engine's keyboard path is DirectInput (injected keys are ignored). Use the pad:
@@ -726,7 +726,7 @@ focused: `reg add "HKCU\Software\Microsoft\DirectX\UserGpuPreferences" /v
 `nvidia-smi --query-compute-apps=pid,process_name`. Note the dump: movie audio
 ends at ~30 s, and everything after is exact zeros until an event is posted.
 
-### 10.6 Reproduce on Windows
+### 10.7 Reproduce on Windows
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\build_host.ps1 -Jobs 8
@@ -755,7 +755,7 @@ sink file is required: without it the link fails on
 script gap, not an untracked source file).
 
 For the title/menu screens this recipe is not enough on its own - the game must
-be foreground or it never calls `Present`; see 10.7.
+be foreground or it never calls `Present`; see 10.6.
 
 ---
 
