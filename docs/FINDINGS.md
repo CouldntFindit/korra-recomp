@@ -2903,3 +2903,53 @@ and not committed.
 posts an event (the `WwiseInfo.wai` IDs are compile-time constants in the
 guest, so a watch on one of them or on the queue object is a better handle than
 the `PostEventWork` RTTI name), then the same three assertions as before.
+
+## 2026-11-22 - Task 2 root cause: two D3D9 shim argument contracts, both host-side
+
+Device: Galaxy S24 (Exynos 2400, Xclipse 940, stock Vulkan 1.3.304), DXVK-native,
+build c2d05d0. Probes: `debug.korra.gate=1`
+(`src/host_android/gate_probe_android.c`, three lines every 250 ms) plus the
+`[hr]` trampoline in `spine_android.c`; the Windows reference ran the same
+census from `src/host/gate_probe.c` with `KORRA_GATE=1`.
+
+**The field.** On Windows `[shader+0x30]+4` holds a live D3D9 interface pointer
+(0x40508780 / 0x40E174E0). On the device it was 0 in every run. That pointer is
+what `sub_00756600`'s cached branch pushes into `SetRenderTarget(0, ...)`.
+
+**Defect 1 - ppSurface / pSharedHandle swapped.** `d_CreateRenderTarget` and
+`d_CreateDepthStencilSurface` wrote the guest token through `A32(7)` (the
+engine's NULL pSharedHandle slot) and passed `A32(6)` as pSharedHandle. Every
+call returned S_OK, so nothing logged a failure, but the engine's surface
+pointer stayed 0. With `ppSurface = A32(6)`:
+`CreateRenderTarget 1280x720 fmt=21 -> 0x00000000 out=200C41A4 shared=00000000
+tok=3463FB20`, and the next census line reads
+`[gate] obj 3a00 ... o34=3463FB20`.
+
+**Defect 2 - interface tokens passed as pointers.** StretchRect, ColorFill,
+UpdateSurface, UpdateTexture, GetRenderTargetData, GetFrontBufferData and
+swapchain GetFrontBufferData cast guest tokens straight to interface pointers;
+DXVK then dereferenced guest memory as a COM object (addr=0x24 inside
+`D3D9DeviceEx::StretchRect`, caller `sub_00756580`). They now resolve through
+`obj_of()` like the other setters always did.
+
+**Measured chain before the fixes.** `[shader+0x30]+4 == 0` ->
+`SetRenderTarget(0, 0)` -> DXVK returns D3DERR_INVALIDCALL 0x8876086C exactly as
+real d3d9 does -> the 0x756B00 gate (`js` after 00756600) bails -> sub_00748CB0
+skips the 5x movq -> `[0xE4D094]` stays 0 -> the pass flush dereferences NULL+4
+in sub_007492B0. 117 such failures per 40 s run; the `[hr]` census found no other
+negative HRESULT in the whole session (3 false positives from `SteamUser:2`
+returning a pointer with the sign bit set).
+
+**After both fixes (run 12).** `[hr]` is down to those 3 false positives, every
+SetRenderTarget failure is gone, `[0xE4D094]` reaches 0xE1DA54 for the first
+time, and `edx` at the crash holds 0xE1DA54. The crash is still sub_007492B0 at
+the pass flush, and the last gate sample before it reads
+`ctx30=00000000` again: something between the install and the flush clears the
+slot (candidates: the six reset siblings in sub_00556330, or the clear path
+sub_00749020). Not yet identified.
+
+**Not proven.** The >2 min stability run, a reach past the flush, the title
+screen capture, first-area fps, SAF install. Nothing was re-tested on Windows
+after these fixes.
+
+Committed: c2d05d0 (shims), 56df681 (probes).
