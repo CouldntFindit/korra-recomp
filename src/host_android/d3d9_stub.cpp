@@ -34,6 +34,10 @@ void ka_d3d9_window_changed(void) {}
 int  ka_d3d9_frame_presented(void) { return 0; }
 void ka_d3d9_shutdown(void) {}
 
+/* The D3D9 bridge decides the `this` convention per call; with no bridge there
+ * are no COM objects, so the flag stays 0 and nothing needs shifting. */
+void ka_vtable_note_import(const char *name) { (void)name; }
+
 int ka_d3dx_create_texture(void) { return (int)0x8876086Cu; }
 int ka_d3dx_texture_from_memory(void) { return (int)0x8876086Cu; }
 int ka_d3dx_cube_from_memory(void) { return (int)0x8876086Cu; }

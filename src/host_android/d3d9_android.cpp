@@ -22,6 +22,30 @@
 
 #include "host_android.h"
 
+/* ---------------------------------------------------------- `this` on x86
+ * The lifted code is 32-bit x86, where a COM call is just a call: the object
+ * pointer travels either in ECX (thiscall, what a C++ compiler emits for
+ * IDirect3D9) or as the first stack argument (what a hand-written __stdcall
+ * vtable call emits). This engine is MSVC-built but its D3D9 calls are not
+ * uniform - sub_007597C0 pushes the object and leaves ECX holding a local
+ * (docs/FINDINGS.md). Decide once per call, at dispatch, and shift A32/RET by
+ * the same amount, so no thunk has to care.
+ *
+ * g_d9_stack_this is 0 for the ECX convention and 1 when the object was the
+ * first pushed argument. ka_vtable_note_import() sets it from the shim name;
+ * see spine_android.c's recomp_lookup_import. */
+static thread_local int g_d9_stack_this;
+static inline uint32_t d9_a32(int i) {
+    return MEM32(g_esp + 4u + 4u * (uint32_t)(i + g_d9_stack_this));
+}
+#undef A32
+#define A32(i) d9_a32(i)
+#undef RET
+#define RET(eax, argc) do { \
+        g_eax = (uint32_t)(eax); \
+        g_esp += 4u + 4u * (uint32_t)((argc) + g_d9_stack_this); \
+        return; } while (0)
+
 extern "C" {
 struct ANativeWindow;
 /* dxvk-native exports the D3D9 entry point as a plain C symbol. */
@@ -83,6 +107,18 @@ Obj *obj_of(uint32_t token) {
     return nullptr;
 }
 
+/* Called by recomp_lookup_import before every shim runs. For a synthetic COM
+ * slot ("kind:index") decide the convention; for anything else clear it, so a
+ * stale stack-this cannot leak into Direct3DCreate9 or a kernel32 call. At
+ * dispatch the guest's args are already pushed and the dummy return address is
+ * not, so MEM32(g_esp) is what A32(0) will be. */
+extern "C" void ka_vtable_note_import(const char *name) {
+    if (name && strchr(name, ':'))
+        g_d9_stack_this = obj_of(MEM32(g_esp)) ? 1 : 0;
+    else
+        g_d9_stack_this = 0;
+}
+
 uint32_t new_token(Kind kind, void *p, uint32_t owner) {
     uint32_t idx = g_obj_count++;
     uint32_t obj = ka_guest_alloc(12, 4);
@@ -98,18 +134,65 @@ uint32_t new_token(Kind kind, void *p, uint32_t owner) {
     return obj;
 }
 
-uint32_t self_kind() { Obj *o = obj_of(g_ecx); return o ? (uint32_t)o->kind : 0; }
-Obj *self_obj() { return obj_of(g_ecx); }
+/* Stack convention: the retaddr is already pushed, so A32(0) is at g_esp+4. */
+Obj *self_obj() {
+    return obj_of(g_d9_stack_this ? MEM32(g_esp + 4u) : g_ecx);
+}
+uint32_t self_kind() { Obj *o = self_obj(); return o ? (uint32_t)o->kind : 0; }
 
 #define SELF_AS(T, K) \
     (reinterpret_cast<T *>(self_obj() && self_obj()->kind == (K) ? self_obj()->p : nullptr))
 
-void fill_device_window(D3DPRESENT_PARAMETERS *pp) {
-    if (!pp) return;
-    pp->hDeviceWindow = dxvkAndroidGetWindowHandle();
+/* The guest is 32-bit: its D3DPRESENT_PARAMETERS is the SDK's 56 bytes with a
+ * 4-byte HWND. dxvk-native's HWND is a host pointer, so its struct is 64 bytes
+ * on arm64 and MUST NOT be overlaid on guest memory - measured on device, the
+ * 8-byte HWND shifted every field after SwapEffect, so `Windowed` read 75
+ * (D3DFMT_D24S8) and the depth format read 0, and DXVK refused the device with
+ * D3DERR_NOTAVAILABLE. Convert at every boundary instead. */
+struct KaPP {
+    uint32_t width, height, format, count;
+    uint32_t msaa, quality;
+    uint32_t swap_effect, hwnd;
+    uint32_t windowed, auto_depth, depth_format, flags;
+    uint32_t refresh, interval;
+};
+static_assert(sizeof(KaPP) == 56, "guest D3DPRESENT_PARAMETERS must be 56 bytes");
+
+void pp_from_guest(const KaPP *g, D3DPRESENT_PARAMETERS *h) {
+    memset(h, 0, sizeof *h);
+    h->BackBufferWidth = g->width;
+    h->BackBufferHeight = g->height;
+    h->BackBufferFormat = (D3DFORMAT)g->format;
+    h->BackBufferCount = g->count;
+    h->MultiSampleType = (D3DMULTISAMPLE_TYPE)g->msaa;
+    h->MultiSampleQuality = g->quality;
+    h->SwapEffect = (D3DSWAPEFFECT)g->swap_effect;
+    h->Windowed = (WINBOOL)g->windowed;
+    h->EnableAutoDepthStencil = (WINBOOL)g->auto_depth;
+    h->AutoDepthStencilFormat = (D3DFORMAT)g->depth_format;
+    h->Flags = g->flags;
+    h->FullScreen_RefreshRateInHz = g->refresh;
+    h->PresentationInterval = g->interval;
+    h->hDeviceWindow = dxvkAndroidGetWindowHandle();
     /* The doc's rule: never let BackBufferCount be 0 - with one image the CPU
      * can run at most a frame ahead and Present blocks the game thread. */
-    if (pp->BackBufferCount < 2) pp->BackBufferCount = 2;
+    if (h->BackBufferCount < 2) h->BackBufferCount = 2;
+}
+
+void pp_to_guest(const D3DPRESENT_PARAMETERS *h, KaPP *g) {
+    g->width = h->BackBufferWidth;
+    g->height = h->BackBufferHeight;
+    g->format = (uint32_t)h->BackBufferFormat;
+    g->count = h->BackBufferCount;
+    g->msaa = (uint32_t)h->MultiSampleType;
+    g->quality = h->MultiSampleQuality;
+    g->swap_effect = (uint32_t)h->SwapEffect;
+    g->windowed = (uint32_t)h->Windowed;
+    g->auto_depth = (uint32_t)h->EnableAutoDepthStencil;
+    g->depth_format = (uint32_t)h->AutoDepthStencilFormat;
+    g->flags = h->Flags;
+    g->refresh = h->FullScreen_RefreshRateInHz;
+    g->interval = h->PresentationInterval;
 }
 
 /* ------------------------------------------------------- IUnknown / shared */
@@ -211,23 +294,26 @@ void i9_GetDeviceCaps() {
                                                    (D3DCAPS9 *)P(A32(2))), 3);
 }
 void i9_CreateDevice() {
-    D3DPRESENT_PARAMETERS *pp = (D3DPRESENT_PARAMETERS *)P(A32(4));
+    const KaPP *gpp = (const KaPP *)P(A32(4));
+    D3DPRESENT_PARAMETERS pp;
+    D3DPRESENT_PARAMETERS *ppp = nullptr;
     IDirect3DDevice9 *dev = nullptr;
     uint32_t out = A32(5);
-    D3DPRESENT_PARAMETERS saved;
     HRESULT hr;
 
-    if (pp) {
-        saved = *pp;
-        fill_device_window(pp);
+    if (gpp) {
+        pp_from_guest(gpp, &pp);
+        ppp = &pp;
         ka_log("d3d9: CreateDevice adapter=%u type=%u hwnd=%08X flags=0x%X "
-               "pp=%ux%u fmt=%u interval=%u windowed=%u",
+               "pp=%ux%u fmt=%u windowed=%u autodepth=%u depthfmt=%u "
+               "count=%u swap=%u interval=0x%08X",
                A32(0), A32(1), A32(2), A32(3),
-               pp->BackBufferWidth, pp->BackBufferHeight, pp->BackBufferFormat,
-               pp->PresentationInterval, pp->Windowed);
+               gpp->width, gpp->height, gpp->format, gpp->windowed,
+               gpp->auto_depth, gpp->depth_format, gpp->count,
+               gpp->swap_effect, gpp->interval);
     }
     hr = SELF_AS(IDirect3D9, K_D3D9)->CreateDevice(
-        A32(0), (D3DDEVTYPE)A32(1), dxvkAndroidGetWindowHandle(), A32(3), pp, &dev);
+        A32(0), (D3DDEVTYPE)A32(1), dxvkAndroidGetWindowHandle(), A32(3), ppp, &dev);
     ka_log("d3d9: CreateDevice -> 0x%08X device=%p", (unsigned)hr, (void *)dev);
     if (out) MEM32(out) = (hr == D3D_OK && dev) ? new_token(K_DEVICE, dev, 0) : 0;
     RET((uint32_t)hr, 6);
@@ -258,10 +344,11 @@ void d_SetCursorPosition() { RET(0, 3); }
 void d_ShowCursor() { RET(0, 1); }
 void d_CreateAdditionalSwapChain() {
     IDirect3DSwapChain9 *sc = nullptr;
-    D3DPRESENT_PARAMETERS *pp = (D3DPRESENT_PARAMETERS *)P(A32(0));
+    const KaPP *gpp = (const KaPP *)P(A32(0));
+    D3DPRESENT_PARAMETERS pp;
     HRESULT hr;
-    if (pp) fill_device_window(pp);
-    hr = DEV->CreateAdditionalSwapChain(pp, &sc);
+    if (gpp) pp_from_guest(gpp, &pp);
+    hr = DEV->CreateAdditionalSwapChain(gpp ? &pp : nullptr, &sc);
     if (A32(1)) MEM32(A32(1)) = SUCCEEDED(hr) ? new_token(K_SWAPCHAIN, sc, g_ecx) : 0;
     RET((uint32_t)hr, 2);
 }
@@ -273,16 +360,15 @@ void d_GetSwapChain() {
 }
 void d_GetNumberOfSwapChains() { RET(DEV->GetNumberOfSwapChains(), 0); }
 void d_Reset() {
-    D3DPRESENT_PARAMETERS *pp = (D3DPRESENT_PARAMETERS *)P(A32(0));
-    D3DPRESENT_PARAMETERS saved;
+    const KaPP *gpp = (const KaPP *)P(A32(0));
+    D3DPRESENT_PARAMETERS pp;
     HRESULT hr;
-    if (pp) {
-        saved = *pp;
-        fill_device_window(pp);
-        ka_log("d3d9: Reset %ux%u fmt=%u windowed=%u", pp->BackBufferWidth,
-               pp->BackBufferHeight, pp->BackBufferFormat, pp->Windowed);
+    if (gpp) {
+        pp_from_guest(gpp, &pp);
+        ka_log("d3d9: Reset %ux%u fmt=%u windowed=%u depthfmt=%u", gpp->width,
+               gpp->height, gpp->format, gpp->windowed, gpp->depth_format);
     }
-    hr = DEV->Reset(pp);
+    hr = DEV->Reset(gpp ? &pp : nullptr);
     ka_log("d3d9: Reset -> 0x%08X", (unsigned)hr);
     RET((uint32_t)hr, 1);
 }
@@ -621,7 +707,15 @@ void s_GetBackBuffer() {
 void s_GetRasterStatus() { RET_HR(SELF_AS(IDirect3DSwapChain9, K_SWAPCHAIN)->GetRasterStatus((D3DRASTER_STATUS *)P(A32(0))), 1); }
 void s_GetDisplayMode() { RET_HR(SELF_AS(IDirect3DSwapChain9, K_SWAPCHAIN)->GetDisplayMode((D3DDISPLAYMODE *)P(A32(0))), 1); }
 void s_GetDevice() { RET(self_obj() ? self_obj()->owner : 0, 0); }
-void s_GetPresentParameters() { RET_HR(SELF_AS(IDirect3DSwapChain9, K_SWAPCHAIN)->GetPresentParameters((D3DPRESENT_PARAMETERS *)P(A32(0))), 1); }
+void s_GetPresentParameters() {
+    void *dst = P(A32(0));
+    D3DPRESENT_PARAMETERS pp;
+    HRESULT hr;
+    memset(&pp, 0, sizeof pp);
+    hr = SELF_AS(IDirect3DSwapChain9, K_SWAPCHAIN)->GetPresentParameters(&pp);
+    if (SUCCEEDED(hr) && dst) pp_to_guest(&pp, (KaPP *)dst);
+    RET((uint32_t)hr, 1);
+}
 
 /* --------------------------------------------------------------- textures */
 #define TEX (reinterpret_cast<IDirect3DTexture9 *>(self_obj()->p))

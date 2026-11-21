@@ -66,6 +66,11 @@ $logs = Join-Path $root "logs"
 New-Item -ItemType Directory -Force -Path $logs | Out-Null
 
 & $adb logcat -c
+# The activity pauses (and the guest stops) the moment the screen goes off, so
+# a run must keep the screen on for its whole length.
+& $adb shell svc power stayon true | Out-Null
+& $adb shell input keyevent KEYCODE_WAKEUP | Out-Null
+& $adb shell settings put system screen_off_timeout 1800000 | Out-Null
 & $adb shell am force-stop $Package
 & $adb shell am start -n "$Package/.MainActivity" | Out-Host
 Start-Sleep -Seconds $Seconds

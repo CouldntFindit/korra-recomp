@@ -57,7 +57,12 @@ static void *guest_thread(void *arg) {
     (void)arg;
     ka_log("guest: entry 0x%08X, dispatch %u functions", ka_pe_entry(),
            (unsigned)recomp_dispatch_count);
+    /* Lifted spin-waits must hand the machine to the thread they wait for. */
+    recomp_yield_hook = ka_machine_yield;
+    ka_log("guest: yield hook %s", recomp_yield_hook ? "installed" : "missing");
+    ka_spine_watchdog_start();
     mach_enter();
+    ka_spine_note_main();
     hle_call_guest(ka_pe_entry(), 0, NULL);
     mach_leave();
     ka_log("guest: CRT entry returned (exit %u) - the game loop is over", g_eax);
@@ -74,6 +79,7 @@ int ka_guest_run(const char *game_root) {
     ka_set_guest_module(exe);
     ka_log("host: game root %s", g_root);
     ka_trace_init();
+    ka_crash_init();
 
     if (ka_mem_init() != 0) return -1;
     ka_shims_register_all();

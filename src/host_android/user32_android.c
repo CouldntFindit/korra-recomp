@@ -205,16 +205,27 @@ static void u_BeginPaint(void) {
     RET(0x7200, 2);
 }
 static void u_EndPaint(void) { RET(1, 2); }
+/* A short, honest mode list: the surface we render into, and nothing else.
+ * Windows answers FALSE once iModeNum is past the last mode, which is how a
+ * caller's enumeration loop ends - answering TRUE for every index (as this
+ * did) traps the engine in `EnumDisplaySettingsA` forever (found on device,
+ * docs/FINDINGS.md). ENUM_CURRENT_SETTINGS (0xFFFFFFFF) is mode 0 here. */
 static void u_EnumDisplaySettingsA(void) {
+    uint32_t index = A32(1);
     uint32_t dm = A32(2);
-    if (dm) {
-        memset(ka_host(dm), 0, 156);
-        MEM32(dm + 40) = 0x400000;   /* dmFields: PELSWIDTH|PELSHEIGHT|BPP|FREQ */
-        MEM32(dm + 104) = 32;        /* dmBitsPerPel */
-        MEM32(dm + 108) = 1280;      /* dmPelsWidth */
-        MEM32(dm + 112) = 720;       /* dmPelsHeight */
-        MEM32(dm + 120) = 60;        /* dmDisplayFrequency */
+    static int logged;
+    if (!logged) {
+        ka_log("display: EnumDisplaySettingsA(iModeNum=%u) -> 1280x720x32@60", index);
+        logged = 1;
     }
+    if (!dm || (index != 0xFFFFFFFFu && index != 0)) RET(0, 3);
+    memset(ka_host(dm), 0, 156);
+    MEM32(dm + 36) = 156;        /* dmSize */
+    MEM32(dm + 40) = 0x400000;   /* dmFields: PELSWIDTH|PELSHEIGHT|BPP|FREQ */
+    MEM32(dm + 104) = 32;        /* dmBitsPerPel */
+    MEM32(dm + 108) = 1280;      /* dmPelsWidth */
+    MEM32(dm + 112) = 720;       /* dmPelsHeight */
+    MEM32(dm + 120) = 60;        /* dmDisplayFrequency */
     RET(1, 3);
 }
 

@@ -83,6 +83,16 @@ static inline void *ka_host_or_null(uint32_t va) {
 uint32_t hle_call_guest(uint32_t va, int nargs, const uint32_t *args);
 void     mach_enter(void);
 void     mach_leave(void);
+/* Releases the machine lock briefly; installed as the runtime's
+ * recomp_yield_hook so a lifted spin-wait lets the thread it waits for run. */
+void     ka_machine_yield(void);
+/* One-second stall reporter: names the machine holder's depth and function
+ * while no import is dispatched, which tells a silent lifted loop from a
+ * thread parked inside a shim. */
+void     ka_spine_watchdog_start(void);
+/* Records the caller as the guest main thread for the per-thread trace. */
+void     ka_spine_note_main(void);
+uint32_t ka_spine_main_fs(void);
 
 /* --------------------------------------------------------------- files */
 /* POSIX file layer over a fixed game root. Guest paths may be relative,
@@ -102,6 +112,7 @@ void ka_log(const char *fmt, ...);
 extern int ka_trace_imports;    /* KORRA_TRACE_IMPORTS=1: one line per shim */
 extern int ka_trace_files;
 void ka_trace_init(void);
+void ka_crash_init(void);       /* guest registers on SIGSEGV/SIGBUS/SIGILL/SIGFPE */
 
 /* ------------------------------------------------------------ services */
 void     ka_set_guest_module(const char *exe_path);
@@ -113,7 +124,8 @@ uint32_t ka_tls_get(uint32_t idx);
 void     ka_tls_set(uint32_t idx, uint32_t v);
 uint32_t ka_thread_attach(const char *why);   /* returns TIB VA for this thread */
 void     ka_thread_detach(void);
-uint32_t ka_thread_create(uint32_t start_va, uint32_t param);
+uint32_t ka_thread_create(uint32_t start_va, uint32_t param, int suspended);
+uint32_t ka_thread_resume(uint32_t token);   /* previous suspend count, 0xFFFFFFFF if unknown */
 uint32_t ka_thread_wait(uint32_t token, uint32_t timeout_ms);
 uint32_t ka_thread_exit_code(uint32_t token);
 int      ka_spine_depth(void);
@@ -144,6 +156,9 @@ int  ka_d3d9_init(void);               /* register interface thunks */
 void ka_d3d9_window_changed(void);
 int  ka_d3d9_frame_presented(void);
 void ka_d3d9_shutdown(void);
+/* Per-call `this` convention probe, called from recomp_lookup_import with the
+ * shim name (see d3d9_android.cpp). */
+void ka_vtable_note_import(const char *name);
 
 /* The guest's entry: run the lifted CRT entry on a host thread. Returns when
  * it returns (normally only through ExitProcess). */

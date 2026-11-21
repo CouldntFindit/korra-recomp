@@ -11,6 +11,9 @@
  * confused in log.txt.
  */
 #include <android/api-level.h>
+#include <sys/stat.h>
+#include <stdlib.h>
+#include <stdio.h>
 #include <android/native_window.h>
 #include <time.h>
 
@@ -139,6 +142,17 @@ extern "C" void android_main(android_app* app) {
         korra_logv("install: probed %s/game/LoK.exe - ready (internal)", internal);
     } else if (external && korra_install_probe(external)) {
         korra_logv("install: probed %s/game/LoK.exe - ready (external)", external);
+    }
+    /* DXVK's state cache path comes from DXVK_STATE_CACHE_PATH; without it the
+     * variable is empty and dxvk-native's create_directories("") throws
+     * (libc++abi: filesystem_error) at device creation. Point it at a directory
+     * this process owns. HOME is unset on Android, so there is no default. */
+    if (internal) {
+        char cache[512];
+        snprintf(cache, sizeof cache, "%s/dxvk-cache", internal);
+        mkdir(cache, 0755);
+        setenv("DXVK_STATE_CACHE_PATH", cache, 1);
+        korra_logv("dxvk: state cache %s", cache);
     }
     korra_perf_init();
     state.last_report_ns = now_ns();
