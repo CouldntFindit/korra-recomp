@@ -21,8 +21,9 @@ New-Item -ItemType Directory -Force -Path $out | Out-Null
 $cl = "cl /nologo /O1 /MT /W3 /D_CRT_SECURE_NO_WARNINGS /DWIN32_LEAN_AND_MEAN " +
       "/I$root\src\host /I$pcrecomp\runtime\recomp32 /I$pcrecomp\runtime\native32 " +
       "/Fo$out\ /Fe$out\selftest.exe " +
-      "tests\selftest_host_shims.c src\host\xaudio2_stub.c src\host\steam_stub.c " +
-      "/link ole32.lib user32.lib"
+      "tests\selftest_host_shims.c src\host\xaudio2_stub.c src\host\wasapi_sink.c " +
+      "src\host\steam_stub.c " +
+      "/link ole32.lib user32.lib winmm.lib"
 
 $cmd = Join-Path $out "build.cmd"
 @(

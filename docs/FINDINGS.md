@@ -2824,3 +2824,82 @@ name the fix. Until then Task 2 is **named, not fixed**, and this entry
 supersedes the two Task-2 readings above ("never written" and "would have bailed
 anyway" - the second is right about the *bail*, wrong about it happening before
 the deref).
+
+## 2026-11-21 - M4 verification session 2: the menu was always reachable; 2-6 are engine-side
+
+**1. Shared host selftest - green; the earlier red was a script gap, not an
+untracked file.** `scripts\run_selftest.ps1` compiled only
+`tests\selftest_host_shims.c`, `src\host\xaudio2_stub.c`,
+`src\host\steam_stub.c`. Since `d594acf` the stub calls
+`korra_audio_sink_start/live/note_underrun`, which live in the **committed**
+`src\host\wasapi_sink.c`, so the link failed with `LNK2019` x3 on a clean tree.
+Fix: add `src\host\wasapi_sink.c` to the compile line and `winmm.lib` to the
+link line. Green twice: `60 passed, 0 failed`, exit 0, sink
+`WASAPI shared: 2 ch, 48000 Hz, 32 bits, buffer 1056 frames (22.0 ms)`,
+`XAudio2 stub stats: 2 created, 1 destroyed, 1 live, 2 buffers, 8192 frames`.
+
+**2. The A-press black screen was the machine, not the M3 pass queue. Retracted.**
+The previous session's title->A "static black screen, 57 ticks/s, present=0/s"
+was a game that never owned the foreground: a D3D9 exclusive-fullscreen process
+that is not foreground never calls `Present`. Re-run with the window forced
+foreground 8 s after launch (`AttachThreadInput` + `ShowWindow` +
+`SetForegroundWindow` + `SetFocus`), and the same `build\run_m4b.exe` reaches a
+real menu:
+
+* Intel UHD (desktop 1920x1200): window 1920x1080, `present==tick` 44-58/s,
+  29-30/s on the title; title mean ~90/255, menu mean ~160/255; menu up from
+  ~50 s and parked 52-105 s; OCR of `work\...\stop_64s.png` = `Story`,
+  `Options`, `Exit` (`korra_host-20261121-232611.log`).
+* NVIDIA RTX 5050 via per-app `GpuPreference=2`
+  (`HKCU\Software\Microsoft\DirectX\UserGpuPreferences`): `nvidia-smi` lists the
+  pid at every sample, the GPU Engine counter shows luid `...0x123C5` beside the
+  Intel `...0x12023`, guest `eip` sits in `nvd3dum.dll`; 57-58 fps,
+  `present=present`, menu at 50 s (`korra_host-20261121-233050.log`). So the
+  per-app preference works, but a dGPU-preferred run that is **not** focused
+  shows no window at all - the same no-Present condition, not a cross-adapter
+  limit.
+* Gate/device state stayed clean in both (`flag=0`, `ctx30` cycling
+  `0x009DF3D8`/`0x00E1DA54`/`0`, `tce=0`, no `[crash]`), matching the Windows
+  oracle: there is no pass-queue fault to bisect here, and `d594acf` was not
+  bisected because the regression did not reproduce.
+
+**3. Acceptance tests, measured.** `KORRA_AUDIO_DUMP` + `KORRA_AUDIO_LOG=1`:
+
+* Test 2 (menu music `bgm_TitleMenu`) - **FAIL**. Menu parked 52-105 s on Intel
+  (`work\m4b_stop.wav`, 137.0 s): 0-30 s is movie audio (peak -11.95 / -10.05 /
+  -9.77 dBFS, RMS -28.99 / -27.67 / -27.87 per 10 s window), **30-137 s is
+  digital silence** (peak -240.00 dBFS, RMS -999). dGPU run
+  (`work\m4b_dgpu2.wav`, 71.0 s): 0-30 s peak -9.77 dBFS, **30-71 s all-zero**.
+  Sink `quiet` 40.1 s -> 89.1 s across the parked menu, `underruns` 1-3 total,
+  `OnVoiceError` 0.
+* Tests 3-6 (longest cue, stinger over a cue, pause/resume, voice) -
+  **BLOCKED**, not failed: each needs a posted cue or the event-post path, and
+  nothing is posted.
+* Root cause is narrow: in the entire menu session there are **4**
+  `CreateSourceVoice` and **3** `SubmitSourceBuffer` calls - voice #1 is the
+  Hw/Wwise voice (0.2 s, mask 0x3, started from `0x0073EC80`) and the rest are
+  the three CRI movie devices (2.3 / 12.5 / 22.0 s). After 22.7 s no voice is
+  created, fed, queried or destroyed, and Wwise's voice is never destroyed. The
+  banks are **not** the problem: `KORRA_TRACE_FILE=1` shows the guest opening
+  `GameData\sound\bgm\BGM.bnk`, `GameData\sound\WwiseInfo.wai`,
+  `GameData\sound\Init.bnk` and `GameData\sound\SeFootstep.bin` from disk, all
+  `attrs=present -> handle=0x...`. The missing piece is the event post itself.
+
+**4. Input quirk.** A single `KORRA_PAD_TAP` at 46.0 s left the title unchanged
+(frames at 44 s and 50 s identical, mean ~90), while taps at 44.0 + 45.5 s
+reached the menu. Repeat the A tap at ~0.5-1.5 s intervals; `KORRA_PAD_AUTO=1`
+(closest thing to a mashed pad) is the reliable version. Injected keyboard input
+remains invisible to DirectInput.
+
+**5. Not verified.** No event was posted by the engine on any screen reached, so
+tests 3-6 have no measurement at all - nothing here says whether the mixer would
+handle a 5.1 stream, a stinger, a state mute or a 32 kHz voice correctly. The
+dGPU session lasted 71 s and parked on the menu 50-56 s only. All numbers are
+from this hybrid laptop's panel on the Intel adapter (dGPU via per-app
+preference), none from the phone. The harness (`work\m4b_run.ps1`) is gitignored
+and not committed.
+
+**Next lead (unchanged):** the Wwise event-post entry point - find the code that
+posts an event (the `WwiseInfo.wai` IDs are compile-time constants in the
+guest, so a watch on one of them or on the queue object is a better handle than
+the `PostEventWork` RTTI name), then the same three assertions as before.

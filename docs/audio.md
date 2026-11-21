@@ -642,24 +642,89 @@ a quiet laptop speaker and obvious on anything else.
   that: no submit, no `GetState`, no destroy, for the rest of the run. An
   XAudio2 source voice is push-only, so no event means no audio, and no event is
   ever posted on a screen this build can reach.
+* **The Wwise banks do load, from plain files in `GameData\sound\`.** A
+  `KORRA_TRACE_FILE=1` run (`korra_host-20261121-233246.log`) shows the guest
+  opening `GameData\data000.cpk`, `GameData\data001.cpk`, then
+  `GameData\sound\bgm\BGM.bnk`, `GameData\sound\WwiseInfo.wai`,
+  `GameData\sound\Init.bnk` and `GameData\sound\SeFootstep.bin`, every one
+  `attrs=present -> handle=0x...`. So the silence is **not** a missing bank, a
+  failed CPK open, or the file layer: the event never reaches Wwise's renderer.
 
-### 10.5 Not proven: acceptance tests 2-6
+### 10.5 Acceptance tests 2-6: measured (2026-11-21, second session)
 
-Tests 2-6 need a posted Wwise event, and the Windows host cannot reach a screen
-that posts one. The title screen (`PRESS ANY BUTTON`) appears around 35-45 s,
-runs at 29-30 fps with the pad polled, and posts nothing. Pressing A leaves the
-title around 40 s onto a static black screen while the process stays alive at
-~57 ticks/s with `present=0/s` - the M3 frame-pass-queue fault described at the
-end of `docs/FINDINGS.md`, upstream of audio. Posting the events from the host
-instead is not yet possible either: the only name-hash in the image
-(`0x00847B10`, FNV-1 over the lowercased name - it reproduces every ID in §9.4
-exactly) is reached only from wide-string filename helpers, and the
+**The first-pass attribution in this section was wrong and is retracted.** Pressing
+A did *not* encounter the M3 frame-pass-queue fault: the game had never been
+foreground, so it never called `IDirect3DDevice9::Present` (`tick` 50-58/s,
+`present=0/s` for 119 s, every screenshot black, mean 0.3). Force the window
+foreground 8 s after launch (`AttachThreadInput` + `ShowWindow` +
+`SetForegroundWindow`) and the same `build\run_m4b.exe` walks title -> A -> main
+menu on **both** adapters:
+
+| adapter | window | fps | menu |
+|---|---|---|---|
+| Intel UHD (desktop 1920x1200) | 1920x1080 exclusive | present==tick 44-58/s, 29-30/s on the title | up from ~50 s, parked 52-105 s; OCR of the 64 s shot: `Story`, `Options`, `Exit` |
+| NVIDIA RTX 5050 (per-app `GpuPreference=2`, `nvidia-smi` lists the pid, guest `eip` in `nvd3dum.dll`) | 1920x1080 | 57-58/s | up at 50 s; OCR: `Options`, `Exit` |
+
+Gate/device state stayed clean in both (`flag=0`, `ctx30` cycling
+`0x009DF3D8`/`0x00E1DA54`/`0`, `tce=0`, no `[crash]`), which is what the Windows
+oracle already said. A dGPU-preferred run *without* focus had produced no window
+at all; with focus it presents normally. The earlier "no window on dGPU" result
+was the same no-Present condition, not a cross-adapter limitation.
+
+Measured against `docs/audio.md` §9.4, with `KORRA_AUDIO_DUMP` and
+`KORRA_AUDIO_LOG=1`:
+
+| # | test | result | numbers |
+|---|---|---|---|
+| 2 | menu music (`bgm_TitleMenu`) | **FAIL** | menu up and parked 52-105 s (`work\m4b_stop.wav`, 137.0 s, `korra_host-20261121-232611.log`); 0-30 s = movie audio (peak -11.95/-10.05/-9.77 dBFS, RMS -28.99/-27.67/-27.87), **30-137 s = digital silence (peak -240.00 dBFS, RMS -999)**. Same on the dGPU session (`work\m4b_dgpu2.wav`, 71.0 s, `korra_host-20261121-233050.log`): 0-30 s peak -9.77 dBFS, **30-71 s all-zero samples**. Sink `quiet` grows 40.1 s -> 89.1 s across the parked menu; `underruns` 1-3 total |
+| 3 | longest cue (`bgm_cs41_skip`) | **BLOCKED** | needs a posted cue to play; nothing posts |
+| 4 | one-shot over a running cue (`bgm_Levelup`) | **BLOCKED** | needs the underlying cue of test 2 first |
+| 5 | pause/resume (`bgm_Sync_Pause` / `bgm_Sync_Resume`) | **BLOCKED** | needs a cue to mute and unmute |
+| 6 | voice (`korra_vo_cont_yes`) | **BLOCKED** | needs the same event-post path (and the CPK file layer for the owning bank) |
+
+Why test 2 fails, exactly: in the whole menu session there are **4**
+`CreateSourceVoice` calls and **3** `SubmitSourceBuffer` calls. The four voices are
+the Hw/Wwise voice #1 at 0.2 s plus one CRI movie device each at 2.3/12.5/22.0 s;
+the three submits are those movie devices. After 22.7 s no XAudio2 voice is
+created, fed, queried or destroyed, while the Wwise device and its started voice
+#1 stay alive to the end (`DestroyVoice` never arrives). So the sink is not
+starved and the mixer has nothing to mix: the game never hands Wwise an event.
+
+Posting the events from the host is still not possible: the only name-hash in the
+image (`0x00847B10`, FNV-1 over the lowercased name - it reproduces every ID in
+§9.4 exactly) is reached only from wide-string filename helpers, and the
 `Hw::Wwise::Command::PostEventWork` RTTI name has no pointer in the image. That
-is the next lead, and it is a Wwise-internals job, not a sink job.
+remains the next lead, and it is a Wwise-internals job, not a sink job.
 
-What that means honestly: the sink is done and measured; the §9.4 *event* tests
-are blocked by the same thing that blocks the menu, and no number in this
-section should be read as "menu music works".
+What that means honestly: the sink is done and measured; acceptance 1 and the
+underrun half of 7 pass; 2 fails on the engine side (no event posted) and 3-6
+cannot be exercised at all. No number in this section should be read as "menu
+music works".
+
+### 10.7 Running a menu session on Windows (second-session recipe)
+
+The title screen only presents when the game owns the foreground, and the
+engine's keyboard path is DirectInput (injected keys are ignored). Use the pad:
+
+```powershell
+# 1. focus is mandatory; without it present=0/s forever
+#    (work\m4b_run.ps1 does this at 8 s, then re-forces at every sample)
+# 2. drive the title with the XInput stub, never with keybd_event
+$env:KORRA_PAD='1'
+$env:KORRA_PAD_TAP='44000'          # one A press at 44 s: title -> main menu
+$env:KORRA_PAD_AUTO='1'             # alternative: taps A every 1.2 s from 12 s
+$env:KORRA_XA2_VERBOSE='2'
+$env:KORRA_AUDIO_LOG='1'
+$env:KORRA_AUDIO_DUMP="$PWD\work\menu.wav"
+build\run_m4b.exe "The Legend of Korra"
+```
+
+Sample the window at 44/50/56 s: title mean ~90, menu mean ~160 (0-255) - a real
+menu, not the black screen. Per-app dGPU preference works when the game is
+focused: `reg add "HKCU\Software\Microsoft\DirectX\UserGpuPreferences" /v
+"<abs exe path>" /t REG_SZ /d "GpuPreference=2;" /f` and confirm with
+`nvidia-smi --query-compute-apps=pid,process_name`. Note the dump: movie audio
+ends at ~30 s, and everything after is exact zeros until an event is posted.
 
 ### 10.6 Reproduce on Windows
 
@@ -676,6 +741,21 @@ Then measure the dump (`RMS > -40 dBFS` is the pass line) and read the
 `[sink]` lines: one per second with `frames/peak/rms/quiet/underruns`. Drop the
 sink in with `KORRA_AUDIO_BACKEND=null` to compare against the M2.9 clock, or
 `KORRA_NO_AUDIO=1` to remove the shim entirely.
+
+The shared host selftest must be green before a session starts:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\run_selftest.ps1   # 60 passed, 0 failed
+```
+
+It compiles `tests\selftest_host_shims.c` + `src\host\xaudio2_stub.c` +
+`src\host\wasapi_sink.c` + `src\host\steam_stub.c` and links `winmm.lib`. The
+sink file is required: without it the link fails on
+`korra_audio_sink_start/live/note_underrun` (the first-pass red result was this
+script gap, not an untracked source file).
+
+For the title/menu screens this recipe is not enough on its own - the game must
+be foreground or it never calls `Present`; see 10.7.
 
 ---
 
