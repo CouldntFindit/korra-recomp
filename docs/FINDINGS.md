@@ -2473,3 +2473,47 @@ fmt=827611204 pool=1` (DXT1), `1024x1024 ... fmt=894720068` (DXT5),
 Not verified: no title screen or menu is identifiable in `logs/s3.png` yet; the
 crash that follows (below) is a separate defect; the cube/volume texture vtables
 are still absent and this path did not mint one.
+
+## 2026-11-21 - M3: the phone renders at 30 fps, then faults on a NULL technique pointer
+
+Two corrections and one new fault, measured on the S24 (Xclipse 940, DXVK-native,
+MAILBOX, 1280x720) with the build from commit 2c4126f.
+
+**1. The present count in earlier entries was a trace artefact.** [import] tracing
+stops at 12,000 lines (g_trace_left in spine_android.c; logs/log12.txt, line 14,757
+carries "(trace limit; set KORRA_TRACE_IMPORTS=0 to silence)"). Every "dev:17 = N"
+figure in this file therefore counts presents only until the trace budget ran out,
+not presents in the run. The real count is DXVK's own per-present block
+("Presenter: Actual swap chain properties", 7 lines): 1,314 of them in a 44 s run,
+i.e. about 30 fps sustained on the device. The 30 fps default limiter works and the
+frame loop is not stalling; the "bursty presents" reading was the trace cap.
+
+**2. The run now ends in a guest fault at about 1,300 frames.** After the D3DX fix
+(2c4126f) nothing refuses in the log before the fault: no missing shim, no failed
+D3DX load, no heap exhaustion.
+
+    [crash] signal 11 code=2 addr=0x6b532a2004 guest_func=0x007492B0 esp=0xC2BFFD58
+    eax=0 ecx=0x00E4D064 edx=2 esi=0x20027120 edi=0
+
+The fault address is g_mem_base + 4: the guest dereferences a NULL pointer at +4.
+sub_007492B0 (recomp_0039.c) does mov eax,[ebp+0x10]; mov edx,[eax+4] on its third
+argument before testing it, so the engine never expects NULL there. The chain is
+
+    sub_0072EED0:  esi = [edi+0x30]        ; the object's field, NULL
+                   call 0x748AB0(edi, "0x9DF3F0", 0)
+                   edx = esi; ecx = edi; call 0x736A20
+    sub_00736A20:  edi = edx               ; fastcall arg 2
+                   push "0x9E5754"; push edi; push 0; push ecx
+                   call 0x7492B0           ; arg3 = edi = NULL -> fault
+
+so the source is the object field at +0x30 of the object handed to sub_0072EED0,
+read before any check. That function has no direct caller in the generated tree
+(only its definition at recomp_0038.c:57650); it is entered through the vtable
+dispatcher, so the object type has to be named from the dispatch site rather than
+from a call chain. Not yet identified: which create leaves +0x30 NULL, and whether
+that field is a technique/material pointer this host should have produced.
+
+Not verified: that +0x30 is meant to be non-NULL on Windows (the Windows reference
+run reaches the menu without this fault, but +0x30 was not sampled); the steady-state
+frame rate after this fault is fixed; the "lifecycle: pause / low memory" kill seen in
+earlier runs is untouched by this entry.
