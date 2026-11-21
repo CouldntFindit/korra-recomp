@@ -1975,8 +1975,11 @@ starving workers, which is a real hazard, but it is not what ended this run.
   object a value stood for when it was handed on.
 - `openthread: tid=… access=… esp=… ebp=…` — whether the teardown really joins.
 - `slot: h=… param=… cap=… post=… done=… fn=… arg=… w18=… w1c=… mgr=… mgrflags=…`
-  on the same 40 wakes as `wait: … woke after N polls` — the worker's parameter
-  block at the moment it was let through, through `ka_thread_self_param()`.
+  on every wake whose block names a semaphore this host created, and always
+  when the job function is zero (capped at 400 lines) — the worker's parameter
+  block at the moment it was let through, through `ka_thread_self_param()`. It
+  cannot ride on the 40-wake budget: the file pool's early wakes spend that
+  long before the asset pool's critical one.
 - `h=0` waits are logged 20 times and then throttled with a 1 ms sleep. The wait
   can never succeed on that handle, so the sleep cannot hide a real wake; it
   keeps a 22 s device log readable instead of 3.6 M ICALL lines.
