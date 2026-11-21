@@ -487,9 +487,12 @@ static void watch_log(void) {
     }
 }
 
+extern void ka_gate_tick(void);   /* gate_probe_android.c: debug.korra.gate */
+
 recomp_func_t recomp_lookup(uint32_t va) {
     watch_icall(va);
     watch_log();
+    ka_gate_tick();
     uint32_t lo = 0, hi = recomp_dispatch_count;
     while (lo < hi) {
         uint32_t mid = lo + (hi - lo) / 2, m = recomp_dispatch_table[mid].address;
@@ -600,6 +603,24 @@ void ka_ring_dump(const char *why) {
     }
 }
 
+static int s_hr_left = 120;
+static int s_hr_depth;
+static recomp_func_t s_hr_fn[8];
+static const char *s_hr_name[8];
+
+static void hr_tramp(void) {
+    int d = s_hr_depth;
+    if (d >= 8) { s_hr_fn[7](); return; }
+    s_hr_depth = d + 1;
+    s_hr_fn[d]();
+    s_hr_depth = d;
+    if ((int32_t)g_eax < 0 && s_hr_left > 0) {
+        s_hr_left--;
+        ka_log("[hr] %s -> %08X at %08X", s_hr_name[d] ? s_hr_name[d] : "?", g_eax,
+               g_cur_func);
+    }
+}
+
 recomp_func_t recomp_lookup_import(uint32_t va) {
     if (va < KA_SHIM_BASE || va >= KA_SHIM_BASE + KA_SHIM_STEP * (uint32_t)g_shim_n)
         return NULL;
@@ -630,6 +651,17 @@ recomp_func_t recomp_lookup_import(uint32_t va) {
         if (g_wtrace_left > 0 && g_main_fs && g_fs_base != g_main_fs) {
             --g_wtrace_left;
             ka_log("[w%08X] %s esp=0x%08X", g_fs_base, g_shim[i].name, g_esp);
+        }
+        /* A negative answer from a synthetic COM slot is the only trace a host
+         * shim leaves; the engine treats it as a failed step and moves on with
+         * an empty handle (measured: [shader+0x30]+4 is 0 on the device and a
+         * live D3D interface on Windows). Census them with a trampoline. */
+        if (s_hr_left > 0 && g_shim[i].name && strchr(g_shim[i].name, ':')) {
+            if (s_hr_depth < 8) {
+                s_hr_fn[s_hr_depth] = g_shim[i].fn;
+                s_hr_name[s_hr_depth] = g_shim[i].name;
+            }
+            return hr_tramp;
         }
         return g_shim[i].fn;
     }

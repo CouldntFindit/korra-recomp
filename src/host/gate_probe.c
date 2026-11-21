@@ -48,6 +48,13 @@ static uint32_t s_force_at;
 static DWORD s_base;
 static DWORD s_last;
 
+/* Guest reads must not fault the probe: the guest image occupies only the
+ * committed part of the address range, exactly as on the device. */
+static uint32_t rd(uint32_t va) {
+    if (va < 0x00400000u || va >= 0x40000000u) return 0;
+    return MEM32(va);
+}
+
 void korra_gate_tick(void) {
     uint32_t m, mgr, st_p, st, flag, ctx30, tce;
     DWORD    now;
@@ -91,5 +98,44 @@ report:
     fprintf(stderr, "[gate] m=%08X mgr=%08X flag=%08X status=%08X"
                     " ctx30=%08X tce=%08X\n",
             m, mgr, flag, st, ctx30, tce);
+    /* The device-side census compares these against the Android run: the
+     * gate binds each technique through sub_00756600, whose cached path
+     * hands SetRenderTarget(0, [t+0x30]+4). Mirror every field the device
+     * probe prints so the two logs can be diffed line for line. */
+    {
+        uint32_t t1 = MEM32(0xCA3A00u), t2 = MEM32(0xCA39E8u);
+        uint32_t dev = MEM32(0xE4D064u);
+        uint32_t c08 = MEM32(0xE4D06Cu), c10 = MEM32(0xE4D074u);
+        uint32_t c18 = MEM32(0xE4D07Cu), c20 = MEM32(0xE4D084u);
+        uint32_t t30 = rd(t2 + 0x30u);
+        fprintf(stderr, "[gate] tech 3a00=%08X t4=%08X t8=%08X t14=%08X"
+                        " t30=%08X t30p4=%08X\n",
+                t1, rd(t1 + 4u), rd(t1 + 8u), rd(t1 + 0x14u),
+                rd(t1 + 0x30u), rd(rd(t1 + 0x30u) + 4u));
+        fprintf(stderr, "[gate] tech 39e8=%08X t4=%08X t8=%08X t14=%08X"
+                        " t30=%08X t30p4=%08X\n",
+                t2, rd(t2 + 4u), rd(t2 + 8u), rd(t2 + 0x14u), t30,
+                rd(t30 + 4u));
+        fprintf(stderr, "[gate] ctx dev=%08X d4=%08X d8=%08X"
+                        " c08=%08X c10=%08X c18=%08X c20=%08X\n",
+                dev, rd(dev + 4u), rd(dev + 8u), c08, c10, c18, c20);
+        /* 00748B30 hands 00756600 [entry+0x14], not the table entry, so the
+         * cached pass state lives at [[t+0x14]+0x30]+4. Same lines as the
+         * device probe, so the bind inputs can be diffed directly. */
+        {
+            uint32_t o = rd(t1 + 0x14u), n = rd(t2 + 0x14u);
+            uint32_t o30 = rd(o + 0x30u), n30 = rd(n + 0x30u);
+            uint32_t o14 = rd(o + 0x14u), o18 = rd(o + 0x18u);
+            uint32_t n14 = rd(n + 0x14u), n18 = rd(n + 0x18u);
+            fprintf(stderr, "[gate] obj 3a00 t14=%08X o14=%08X o18=%08X"
+                            " o30=%08X o34=%08X p14=%08X p18=%08X\n",
+                    o, o14, o18, o30, rd(o30 + 4u),
+                    rd(o14 + 0x14u), rd(o18 + 0x18u));
+            fprintf(stderr, "[gate] obj 39e8 t14=%08X o14=%08X o18=%08X"
+                            " o30=%08X o34=%08X p14=%08X p18=%08X\n",
+                    n, n14, n18, n30, rd(n30 + 4u),
+                    rd(n14 + 0x14u), rd(n18 + 0x18u));
+        }
+    }
     fflush(stderr);
 }
