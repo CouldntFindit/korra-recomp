@@ -232,7 +232,7 @@ static void k_CloseHandle(void) {
     /* A thread handle: create/openthread ids are real here even though they are
      * not kernel objects, and closing one must not touch the thread table (the
      * engine opens the same worker again to join it). */
-    if (ka_thread_exists(h)) RET(1, 1);
+    if (ka_thread_close(h)) RET(1, 1);
     if (ka_file_close(h)) RET(1, 1);
     RET(0, 1);
 }
@@ -342,7 +342,10 @@ static void k_ExitProcess(void) {
 static void k_ExitThread(void) {
     int d;
     extern int ka_spine_depth(void);
+    extern void ka_thread_detach(void);
     while ((d = ka_spine_depth()) > 0) mach_leave();
+    /* The guest thread is ending without returning from its entry point. */
+    ka_thread_detach();
     pthread_exit(NULL);
 }
 static void k_TerminateProcess(void) { k_ExitProcess(); }

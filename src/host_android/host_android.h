@@ -51,6 +51,10 @@ uint32_t  ka_guest_strdup(const char *s);
 uint32_t  ka_guest_size(uint32_t va);
 /* A fresh guest stack; returns the initial esp (top, 16-byte aligned). */
 uint32_t  ka_stack_new(uint32_t size, uint32_t *limit);
+/* Give a stack back when its guest thread ends; a later thread reuses it. */
+void      ka_stack_release(uint32_t lo, uint32_t size);
+/* LoK.exe's own SizeOfStackReserve: CreateThread(dwStackSize=0) means this. */
+#define KA_STACK_DEFAULT (1u << 20)
 /* Census for the 1 Hz sampler: heap bump pointer + free list, and the stack
  * region's bump pointer, end, free list and free bytes. */
 void      ka_heap_stats(uint32_t *hi, uint32_t *free_blocks, uint32_t *free_bytes);
@@ -161,6 +165,7 @@ void     ka_thread_detach(void);
 uint32_t ka_thread_create(uint32_t start_va, uint32_t param, int suspended);
 uint32_t ka_thread_resume(uint32_t token);   /* previous suspend count, 0xFFFFFFFF if unknown */
 int      ka_thread_exists(uint32_t token);   /* 1 if the id names a live host thread */
+int      ka_thread_close(uint32_t token);    /* CloseHandle on a thread id */
 uint32_t ka_thread_wait(uint32_t token, uint32_t timeout_ms);
 /* The CreateThread token of the calling guest thread, or 0 outside one.
  * GetCurrentThreadId must return it (see k_GetCurrentThreadId). */

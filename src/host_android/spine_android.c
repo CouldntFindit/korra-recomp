@@ -76,6 +76,11 @@ typedef struct {
     int      depth, inited;
     uint32_t tls[64];
     uint32_t last_error;
+    /* What this guest thread owns, so its death can give it back: the stack's
+     * base and size, and the TIB block. Before this, a guest thread cost 4 MiB
+     * of the 256 MiB stack region for the life of the process and the process
+     * aborted at sixty-five threads (docs/FINDINGS.md 2026-11-22). */
+    uint32_t stk_lo, stk_size, tib_va;
 } tstate;
 
 static __thread tstate g_ts;
@@ -99,29 +104,54 @@ static void regs_load(const tstate *t) {
 uint32_t ka_thread_attach(const char *why) {
     if (!g_ts.inited) {
         uint32_t limit = 0;
-        uint32_t esp = ka_stack_new(4u << 20, &limit);
+        uint32_t esp = ka_stack_new(KA_STACK_DEFAULT, &limit);
         uint32_t tib = ka_guest_alloc(0x1000, 16);
         uint32_t *t;
         if (!esp || !tib) {
-            ka_log("FATAL: cannot create guest stack/TIB (%s)", why ? why : "?");
-            abort();
+            /* Not a host abort: on Windows CreateThread returns NULL and the
+             * caller carries on. Say what ran out, then let the caller fail
+             * the way it would there. */
+            ka_log("thread: cannot create guest stack/TIB (%s) esp=%08X tib=%08X",
+                   why ? why : "?", esp, tib);
+            if (esp) ka_stack_release(limit, esp + 64u - limit);
+            if (tib) ka_guest_free(tib);
+            return 0;
         }
         t = (uint32_t *)ka_host(tib);
         t[0x00/4] = 0xFFFFFFFFu;     /* ExceptionList: end of chain */
-        t[0x04/4] = limit + (4u << 20);
-        t[0x08/4] = limit;
+        t[0x04/4] = esp + 64u;       /* StackBase */
+        t[0x08/4] = limit;           /* StackLimit */
         t[0x18/4] = tib;             /* Self */
         g_ts.esp = esp;
         g_ts.fs  = tib;
         g_ts.fpu_cw = 0x027F;
         g_ts.inited = 1;
         g_ts.last_error = 0;
+        g_ts.stk_lo = limit;
+        g_ts.stk_size = esp + 64u - limit;
+        g_ts.tib_va = tib;
         ka_log("thread: attach fs=%08X tib=%08X why=%s", g_ts.fs, tib, why ? why : "?");
     }
     return g_ts.fs;
 }
 
-void ka_thread_detach(void) { /* stacks are freed with the process */ }
+/* A guest thread's stack and TIB are dead the moment the thread is. Releasing
+ * them is what makes thread churn survive a level load: the 256 MiB region has
+ * to hold the threads that are alive, not every thread ever created. */
+void ka_thread_detach(void) {
+    if (!g_ts.inited) return;
+    if (g_ts.tib_va) {
+        /* The guest heap free list is only touched under the machine lock. */
+        mach_enter();
+        ka_guest_free(g_ts.tib_va);
+        mach_leave();
+        g_ts.tib_va = 0;
+    }
+    if (g_ts.stk_lo && g_ts.stk_size) ka_stack_release(g_ts.stk_lo, g_ts.stk_size);
+    g_ts.stk_lo = g_ts.stk_size = 0;
+    g_ts.inited = 0;
+    g_ts.esp = g_ts.fs = 0;
+}
 
 static volatile uint32_t g_wd_fs, g_wd_depth;
 /* The machine holder's pthread, so the stall probe interrupts the thread that
@@ -698,14 +728,19 @@ uint32_t hle_call_guest(uint32_t va, int nargs, const uint32_t *args) {
 uint32_t ka_proc_address(const char *dll, const char *name);
 
 /* ---------------------------------------------------------------- threads */
-#define MAX_THREADS 64
+/* Records are small and must outlive the thread (the engine waits on ids and
+ * reads exit codes), so the table is a capacity, not a queue: 256 records is
+ * 16 KiB and stops the table being the limit before the stack region is. */
+#define MAX_THREADS 256
 typedef struct {
     uint32_t token, used, done, exit_code, start_va, param;
     uint32_t suspended, resumed;   /* CREATE_SUSPENDED gate, see ka_thread_resume */
+    uint32_t closed;               /* CloseHandle ran; free the slot once done */
     pthread_t th;
 } ka_thread;
 static ka_thread g_threads[MAX_THREADS];
 static pthread_mutex_t g_threads_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t ka_thread_stats_live(void);
 /* CREATE_SUSPENDED parks the thread at its entry point until ResumeThread. */
 static pthread_cond_t g_resume_cond = PTHREAD_COND_INITIALIZER;
 /* Thread ids start above the object-handle range (obj_new hands out 1..256)
@@ -727,7 +762,19 @@ static void *thread_trampoline(void *p) {
     thread_start_t *t = (thread_start_t *)p;
     uint32_t args[1];
     uint32_t ret;
-    ka_thread_attach("CreateThread");
+    if (!ka_thread_attach("CreateThread")) {
+        /* The stack/TIB allocation failed; finish the thread record the way an
+         * immediately-returning thread would, and leave the host alive. */
+        pthread_mutex_lock(&g_threads_lock);
+        for (int i = 0; i < MAX_THREADS; i++)
+            if (g_threads[i].token == t->token) {
+                g_threads[i].done = 1;
+                if (g_threads[i].closed) g_threads[i].used = 0;
+            }
+        pthread_mutex_unlock(&g_threads_lock);
+        free(t);
+        return NULL;
+    }
     g_guest_tid = t->token;
     /* CREATE_SUSPENDED: the engine's spawner passes the start routine, then
      * fills the parameter block (its function pointer, its event) only after
@@ -746,10 +793,15 @@ static void *thread_trampoline(void *p) {
         if (g_threads[i].token == t->token) {
             g_threads[i].done = 1;
             g_threads[i].exit_code = ret;
+            /* Closed before the thread ended: the handle is gone, so the id is
+             * no longer valid (Windows drops it the same way). */
+            if (g_threads[i].closed) g_threads[i].used = 0;
         }
     pthread_mutex_unlock(&g_threads_lock);
     ka_log("thread: exit tok=%u code=0x%08X", t->token, ret);
     free(t);
+    /* The guest function has returned: this thread's guest stack is dead. */
+    ka_thread_detach();
     return NULL;
 }
 
@@ -760,6 +812,9 @@ uint32_t ka_thread_create(uint32_t start_va, uint32_t param, int suspended) {
             thread_start_t *ts = (thread_start_t *)calloc(1, sizeof *ts);
             pthread_attr_t attr;
             g_threads[i].used = 1;
+            g_threads[i].done = 0;
+            g_threads[i].closed = 0;
+            g_threads[i].exit_code = 0;
             g_threads[i].token = g_next_token++;
             g_threads[i].start_va = start_va;
             g_threads[i].param = param;
@@ -779,7 +834,16 @@ uint32_t ka_thread_create(uint32_t start_va, uint32_t param, int suspended) {
         }
     }
     pthread_mutex_unlock(&g_threads_lock);
+    ka_log("thread: table full (%u records, %u live) - CreateThread fails as it "
+           "would on Windows", MAX_THREADS, ka_thread_stats_live());
     return 0;
+}
+
+static uint32_t ka_thread_stats_live(void) {
+    uint32_t l = 0;
+    for (int i = 0; i < MAX_THREADS; i++)
+        if (g_threads[i].used && !g_threads[i].done) l++;
+    return l;
 }
 
 ka_thread *ka_thread_find(uint32_t token) {
@@ -791,6 +855,24 @@ ka_thread *ka_thread_find(uint32_t token) {
 /* Lets a kernel32 shim recognise a thread id (as OpenThread's caller holds it)
  * without exposing the thread table's type. */
 int ka_thread_exists(uint32_t token) { return ka_thread_find(token) != NULL; }
+
+/* CloseHandle on a thread id. Windows keeps the thread object alive until the
+ * thread ends; the record is therefore kept while it runs and the slot is only
+ * freed once it is both closed and done. Never recycling it is what put the
+ * 64-slot table out of reach of a long session. */
+int ka_thread_close(uint32_t token) {
+    int found = 0;
+    pthread_mutex_lock(&g_threads_lock);
+    for (int i = 0; i < MAX_THREADS; i++) {
+        if (!g_threads[i].used || g_threads[i].token != token) continue;
+        found = 1;
+        g_threads[i].closed = 1;
+        if (g_threads[i].done) g_threads[i].used = 0;
+        break;
+    }
+    pthread_mutex_unlock(&g_threads_lock);
+    return found;
+}
 
 /* ResumeThread returns the previous suspend count; 0xFFFFFFFF means "not a
  * thread of ours", which the shim turns into WAIT_FAILED/ERROR_INVALID_HANDLE. */
@@ -840,9 +922,9 @@ uint32_t ka_thread_wait(uint32_t token, uint32_t timeout_ms) {
 
 int ka_spine_depth(void) { return g_ts.depth; }
 
-/* Census for the 1 Hz sampler: `created` is the live table's occupancy, `live`
- * the threads still running, and the peak is what the stack region has to
- * hold. */
+/* Census for the 1 Hz sampler: `created` is the live table's occupancy, which
+ * plateaus when closed+done slots are retired (ka_thread_close); `live` is the
+ * threads still running, and the peak is what the stack region has to hold. */
 void ka_thread_stats(uint32_t *live, uint32_t *created, uint32_t *peak) {
     static uint32_t s_peak;
     uint32_t l = 0, c = 0;

@@ -16,6 +16,7 @@
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,6 +36,11 @@ static size_t   g_page = 4096;
 /* ---- heap ------------------------------------------------------------- */
 #define HEAP_SIZE  0x40000000u   /* 1 GiB of address space, lazily backed */
 #define BLK_MAGIC  0x4B41524Bu
+/* LoK.exe's own SizeOfStackReserve (PE optional header: reserve 0x100000,
+ * commit 0x1000). CreateThread(dwStackSize=0) means this value on Windows, so
+ * this is the guest's contract, not a budget guess: 4 MiB per thread was four
+ * times what the engine reserves and it is what capped the process at 64
+ * concurrent guest threads. The constant lives in host_android.h. */
 
 typedef struct blk {
     uint32_t size;      /* payload bytes, header excluded */
@@ -51,6 +57,18 @@ static uint32_t g_free_blocks, g_free_bytes;
 
 static uint32_t g_stack_hi;
 static uint32_t g_stack_end;
+
+/* Stacks handed back by threads that ended. The node lives in the block it
+ * describes (the block is dead memory once its thread is gone), so a release
+ * costs nothing and a level load that spawns a worker per stream reuses what
+ * the previous one returned instead of spending the region. */
+typedef struct stkfree {
+    struct stkfree *next;
+    uint32_t lo, size;
+} stkfree;
+static stkfree *g_stack_free;
+static uint32_t g_stack_free_b, g_stack_free_bytes;
+static pthread_mutex_t g_stack_lock = PTHREAD_MUTEX_INITIALIZER;
 
 int ka_mem_init(void) {
     long ps = sysconf(_SC_PAGESIZE);
@@ -170,26 +188,64 @@ uint32_t ka_guest_strdup(const char *s) {
 }
 
 uint32_t ka_stack_new(uint32_t size, uint32_t *limit) {
+    uint32_t lo;
     if (size < 0x10000u) size = 0x10000u;
     size = (size + g_page - 1u) & ~(uint32_t)(g_page - 1u);
+
+    pthread_mutex_lock(&g_stack_lock);
+    {
+        stkfree **pp = &g_stack_free;
+        while (*pp) {
+            stkfree *b = *pp;
+            if (b->size >= size) {
+                *pp = b->next;
+                g_stack_free_b--;
+                g_stack_free_bytes -= b->size;
+                lo = b->lo;
+                pthread_mutex_unlock(&g_stack_lock);
+                memset(ka_host(lo), 0, 64);
+                if (limit) *limit = lo;
+                return lo + size - 64u;
+            }
+            pp = &b->next;
+        }
+    }
     if (g_stack_hi + size > g_stack_end) {
-        ka_log("guest stack space exhausted");
+        ka_log("guest stack space exhausted (hi=%08X end=%08X want=%u "
+               "free=%u/%uK)", g_stack_hi, g_stack_end, size,
+               g_stack_free_b, g_stack_free_bytes / 1024u);
+        pthread_mutex_unlock(&g_stack_lock);
         return 0;
     }
-    uint32_t lo = g_stack_hi;
-    uint32_t esp = g_stack_hi + size - 64u;
+    lo = g_stack_hi;
     g_stack_hi += size;
+    pthread_mutex_unlock(&g_stack_lock);
     if (limit) *limit = lo;
     memset(ka_host(lo), 0, 64);
-    return esp;
+    return lo + size - 64u;
+}
+
+void ka_stack_release(uint32_t lo, uint32_t size) {
+    stkfree *b;
+    if (!lo || size < 0x10000u || lo < 0xC0000000u || lo >= g_stack_end) return;
+    if (lo + size > g_stack_end) return;
+    b = (stkfree *)ka_host(lo);
+    pthread_mutex_lock(&g_stack_lock);
+    b->lo = lo;
+    b->size = size;
+    b->next = g_stack_free;
+    g_stack_free = b;
+    g_stack_free_b++;
+    g_stack_free_bytes += size;
+    pthread_mutex_unlock(&g_stack_lock);
 }
 
 void ka_stack_stats(uint32_t *hi, uint32_t *end, uint32_t *free_blocks,
                     uint32_t *free_bytes) {
     if (hi) *hi = g_stack_hi;
     if (end) *end = g_stack_end;
-    if (free_blocks) *free_blocks = 0;
-    if (free_bytes) *free_bytes = 0;
+    if (free_blocks) *free_blocks = g_stack_free_b;
+    if (free_bytes) *free_bytes = g_stack_free_bytes;
 }
 
 void ka_heap_stats(uint32_t *hi, uint32_t *free_blocks, uint32_t *free_bytes) {
