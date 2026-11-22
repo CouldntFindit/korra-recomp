@@ -603,15 +603,28 @@ static void k_FlsSetValue(void) { ka_tls_set(A32(0), A32(1)); RET(1, 2); }
 /* --------------------------------------------------------------- files */
 static void k_CreateFileA(void) {
     uint32_t name = A32(0);
+    uint32_t access = A32(1);
     uint32_t disp = A32(4);
+    int want_write, create = 0, truncate = 0;
     uint32_t h;
     if (!name) RET(INVALID_HANDLE, 7);
-    h = ka_file_open((const char *)ka_host(name));
+    /* dwDesiredAccess / dwCreationDisposition, as Windows means them. Without
+     * them every open was read-only and never created anything, so the engine's
+     * first save answered FILE_NOT_FOUND and New Game stopped at "Failed to
+     * save data." */
+    want_write = (access & 0x40000000u) != 0;          /* GENERIC_WRITE */
+    switch (disp) {
+    case 1: create = 1; break;                          /* CREATE_NEW */
+    case 2: create = 1; truncate = 1; break;            /* CREATE_ALWAYS */
+    case 4: create = 1; break;                          /* OPEN_ALWAYS */
+    case 5: truncate = 1; break;                        /* TRUNCATE_EXISTING */
+    default: break;                                     /* OPEN_EXISTING (3) */
+    }
+    h = ka_file_open_ex((const char *)ka_host(name), want_write, create, truncate);
     if (!h) {
         ka_last_error_set(2);               /* ERROR_FILE_NOT_FOUND */
         RET(INVALID_HANDLE, 7);
     }
-    (void)disp;
     RET(h, 7);
 }
 static void wstr_to_ascii(const uint16_t *w, char *out, size_t cap) {
@@ -621,9 +634,19 @@ static void wstr_to_ascii(const uint16_t *w, char *out, size_t cap) {
 }
 static void k_CreateFileW(void) {
     char name[512];
+    uint32_t access = A32(1), disp = A32(4);
+    int want_write, create = 0, truncate = 0;
     wstr_to_ascii(AWSTR(0), name, sizeof name);
+    want_write = (access & 0x40000000u) != 0;
+    switch (disp) {
+    case 1: create = 1; break;
+    case 2: create = 1; truncate = 1; break;
+    case 4: create = 1; break;
+    case 5: truncate = 1; break;
+    default: break;
+    }
     {
-        uint32_t h = ka_file_open(name);
+        uint32_t h = ka_file_open_ex(name, want_write, create, truncate);
         if (!h) { ka_last_error_set(2); RET(INVALID_HANDLE, 7); }
         RET(h, 7);
     }
@@ -661,8 +684,8 @@ static void k_GetFileType(void) {
     if (h == STD_OUT || h == STD_ERR || h == STD_IN) RET(2, 1);
     RET(1, 1);
 }
-static void k_FlushFileBuffers(void) { RET(1, 1); }
-static void k_SetEndOfFile(void) { RET(1, 1); }
+static void k_FlushFileBuffers(void) { RET(ka_file_sync(A32(0)) ? 1 : 0, 1); }
+static void k_SetEndOfFile(void) { RET(ka_file_truncate(A32(0)) ? 1 : 0, 1); }
 static void k_DeleteFileA(void) {
     char p[1024];
     ka_fs_resolve(ASTR(0), p, sizeof p);
@@ -676,8 +699,12 @@ static void k_MoveFileA(void) {
 }
 static void k_CreateDirectoryA(void) {
     char p[1024];
+    int rc;
     ka_fs_resolve(ASTR(0), p, sizeof p);
-    RET(mkdir(p, 0755) == 0 || errno == EEXIST, 2);
+    rc = mkdir(p, 0755);
+    if (rc != 0 && errno != EEXIST)
+        ka_log("[fs] mkdir FAILED %s -> %s: %s", ASTR(0), p, strerror(errno));
+    RET(rc == 0 || errno == EEXIST, 2);
 }
 static void k_SetCurrentDirectoryA(void) {
     extern void ka_fs_set_cwd(const char *);

@@ -107,10 +107,17 @@ void ka_fs_set_root(const char *root);
 const char *ka_fs_root(void);
 const char *ka_fs_resolve(const char *guest_path, char *out, size_t cap);
 uint32_t ka_file_open(const char *guest_path);       /* token, 0 on failure */
+/* create/truncate honour dwCreationDisposition; write is GENERIC_WRITE. The
+ * engine's save path needs all three: without O_CREAT every CreateFileA of a
+ * new save answered FILE_NOT_FOUND and the New Game route stopped at
+ * "Failed to save data." (2026-11-22). */
+uint32_t ka_file_open_ex(const char *guest_path, int write, int create, int truncate);
 uint32_t ka_file_seek(uint32_t tok, int64_t delta, int method, int *ok);
 int      ka_file_read(uint32_t tok, void *buf, uint32_t n, uint32_t *got);
 int      ka_file_write(uint32_t tok, const void *buf, uint32_t n, uint32_t *put);
 uint64_t ka_file_size(uint32_t tok);
+int      ka_file_truncate(uint32_t tok);   /* SetEndOfFile at the current offset */
+int      ka_file_sync(uint32_t tok);       /* FlushFileBuffers */
 int      ka_file_close(uint32_t tok);
 
 /* ------------------------------------------------------------ logging */

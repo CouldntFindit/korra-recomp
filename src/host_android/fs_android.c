@@ -115,14 +115,22 @@ static kfile *kf(uint32_t tok) {
     return &g_files[i];
 }
 
-uint32_t ka_file_open(const char *guest_path) {
+uint32_t ka_file_open_ex(const char *guest_path, int write, int create, int truncate) {
     char path[1024];
+    int flags = (write || create || truncate) ? O_RDWR : O_RDONLY;
     int fd;
     ka_fs_resolve(guest_path, path, sizeof path);
-    fd = open(path, O_RDWR);
-    if (fd < 0) fd = open(path, O_RDONLY);
+    if (create) flags |= O_CREAT;
+    if (truncate) flags |= O_TRUNC;
+    fd = open(path, flags, 0644);
+    /* A read-only data file opened with a write disposition (some code paths
+     * pass GENERIC_WRITE for a file it only reads) still has to open. */
+    if (fd < 0 && !create && !truncate) fd = open(path, O_RDONLY);
     if (fd < 0) {
-        if (ka_trace_files) ka_log("[fs] open %s -> %s", guest_path, strerror(errno));
+        /* A failed open is always worth a line: the save path fails silently
+         * otherwise ("Failed to save data." with no clue which file). */
+        ka_log("[fs] open FAILED %s (w=%d c=%d t=%d): %s", guest_path,
+               write, create, truncate, strerror(errno));
         return 0;
     }
     if (ka_trace_files) ka_log("[fs] open %s -> %s", guest_path, path);
@@ -135,6 +143,10 @@ uint32_t ka_file_open(const char *guest_path) {
     }
     close(fd);
     return 0;
+}
+
+uint32_t ka_file_open(const char *guest_path) {
+    return ka_file_open_ex(guest_path, 0, 0, 0);
 }
 
 uint32_t ka_file_seek(uint32_t tok, int64_t delta, int method, int *ok) {
@@ -171,6 +183,21 @@ uint64_t ka_file_size(uint32_t tok) {
     struct stat st;
     if (!f || fstat(f->fd, &st) != 0) return 0;
     return (uint64_t)st.st_size;
+}
+
+/* SetEndOfFile: truncate at the current position, which is what Windows means.
+ * The save writer uses it after its last block. */
+int ka_file_truncate(uint32_t tok) {
+    kfile *f = kf(tok);
+    off_t at;
+    if (!f) return 0;
+    at = lseek(f->fd, 0, SEEK_CUR);
+    return at >= 0 && ftruncate(f->fd, at) == 0;
+}
+
+int ka_file_sync(uint32_t tok) {
+    kfile *f = kf(tok);
+    return f ? fsync(f->fd) == 0 : 0;
 }
 
 int ka_file_close(uint32_t tok) {
