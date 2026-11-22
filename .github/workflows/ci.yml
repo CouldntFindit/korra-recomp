@@ -14,3 +14,7 @@ jobs:
       - name: Content guard
         shell: bash
         run: python tools/check_content.py $(git ls-files)
+
+      - name: Content guard selftest
+        shell: pwsh
+        run: ./tests/check_content_selftest.ps1

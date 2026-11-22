@@ -21,6 +21,13 @@ explicitly marked unverified.
 5. **One hypothesis at a time.** A crash is not "fixed" until a build runs and
    the same input reaches one step further. Record what you tried in the
    dead-end ledger even when it fails.
+6. **Never commit machine-identifying paths.** No absolute home-directory paths
+   (a Windows profile path or a POSIX home path), no cloud-sync folder names, no
+   localized Documents folder names. Use `<workspace>`, `<Documents>`,
+   `%LOCALAPPDATA%` / `$env:LOCALAPPDATA%`, or derive the location at runtime
+   (the Android scripts show the pattern). `tools/check_content.py` scans file
+   contents on every commit and in CI; `tests/check_content_selftest.ps1`
+   proves the patterns fire.
 
 ## 2. Layout
 
