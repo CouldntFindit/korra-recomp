@@ -22,7 +22,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
-$sdk = "<workspace>\android-sdk"
+$sdk = if ($env:ANDROID_HOME) { $env:ANDROID_HOME }
+       elseif ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT }
+       else { Join-Path (Split-Path (Split-Path $root -Parent) -Parent) "android-sdk" }
 $adb = Join-Path $sdk "platform-tools\adb.exe"
 $ndkRoot = Join-Path $sdk "ndk"
 $ndk = (Get-ChildItem $ndkRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1).FullName

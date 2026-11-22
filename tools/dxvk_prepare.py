@@ -34,6 +34,7 @@ Usage:
 """
 import argparse
 import hashlib
+import os
 import pathlib
 import re
 import subprocess
@@ -404,10 +405,23 @@ def main() -> int:
 
     glslc = pathlib.Path(args.glslc) if args.glslc else None
     if not glslc:
-        # The NDK ships shaderc; find the newest installed one.
-        sdk = pathlib.Path("<workspace>/android-sdk/ndk")
-        cands = sorted(sdk.glob("*/shader-tools/windows-x86_64/glslc.exe")) if sdk.is_dir() else []
-        glslc = cands[-1] if cands else None
+        # The NDK ships shaderc; find the newest installed one. Prefer the SDK
+        # the environment names, then the workspace layout (android-sdk/ next to
+        # recomp-work/; docs/TOOLCHAIN.md).
+        ndk_roots = []
+        for var in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
+            value = os.environ.get(var)
+            if value:
+                ndk_roots.append(pathlib.Path(value) / "ndk")
+        ndk_roots.append(pathlib.Path(__file__).resolve().parents[3] / "android-sdk" / "ndk")
+        glslc = None
+        for ndk_root in ndk_roots:
+            if not ndk_root.is_dir():
+                continue
+            cands = sorted(ndk_root.glob("*/shader-tools/windows-x86_64/glslc.exe"))
+            if cands:
+                glslc = cands[-1]
+                break
     if glslc and glslc.is_file():
         n = generate_shaders(tree, glslc)
         print("prepare: generated %d shader headers with %s" % (n, glslc))

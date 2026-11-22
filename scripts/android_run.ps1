@@ -16,7 +16,7 @@ param(
     [int]$Seconds = 30,
     [string]$Apk = "android\app\build\outputs\apk\debug\app-debug.apk",
     [string]$Package = "org.korra.recomp",
-    [string]$GameSource = "<workspace>\The Legend of Korra",
+    [string]$GameSource = "",
     [switch]$NoInstall,
     [switch]$NoGameCopy,
     [switch]$NoLogcat,
@@ -36,7 +36,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
-$sdk = "<workspace>\android-sdk"
+if (-not $GameSource) {
+    # Bring-your-own-copy: the game tree sits next to the workspace by default.
+    $GameSource = Join-Path (Split-Path (Split-Path $root -Parent) -Parent) "The Legend of Korra"
+}
+$sdk = if ($env:ANDROID_HOME) { $env:ANDROID_HOME }
+       elseif ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT }
+       else { Join-Path (Split-Path (Split-Path $root -Parent) -Parent) "android-sdk" }
 $adb = Join-Path $sdk "platform-tools\adb.exe"
 if (-not (Test-Path $adb)) { throw "adb not found at $adb" }
 

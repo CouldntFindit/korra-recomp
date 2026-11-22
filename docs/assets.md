@@ -490,7 +490,7 @@ clang-cl/LLVM, or (b) use the vgmstream CLI for audio only. Neither is blocking.
 ## 8. Reproduce
 
 ```powershell
-$py = "%LOCALAPPDATA%\Python\pythoncore-3.15-64\python.exe"
+$py = "$env:LOCALAPPDATA\Python\pythoncore-3.15-64\python.exe"
 $g  = "The Legend of Korra\GameData"
 
 # manifest (no extraction, < 0.5 s per archive; data001 is mmap'd, 1.6 GB stays on disk)

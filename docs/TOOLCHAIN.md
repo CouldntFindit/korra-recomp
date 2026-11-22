@@ -114,7 +114,7 @@ Three notes worth their kilobytes:
    so `"ndk;28.2.13676358"` arrives as two packages ("Package ndk not found").
    Use the `/` form shown above.
 2. `JAVA_HOME` on this machine points at a **JDK 8** install
-   (`%USERPROFILE%\Downloads\jdk8\...`), which AGP cannot use. `java` on PATH is
+   (`...\Downloads\jdk8\...`), which AGP cannot use. `java` on PATH is
    JDK 21, so the build works only when `JAVA_HOME` is set — `scripts\android_build.ps1`
    does it, and any manual `gradlew` run needs it too.
 3. The installed command-line tools warn that `sdkmanager` is deprecated in

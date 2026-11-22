@@ -27,7 +27,7 @@ $work = Join-Path $env:TEMP "opencode\pcmpistri"
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 
 # vcvarsall from the project-local Build Tools install (see docs/TOOLCHAIN.md).
-$vcvars = "<workspace>\msvc\VC\Auxiliary\Build\vcvarsall.bat"
+$vcvars = Join-Path (Split-Path (Split-Path $root -Parent) -Parent) "msvc\VC\Auxiliary\Build\vcvarsall.bat"
 if (-not (Test-Path $vcvars)) {
     $vcvars = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat"
 }

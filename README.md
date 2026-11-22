@@ -15,7 +15,8 @@ side (Win32, D3D9 surface, XInput, XAudio2, CRI/Wwise audio, Steam stubs).
 > **Work in progress.** The Windows path now boots, renders and plays: no Steam,
 > text renders, and the first area runs at 39-58 fps (30 fps cap is the Android
 > default). On Android, the S24 (Xclipse 940, stock driver) now reaches the
-> title screen, main menu and intro cutscene with working touch input — the
+> title screen, main menu, intro cutscene and the tutorial area with working
+> touch input, and the save path works — the frame-rate/thermal campaign for the
 > first playable area is next. The milestone table and timeline below are the
 > source of truth.
 
@@ -25,7 +26,7 @@ side (Win32, D3D9 surface, XInput, XAudio2, CRI/Wwise audio, Steam stubs).
 
 ## Status
 
-*Last updated 2026-11-22. Current focus: M3 — the first playable area on the device (the save path is closed).*
+*Last updated 2026-11-22. Current focus: M3 — the first-area frame-rate/thermal campaign (save path and post-cutscene stability are closed).*
 
 | Milestone | What it means | State |
 |---|---|---|

@@ -14,13 +14,18 @@ param(
     [switch]$Install,
     [string]$Sdk = $(if ($env:ANDROID_HOME) { $env:ANDROID_HOME }
                     elseif ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT }
-                    else { "<workspace>\android-sdk" }),
+                    else { "" }),
     [string]$Jdk = $(if ($env:KORRA_JDK) { $env:KORRA_JDK }
                     else { "C:\Program Files\Eclipse Adoptium\jdk-21.0.12.101-hotspot" })
 )
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
+if (-not $Sdk) {
+    # The workspace root holds android-sdk/ next to recomp-work/, not in the
+    # default per-user location (docs/TOOLCHAIN.md).
+    $Sdk = Join-Path (Split-Path (Split-Path $root -Parent) -Parent) "android-sdk"
+}
 $android = Join-Path $root "android"
 
 if (-not (Test-Path (Join-Path $android "gradlew.bat"))) {

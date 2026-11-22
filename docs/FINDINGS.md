@@ -3136,7 +3136,7 @@ build the file, `CreateFileA(GENERIC_WRITE, CREATE_ALWAYS)`, `WriteFile`.
 
 **Same state, two hosts (cold: no `Korra` directory).** Windows oracle
 (`work\m4b_run.ps1`, pad timeline 44 s A / 47 A / 53 A / 61.8 A / 67.8 DOWN /
-69.8 A / 73.2 LEFT / 75.2 A / 80.2 A, `Documents\Korra` renamed away):
+69.8 A / 73.2 LEFT / 75.2 A / 80.2 A, `<Documents>\Korra` renamed away):
 
 ```
 [save] SHGetSpecialFolderPathA hwnd=0 csidl=5 create=0 -> ret=1 path="<Documents>"
