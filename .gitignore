@@ -54,6 +54,21 @@ CMakeFiles/
 *.log
 
 # ---------------------------------------------------------------------------
+# Editor / OS / machine-local state. `.vs/` is Visual Studio 2022 (the
+# toolchain this project pins); everything here is per-machine scratch.
+# ---------------------------------------------------------------------------
+.vs/
+*.code-workspace
+CMakeUserPresets.json
+*.VC.db
+*.VC.opendb
+*.swp
+Thumbs.db
+Desktop.ini
+.DS_Store
+MASTER_STATE.md
+
+# ---------------------------------------------------------------------------
 # Android (M3). Build output, machine-specific paths, signing material.
 # `build/` above already covers android/build and android/app/build.
 # The Gradle wrapper jar IS committed on purpose (see THIRD_PARTY_NOTICES.md).
