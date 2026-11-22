@@ -39,8 +39,10 @@ const char* korra_install_gamedata(void) {
 
 /* adb-driven install: if the tree is already at <files>/game, use it without a
  * picker. This is the loop the dev builds are tested with
- * (scripts\android_push_game.ps1) and it cannot fake a real install: the same
- * three paths are required. */
+ * (scripts\android_run.ps1) and it cannot fake a real install: the same three
+ * paths are required. The script writes the install marker after its copy, so
+ * the Java first-run check (marker + LoK.exe + both CPKs) agrees with the
+ * native probe. */
 int korra_install_probe(const char* external_files) {
     char path[640];
     FILE* f;

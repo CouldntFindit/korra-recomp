@@ -22,9 +22,9 @@ const char* korra_log_path(void);
 void korra_logv(const char* fmt, ...);
 
 /* ---- install_android.c ---------------------------------------------------
- * First-run state shared with the Java side. Java copies the user's GameData
- * tree into external storage and then calls nativeGameDataReady(); the native
- * frame loop polls korra_install_ready(). */
+ * First-run state shared with the Java side. Java copies the user's game root
+ * (LoK.exe + GameData) into the app's internal files directory and then calls
+ * nativeGameDataReady(); the native frame loop polls korra_install_ready(). */
 void korra_install_set_gamedata(const char* path);
 int korra_install_ready(void);
 const char* korra_install_gamedata(void);

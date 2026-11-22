@@ -1,11 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Korra</string>
-    <string name="pick_prompt">Select the folder that contains GameData</string>
+    <string name="pick_prompt">Select the folder that contains GameData and LoK.exe</string>
     <string name="pick_hint">Tap anywhere to open the system file picker.</string>
-    <string name="copying">Copying game data: %1$s</string>
-    <string name="copy_done">Game data ready (%1$s)</string>
+    <string name="pick_cancelled">No folder was picked.</string>
+    <string name="pick_no_gamedata">That folder has no GameData folder. Pick the folder that contains GameData and LoK.exe.</string>
+    <string name="pick_no_exe">That folder has no LoK.exe. Pick the game root - the folder that contains LoK.exe and GameData.</string>
+    <string name="pick_gamedata_itself">You picked GameData itself. Pick its parent folder, which also contains LoK.exe.</string>
+    <string name="pick_incomplete">That GameData is incomplete: data000.cpk and data001.cpk must both be there.</string>
+    <string name="validating">Checking the selected folder...</string>
+    <string name="resuming">Resuming the game data copy...</string>
+    <string name="copying_progress">Copying game data: %1$s / %2$s</string>
+    <string name="copying_progress_rate">Copying game data: %1$s / %2$s (%3$s)</string>
+    <string name="copy_done_files">Game data ready: %1$s in %2$s (%3$d files copied, %4$d already present)</string>
     <string name="copy_failed">Copy failed: %1$s</string>
-    <string name="no_game_data">The selected folder does not contain a GameData folder.</string>
-    <string name="no_space">Not enough free space: %1$s needed, %2$s available.</string>
+    <string name="no_space">Not enough free space: %1$s needed, %2$s available. Free some space, then tap to try again.</string>
 </resources>

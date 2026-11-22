@@ -70,8 +70,11 @@ if (-not $NoInstall) {
 }
 
 # --- game tree: push to /data/local/tmp (world readable), then run-as copy ---
+# The install is "done" only when the marker the SAF installer writes is there
+# too: the app's first-run check is marker + LoK.exe + both CPKs, so a dev tree
+# copied here must say so or the app shows the picker over a running game.
 if (-not $NoGameCopy) {
-    $hasGame = (& $adb shell "run-as $Package sh -c 'test -f files/game/GameData/main.data && echo yes || echo no'" 2>$null) -join ""
+    $hasGame = (& $adb shell "run-as $Package sh -c 'test -f files/game/install.complete && test -f files/game/LoK.exe && echo yes || echo no'" 2>$null) -join ""
     if ($hasGame -notmatch "yes") {
         Write-Host "game tree: copying into internal storage (first run, ~3 GB)"
         & $adb shell "mkdir -p /data/local/tmp/korra"
@@ -85,6 +88,7 @@ if (-not $NoGameCopy) {
             & $adb shell "run-as $Package sh -c 'mkdir -p files/game && cp -r /data/local/tmp/korra/$item files/game/'"
             if ($LASTEXITCODE -ne 0) { throw "run-as copy of $item failed" }
         }
+        & $adb shell "run-as $Package sh -c 'printf dev=1 > files/game/install.complete'"
         & $adb shell "run-as $Package sh -c 'ls -l files/game; du -sh files/game/GameData'" | Out-Host
     } else {
         Write-Host "game tree: already installed"

@@ -14,129 +14,267 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.Locale;
 
 /**
- * Copies the user's GameData tree out of a SAF folder into app storage.
+ * Copies the user's game root out of a SAF folder into app storage.
  *
- * <p>The picker can return either the game folder (the one that contains
- * {@code GameData}) or the {@code GameData} folder itself; both are accepted.
- * Everything below {@code GameData} is copied, because the engine reads the
- * two CPKs plus the loose {@code sound/} and {@code movie/} folders at
- * runtime, and the CPK layer is not allowed to reach outside its root.
+ * <p>The picked folder must be the <b>game root</b>: the one that contains
+ * {@code LoK.exe} and {@code GameData\}. LoK.exe is not optional - the lifted
+ * program reads its image's data sections (strings, vtables, resources) at
+ * runtime - so a GameData-only selection is rejected before a byte is copied.
  *
  * <p>Why copy at all: the lifted code opens paths through the host file layer,
  * which is plain POSIX I/O. A content:// URI cannot be handed to that layer
  * without a proxy the engine does not know about. Copying once, on first run,
  * keeps the runtime boring.
+ *
+ * <p>The copy is resumable at file granularity: a file whose target already
+ * exists with the source's exact size is skipped, so a copy killed by the
+ * system (or a storage-full failure) continues where it stopped on the next
+ * attempt. 2.8 GB is a few minutes of I/O, so progress is reported on a byte
+ * clock (not a file count - the first files are 265 MB and 1.6 GB) and every
+ * top-level item is timed in the log.
  */
 final class GameDataInstaller {
     private static final String TAG = "Korra";
 
-    /** Rough footprint of the shipped GameData tree, with slack for a patch. */
-    static final long REQUIRED_BYTES = 2_600_000_000L;
+    /** Written only after a complete pass; its absence means "copy me again". */
+    static final String INSTALL_MARKER = "install.complete";
 
     private static final int BUFFER = 1 << 20;
 
+    /** How often the byte clock publishes progress. */
+    private static final long PROGRESS_INTERVAL_NS = 400_000_000L;
+
+    /** Headroom requested on top of the measured source size. */
+    private static final long SPACE_SLACK = 128L << 20;
+
     interface Progress {
-        void onProgress(long files, long bytes);
+        void onProgress(long files, long filesTotal, long bytes, long bytesTotal, String item);
+    }
+
+    /** Why a picked folder cannot be installed, with a string for the user. */
+    enum Problem {
+        NO_GAMEDATA(R.string.pick_no_gamedata),
+        NO_EXE(R.string.pick_no_exe),
+        GAMEDATA_ITSELF(R.string.pick_gamedata_itself),
+        INCOMPLETE(R.string.pick_incomplete);
+
+        final int message;
+
+        Problem(int message) {
+            this.message = message;
+        }
+    }
+
+    static final class PickProblem extends IOException {
+        final Problem problem;
+
+        PickProblem(Problem problem) {
+            super(problem.name());
+            this.problem = problem;
+        }
+
+        String message(Context context) {
+            return context.getString(problem.message);
+        }
+    }
+
+    static final class SpaceProblem extends IOException {
+        final long needed;
+        final long available;
+
+        SpaceProblem(long needed, long available) {
+            super("need " + needed + " bytes, have " + available);
+            this.needed = needed;
+            this.available = available;
+        }
+    }
+
+    /** A validated selection: where the two required pieces live, and its size. */
+    static final class Source {
+        final String gameDataDocId;
+        final String exeDocId;
+        final long files;
+        final long bytes;
+
+        Source(String gameDataDocId, String exeDocId, long files, long bytes) {
+            this.gameDataDocId = gameDataDocId;
+            this.exeDocId = exeDocId;
+            this.files = files;
+            this.bytes = bytes;
+        }
     }
 
     static final class Result {
         final long files;
+        final long skipped;
         final long bytes;
+        final long millis;
 
-        Result(long files, long bytes) {
+        Result(long files, long skipped, long bytes, long millis) {
             this.files = files;
+            this.skipped = skipped;
             this.bytes = bytes;
+            this.millis = millis;
         }
     }
 
     private GameDataInstaller() {
     }
 
-    /** True when the marker, both CPKs and the image the lift needs are present. */
+    /** True when the marker, LoK.exe and both CPKs are present. */
     static boolean isInstalled(File gameRoot) {
         File data = new File(gameRoot, "GameData");
-        return new File(gameRoot, MainActivity.INSTALL_MARKER).isFile()
+        return new File(gameRoot, INSTALL_MARKER).isFile()
                 && new File(gameRoot, "LoK.exe").isFile()
                 && new File(data, "data000.cpk").isFile()
                 && new File(data, "data001.cpk").isFile();
     }
 
-    static String human(long bytes) {
-        if (bytes >= 1_000_000_000L) {
-            return String.format(java.util.Locale.US, "%.2f GB", bytes / 1e9);
+    /** True when a previous copy left something behind worth resuming. */
+    static boolean hasPartialInstall(File gameRoot) {
+        if (!gameRoot.isDirectory()) {
+            return false;
         }
-        return String.format(java.util.Locale.US, "%.0f MB", bytes / 1e6);
+        String[] children = gameRoot.list();
+        return children != null && children.length > 0;
     }
 
-    static Result copy(Context context, Uri tree, File gameRoot, Progress progress)
-            throws IOException {
+    static String human(long bytes) {
+        if (bytes >= 1_000_000_000L) {
+            return String.format(Locale.US, "%.2f GB", bytes / 1e9);
+        }
+        return String.format(Locale.US, "%.0f MB", bytes / 1e6);
+    }
+
+    /**
+     * Check the picked tree before copying anything: LoK.exe, GameData and both
+     * CPKs must be there, and the size is measured for the space check and the
+     * progress bar. Throws a {@link PickProblem} naming what is missing.
+     */
+    static Source validate(Context context, Uri tree) throws IOException {
         ContentResolver resolver = context.getContentResolver();
         String rootDocId = DocumentsContract.getTreeDocumentId(tree);
 
-        // Case 1: the picked tree is the game root and contains a GameData child.
         String gameDataDocId = null;
+        String exeDocId = null;
+        long exeBytes = -1;
+        boolean cpkAtRoot = false;
+
         try (Cursor c = query(resolver, childUri(tree, rootDocId))) {
+            if (c == null) {
+                throw new IOException("cannot list the selected folder");
+            }
+            while (c.moveToNext()) {
+                String name = c.getString(1);
+                if (name == null) {
+                    continue;
+                }
+                boolean dir = isDir(c.getString(2));
+                if (dir && name.equalsIgnoreCase("GameData")) {
+                    gameDataDocId = c.getString(0);
+                } else if (!dir && name.equalsIgnoreCase("LoK.exe")) {
+                    exeDocId = c.getString(0);
+                    exeBytes = sizeOf(c);
+                } else if (!dir && (name.equalsIgnoreCase("data000.cpk")
+                        || name.equalsIgnoreCase("data001.cpk"))) {
+                    cpkAtRoot = true;
+                }
+            }
+        }
+
+        if (gameDataDocId == null) {
+            throw new PickProblem(cpkAtRoot ? Problem.GAMEDATA_ITSELF : Problem.NO_GAMEDATA);
+        }
+        if (exeDocId == null) {
+            throw new PickProblem(Problem.NO_EXE);
+        }
+
+        boolean cpk0 = false;
+        boolean cpk1 = false;
+        try (Cursor c = query(resolver, childUri(tree, gameDataDocId))) {
             while (c != null && c.moveToNext()) {
                 String name = c.getString(1);
-                if ("GameData".equalsIgnoreCase(name)) {
-                    gameDataDocId = c.getString(0);
-                    break;
+                if (name == null) {
+                    continue;
+                }
+                if (name.equalsIgnoreCase("data000.cpk")) {
+                    cpk0 = true;
+                } else if (name.equalsIgnoreCase("data001.cpk")) {
+                    cpk1 = true;
                 }
             }
         }
-        if (gameDataDocId == null) {
-            // Case 2: the picked tree is GameData itself. Guard against a wrong
-            // pick by requiring one of the two CPKs at this level.
-            try (Cursor c = query(resolver, childUri(tree, rootDocId))) {
-                boolean looksRight = false;
-                while (c != null && c.moveToNext()) {
-                    String name = c.getString(1).toLowerCase(java.util.Locale.ROOT);
-                    if (name.equals("data000.cpk") || name.equals("data001.cpk")) {
-                        looksRight = true;
-                    }
-                }
-                if (!looksRight) {
-                    throw new IOException("no GameData folder and no data000.cpk in the selection");
-                }
-            }
-            gameDataDocId = rootDocId;
+        if (!cpk0 || !cpk1) {
+            throw new PickProblem(Problem.INCOMPLETE);
         }
+
+        long[] totals = new long[2];
+        measure(resolver, tree, gameDataDocId, totals);
+        long bytes = totals[1] + Math.max(0, exeBytes);
+        Log.i(TAG, "install: validated " + (totals[0] + 1) + " files, " + bytes + " bytes");
+        return new Source(gameDataDocId, exeDocId, totals[0] + 1, bytes);
+    }
+
+    /**
+     * Copy the validated tree into {@code gameRoot}. Existing files whose size
+     * matches the source are skipped, so this is safe to call again after an
+     * interrupted copy.
+     */
+    static Result copy(Context context, Uri tree, Source source, File gameRoot, Progress progress)
+            throws IOException {
+        ContentResolver resolver = context.getContentResolver();
 
         File target = new File(gameRoot, "GameData");
         if (!target.isDirectory() && !target.mkdirs()) {
             throw new IOException("cannot create " + target);
         }
-        Log.i(TAG, "copying tree " + gameDataDocId + " -> " + target);
 
-        long[] totals = new long[2];
-        copyDir(resolver, tree, gameDataDocId, target, totals, progress);
-
-        /* The lifted program still reads its image's data sections (strings,
-         * vtables, resources), so LoK.exe is part of the install - 6.8 MB next
-         * to the 2 GB of GameData. It lives in the game root, which the picker
-         * may have been (case 1) or not (case 2). */
-        if (gameDataDocId.equals(rootDocId)) {
-            throw new IOException("pick the game folder that contains GameData, "
-                    + "not GameData itself: LoK.exe must be copied too");
+        long existing = existingBytes(target) + existingBytes(new File(gameRoot, "LoK.exe"));
+        long need = Math.max(0, source.bytes - existing);
+        long free = gameRoot.getUsableSpace();
+        if (free > 0 && free < need + SPACE_SLACK) {
+            throw new SpaceProblem(need + SPACE_SLACK, free);
         }
-        copyRootFile(resolver, tree, rootDocId, "LoK.exe", new File(gameRoot, "LoK.exe"),
-                totals, progress);
 
-        if (totals[0] == 0) {
+        long started = System.currentTimeMillis();
+        Meter meter = new Meter(progress, source.files, source.bytes, "GameData");
+
+        Log.i(TAG, "install: GameData start: " + source.files + " files, "
+                + source.bytes + " bytes (" + GameDataInstaller.human(existing) + " already present)");
+        copyDir(resolver, tree, source.gameDataDocId, target, meter, "");
+        long gameDataMs = System.currentTimeMillis() - started;
+        Log.i(TAG, "install: GameData done in " + gameDataMs + " ms, "
+                + GameDataInstaller.human(meter.bytes) + " at "
+                + GameDataInstaller.human(rate(meter.bytes, gameDataMs)) + "/s");
+
+        long exeStarted = System.currentTimeMillis();
+        Log.i(TAG, "install: LoK.exe start");
+        copyOne(resolver, tree, source.exeDocId, new File(gameRoot, "LoK.exe"),
+                -1, meter);
+        long exeMs = System.currentTimeMillis() - exeStarted;
+        Log.i(TAG, "install: LoK.exe done in " + exeMs + " ms");
+        meter.tick(true);
+
+        if (meter.bytes == 0) {
             throw new IOException("the selection was empty");
         }
+
         // Only after a complete pass, so a killed copy is retried next launch.
-        try (OutputStream marker = new FileOutputStream(
-                new File(gameRoot, MainActivity.INSTALL_MARKER))) {
-            marker.write(("files=" + totals[0] + " bytes=" + totals[1] + "\n").getBytes());
+        try (OutputStream marker = new FileOutputStream(new File(gameRoot, INSTALL_MARKER))) {
+            marker.write(("files=" + meter.files + " skipped=" + meter.skipped
+                    + " bytes=" + meter.bytes + " total=" + source.bytes
+                    + " seconds=" + ((System.currentTimeMillis() - started) / 1000) + "\n")
+                    .getBytes());
         }
-        return new Result(totals[0], totals[1]);
+        return new Result(meter.files, meter.skipped, meter.bytes,
+                System.currentTimeMillis() - started);
     }
 
     private static void copyDir(ContentResolver resolver, Uri tree, String docId, File target,
-                                long[] totals, Progress progress) throws IOException {
+                                Meter meter, String prefix) throws IOException {
         try (Cursor c = query(resolver, childUri(tree, docId))) {
             if (c == null) {
                 return;
@@ -144,22 +282,37 @@ final class GameDataInstaller {
             while (c.moveToNext()) {
                 String id = c.getString(0);
                 String name = c.getString(1);
-                String mime = c.getString(2);
+                if (name == null) {
+                    continue;
+                }
                 File child = new File(target, name);
-                if (DocumentsContract.Document.MIME_TYPE_DIR.equals(mime)) {
+                if (isDir(c.getString(2))) {
                     if (!child.isDirectory() && !child.mkdirs()) {
                         throw new IOException("cannot create " + child);
                     }
-                    copyDir(resolver, tree, id, child, totals, progress);
+                    copyDir(resolver, tree, id, child, meter, prefix + name + "/");
                 } else {
-                    copyFile(resolver, tree, id, child, totals, progress);
+                    copyOne(resolver, tree, id, child, sizeOf(c), meter);
                 }
             }
         }
     }
 
-    private static void copyFile(ContentResolver resolver, Uri tree, String docId, File target,
-                                 long[] totals, Progress progress) throws IOException {        Uri document = DocumentsContract.buildDocumentUriUsingTree(tree, docId);
+    /**
+     * Copy one document. A target that already has the source's exact size is
+     * counted and skipped (resume). {@code size < 0} means the provider did not
+     * report one: no skip, no length assertion.
+     */
+    private static void copyOne(ContentResolver resolver, Uri tree, String docId, File target,
+                                long size, Meter meter) throws IOException {
+        if (size > 0 && target.isFile() && target.length() == size) {
+            meter.skipped++;
+            meter.file(size);
+            meter.tick(false);
+            return;
+        }
+        Uri document = DocumentsContract.buildDocumentUriUsingTree(tree, docId);
+        long written = 0;
         try (InputStream in = new BufferedInputStream(resolver.openInputStream(document), BUFFER);
              OutputStream out = new BufferedOutputStream(new FileOutputStream(target), BUFFER)) {
             if (in == null) {
@@ -169,31 +322,111 @@ final class GameDataInstaller {
             int n;
             while ((n = in.read(buffer)) > 0) {
                 out.write(buffer, 0, n);
-                totals[1] += n;
+                written += n;
+                meter.bytes(n);
+                meter.tick(false);
             }
         }
-        totals[0]++;
-        if (progress != null && (totals[0] % 32) == 0) {
-            progress.onProgress(totals[0], totals[1]);
+        if (size > 0 && written != size) {
+            throw new IOException("short copy of " + target.getName() + ": "
+                    + written + " of " + size + " bytes");
+        }
+        meter.files++;
+        meter.bytes(0);
+        meter.tick(false);
+    }
+
+    private static long existingBytes(File file) {
+        if (file.isFile()) {
+            return file.length();
+        }
+        if (!file.isDirectory()) {
+            return 0;
+        }
+        long total = 0;
+        File[] children = file.listFiles();
+        if (children != null) {
+            for (File child : children) {
+                total += existingBytes(child);
+            }
+        }
+        return total;
+    }
+
+    private static long rate(long bytes, long millis) {
+        if (millis <= 0) {
+            return bytes;
+        }
+        return bytes * 1000 / millis;
+    }
+
+    private static void measure(ContentResolver resolver, Uri tree, String docId, long[] totals) {
+        try (Cursor c = query(resolver, childUri(tree, docId))) {
+            if (c == null) {
+                return;
+            }
+            while (c.moveToNext()) {
+                long size = sizeOf(c);
+                if (isDir(c.getString(2))) {
+                    measure(resolver, tree, c.getString(0), totals);
+                } else {
+                    totals[0]++;
+                    if (size > 0) {
+                        totals[1] += size;
+                    }
+                }
+            }
+        } catch (RuntimeException e) {
+            Log.w(TAG, "install: measure failed below " + docId, e);
         }
     }
 
-    /** Copy one named file from the picked tree's root, if it exists. */
-    private static void copyRootFile(ContentResolver resolver, Uri tree, String rootDocId,
-                                     String name, File target, long[] totals,
-                                     Progress progress) throws IOException {
-        try (Cursor c = query(resolver, childUri(tree, rootDocId))) {
-            if (c == null) {
-                throw new IOException("cannot list the picked folder");
+    /** Byte-clock progress: a 1.6 GB CPK must not look frozen. */
+    private static final class Meter {
+        final Progress progress;
+        final long totalFiles;
+        final long totalBytes;
+        final String item;
+        long files;
+        long skipped;
+        long bytes;
+        long lastNs;
+
+        Meter(Progress progress, long totalFiles, long totalBytes, String item) {
+            this.progress = progress;
+            this.totalFiles = totalFiles;
+            this.totalBytes = totalBytes;
+            this.item = item;
+            this.lastNs = System.nanoTime();
+        }
+
+        void file(long size) {
+            files++;
+            bytes += size;
+        }
+
+        void bytes(long n) {
+            bytes += n;
+        }
+
+        void tick(boolean force) {
+            long now = System.nanoTime();
+            if (!force && now - lastNs < PROGRESS_INTERVAL_NS) {
+                return;
             }
-            while (c.moveToNext()) {
-                if (name.equalsIgnoreCase(c.getString(1))) {
-                    copyFile(resolver, tree, c.getString(0), target, totals, progress);
-                    return;
-                }
+            lastNs = now;
+            if (progress != null) {
+                progress.onProgress(files, totalFiles, bytes, totalBytes, item);
             }
         }
-        throw new IOException("LoK.exe is not in the picked folder; pick the game root");
+    }
+
+    private static boolean isDir(String mime) {
+        return DocumentsContract.Document.MIME_TYPE_DIR.equals(mime);
+    }
+
+    private static long sizeOf(Cursor c) {
+        return c.isNull(3) ? -1 : c.getLong(3);
     }
 
     private static Uri childUri(Uri tree, String docId) {
@@ -205,6 +438,7 @@ final class GameDataInstaller {
                 DocumentsContract.Document.COLUMN_DOCUMENT_ID,
                 DocumentsContract.Document.COLUMN_DISPLAY_NAME,
                 DocumentsContract.Document.COLUMN_MIME_TYPE,
+                DocumentsContract.Document.COLUMN_SIZE,
         }, null, null, null);
     }
 }
