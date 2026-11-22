@@ -23,6 +23,7 @@ static char g_exe_path[768];
 static char g_root[640];
 static void *g_window;
 static int g_started;
+static volatile uint32_t g_shell_frames;
 
 void ka_set_guest_module(const char *exe_path) {
     snprintf(g_exe_path, sizeof g_exe_path, "%s", exe_path);
@@ -88,6 +89,9 @@ int ka_guest_run(const char *game_root) {
     if (ka_pe_map(exe) != 0) return -1;
     unresolved = ka_pe_bind();
     ka_log("host: %d unresolved imports", unresolved);
+    /* After the image map: the sampler reads guest globals, and those are not
+     * addressable until the window and the .data section exist. */
+    ka_memtrace_start();
 
     {
         pthread_t th;
@@ -135,7 +139,10 @@ int korra_guest_start(const char *game_data_dir, void *native_window) {
 void korra_guest_frame(void *native_window) {
     if (native_window != g_window) ka_window_set(native_window);
     ka_d3d9_window_changed();
+    g_shell_frames++;
 }
+
+uint32_t ka_shell_frames(void) { return g_shell_frames; }
 
 void korra_guest_stop(void) {
     ka_d3d9_shutdown();

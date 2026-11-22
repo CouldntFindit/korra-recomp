@@ -840,6 +840,25 @@ uint32_t ka_thread_wait(uint32_t token, uint32_t timeout_ms) {
 
 int ka_spine_depth(void) { return g_ts.depth; }
 
+/* Census for the 1 Hz sampler: `created` is the live table's occupancy, `live`
+ * the threads still running, and the peak is what the stack region has to
+ * hold. */
+void ka_thread_stats(uint32_t *live, uint32_t *created, uint32_t *peak) {
+    static uint32_t s_peak;
+    uint32_t l = 0, c = 0;
+    pthread_mutex_lock(&g_threads_lock);
+    for (int i = 0; i < MAX_THREADS; i++) {
+        if (!g_threads[i].used) continue;
+        c++;
+        if (!g_threads[i].done) l++;
+    }
+    if (l > s_peak) s_peak = l;
+    pthread_mutex_unlock(&g_threads_lock);
+    if (live) *live = l;
+    if (created) *created = c;
+    if (peak) *peak = s_peak;
+}
+
 uint32_t ka_thread_exit_code(uint32_t token) {
     ka_thread *t = ka_thread_find(token);
     return t ? t->exit_code : 0;

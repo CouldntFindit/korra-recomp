@@ -44,6 +44,10 @@ typedef struct blk {
 
 static blk *g_free_list;
 static uint32_t g_heap_hi, g_heap_end;
+/* Free-list census maintained at the two places the list changes, so the 1 Hz
+ * sampler never walks a list the guest is mutating (the guest holds the machine
+ * lock; the sampler must not take it). */
+static uint32_t g_free_blocks, g_free_bytes;
 
 static uint32_t g_stack_hi;
 static uint32_t g_stack_end;
@@ -110,6 +114,8 @@ uint32_t ka_guest_alloc(uint32_t size, uint32_t align) {
         if (b->size >= size) {
             *pp = b->next;
             b->magic = 0;
+            g_free_blocks--;
+            g_free_bytes -= b->size;
             uint32_t va = (uint32_t)((uint8_t *)b - g_win) + (uint32_t)sizeof(blk);
             va = (va + align - 1u) & ~(align - 1u);
             if (size >= (4u << 20) && g_big_logs < 60) {
@@ -145,6 +151,8 @@ void ka_guest_free(uint32_t va) {
     b->magic = BLK_MAGIC;
     b->next = g_free_list;
     g_free_list = b;
+    g_free_blocks++;
+    g_free_bytes += b->size;
 }
 
 uint32_t ka_guest_size(uint32_t va) {
@@ -174,6 +182,20 @@ uint32_t ka_stack_new(uint32_t size, uint32_t *limit) {
     if (limit) *limit = lo;
     memset(ka_host(lo), 0, 64);
     return esp;
+}
+
+void ka_stack_stats(uint32_t *hi, uint32_t *end, uint32_t *free_blocks,
+                    uint32_t *free_bytes) {
+    if (hi) *hi = g_stack_hi;
+    if (end) *end = g_stack_end;
+    if (free_blocks) *free_blocks = 0;
+    if (free_bytes) *free_bytes = 0;
+}
+
+void ka_heap_stats(uint32_t *hi, uint32_t *free_blocks, uint32_t *free_bytes) {
+    if (hi) *hi = g_heap_hi;
+    if (free_blocks) *free_blocks = g_free_blocks;
+    if (free_bytes) *free_bytes = g_free_bytes;
 }
 
 /* ---- engine pool inspection -------------------------------------------- */

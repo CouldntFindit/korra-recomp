@@ -51,6 +51,11 @@ uint32_t  ka_guest_strdup(const char *s);
 uint32_t  ka_guest_size(uint32_t va);
 /* A fresh guest stack; returns the initial esp (top, 16-byte aligned). */
 uint32_t  ka_stack_new(uint32_t size, uint32_t *limit);
+/* Census for the 1 Hz sampler: heap bump pointer + free list, and the stack
+ * region's bump pointer, end, free list and free bytes. */
+void      ka_heap_stats(uint32_t *hi, uint32_t *free_blocks, uint32_t *free_bytes);
+void      ka_stack_stats(uint32_t *hi, uint32_t *end, uint32_t *free_blocks,
+                         uint32_t *free_bytes);
 
 /* ------------------------------------------------------------------- PE */
 int  ka_pe_map(const char *exe_path);     /* map sections at their VAs */
@@ -162,6 +167,8 @@ uint32_t ka_thread_wait(uint32_t token, uint32_t timeout_ms);
 uint32_t ka_guest_tid(void);
 uint32_t ka_thread_exit_code(uint32_t token);
 uint32_t ka_thread_self_param(void);
+/* live / created / peak-live guest threads, for the 1 Hz sampler. */
+void     ka_thread_stats(uint32_t *live, uint32_t *created, uint32_t *peak);
 int      ka_spine_depth(void);
 uint32_t ka_mono_ms(void);
 uint32_t ka_hat_packet(void);
@@ -197,6 +204,12 @@ void ka_vtable_note_import(const char *name);
 /* The guest's entry: run the lifted CRT entry on a host thread. Returns when
  * it returns (normally only through ExitProcess). */
 int ka_guest_run(const char *game_root);
+
+/* 1 Hz stability sampler, started by ka_guest_run when debug.korra.memtrace=1
+ * (memtrace_android.c). */
+void ka_memtrace_start(void);
+/* Shell loop iterations (jni_bridge -> main_android.c korra_guest_frame). */
+uint32_t ka_shell_frames(void);
 
 /* XAudio2 / steam / misc module tables registered at boot. */
 void ka_shims_register_all(void);

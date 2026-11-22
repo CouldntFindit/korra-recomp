@@ -97,6 +97,9 @@ uint32_t g_vt[32][192];          /* per kind: guest vtable VAs */
 int g_vt_built[32];
 uint32_t g_d3d_token;
 uint32_t g_device_token;
+/* Present count for the 1 Hz sampler (ka_d3d9_frame_presented). Incremented in
+ * d_Present, i.e. the engine's own frame boundary, not the shell's tick. */
+unsigned g_presents;
 
 /* ---------------------------------------------------------------- helpers */
 void *P(uint32_t va) { return va ? ka_host(va) : nullptr; }
@@ -430,6 +433,7 @@ void d_Reset() {
 void d_Present() {
     HRESULT hr = DEV->Present((const RECT *)P(A32(0)), (const RECT *)P(A32(1)),
                               (HWND)(uintptr_t)A32(2), (const RGNDATA *)P(A32(3)));
+    g_presents++;
     RET((uint32_t)hr, 4);
 }
 void d_GetBackBuffer() {
@@ -1614,7 +1618,7 @@ void ka_d3d9_window_changed(void) {
      * jni_bridge through dxvkAndroidSetWindow when it changes. */
 }
 
-int ka_d3d9_frame_presented(void) { return 0; }
+int ka_d3d9_frame_presented(void) { return (int)g_presents; }
 void ka_d3d9_shutdown(void) {}
 
 /* --------------------------------------------------------------- D3DX9 */
