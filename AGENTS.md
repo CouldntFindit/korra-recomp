@@ -348,3 +348,20 @@ Append only; newest last. Format: date — attempt — outcome — next idea.
   pointer to it anywhere in the image, so there is no TypeDescriptor chain to
   follow. Next: locate the class through its code (the command queue's vtable),
   not through RTTI.
+- 2026-11-22 - Building the device APK with `scripts\android_build.ps1` and
+  expecting the game - **it produces the STUB shell.** The script runs plain
+  `:app:assembleDebug`, and `KORRA_LINK_GUEST`/`KORRA_WITH_DXVK` default to OFF,
+  so `libkorra.so` logs `guest: STUB - nothing linked` and the window stays
+  black (the guest never starts, the frame counter still climbs). A device run
+  in that state looks exactly like "the shim change broke rendering". Use
+  `android\gradlew.bat --no-daemon -PkorraLinkGuest=ON -PkorraWithDxvk=ON
+  -PkorraDxvkSource=<abs reference\dxvk-native> :app:assembleDebug`; check the
+  first log lines for `guest: entry 0x77C3B7` (not `guest: STUB`) before
+  believing anything else in the log.
+- 2026-11-22 - Reading the device's save step from the `[import]` trace -
+  **impossible past the cap.** `spine_android.c` stops printing imports after
+  12,000 (`g_trace_left`), which is log line ~14,800; the save device's calls
+  are routinely later, so their absence there is not evidence that they did not
+  run. The save probe (`debug.korra.trace_save=1`) is uncapped and is the place
+  to look. Same trap in reverse: an empty directory + `FindFirstFileExA` is a
+  legitimate Windows failure (`ERROR_FILE_NOT_FOUND`), not a host defect.

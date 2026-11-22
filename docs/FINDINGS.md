@@ -3113,3 +3113,111 @@ should trace the save routine's first step (the `Korra` directory at
 Nothing was re-tested on Windows after the cube change (it was already correct
 there).
 
+
+## 2026-11-22 - the save lands where the engine asked: a host path is absolute (save-path session)
+
+Device: Galaxy S24 (Exynos 2400, Xclipse 940, stock Vulkan), DXVK-native. Base
+HEAD `245fd37`; commits `77adf45` (probe), `481d2c5` (fix). Probes:
+`KORRA_TRACE_SAVE=1` (`src/host/save_probe.c`, chained onto
+`native32_post_hook`) and `debug.korra.trace_save=1`
+(`src/host_android/save_probe_android.c`); both print the call, its arguments,
+the resolved host path and the answer in one line, so the two logs diff.
+
+**The save path, derived from the original exe (no analysis-exe layout).**
+`0x76CB50(buf)` asks `SHGetSpecialFolderPathA(NULL, buf, CSIDL_PERSONAL=5,
+FALSE)`, then builds `"%s/%s/"` (`0x95C214`) with `"Korra"` (`0x943FA4`) and
+appends `"%sSystemData.dat"` / `"%sGameData.dat"` / `"%sSlotData_%d.dat"`
+(`0x96DC30` / `0x96DC0C` / `0x96DC1C`) according to `[0xE4F474]`
+(-2 / -1 / slot). The existence test `0x76CC40` appends `"%s*.*"`
+(`0x96DC44`) and goes through the CRT's `_findfirst` (`0x77D512 ->
+FindFirstFileExA`). The writer is the state machine `0x76D0E0` (state word
+`[0xE4F470]`): state 0 = build the directory (`0x56BE90`), test it, `mkdir`,
+build the file, `CreateFileA(GENERIC_WRITE, CREATE_ALWAYS)`, `WriteFile`.
+
+**Same state, two hosts (cold: no `Korra` directory).** Windows oracle
+(`work\m4b_run.ps1`, pad timeline 44 s A / 47 A / 53 A / 61.8 A / 67.8 DOWN /
+69.8 A / 73.2 LEFT / 75.2 A / 80.2 A, `Documents\Korra` renamed away):
+
+```
+[save] SHGetSpecialFolderPathA hwnd=0 csidl=5 create=0 -> ret=1 path="<Documents>"
+[save] CreateFileA path="<Documents>/Korra/SystemData.dat" access=0x80000000 share=0x00000000 disp=3 flags=0x00000080 -> 0xFFFFFFFF last=3
+[save] CreateFileA path="<Documents>/Korra/GameData.dat"  access=0x80000000 share=0x00000000 disp=3 flags=0x00000080 -> 0xFFFFFFFF last=3
+[save] CreateDirectoryA path="<Documents>/Korra/" -> ret=1 last=3
+[save] CreateFileA path="<Documents>/Korra/GameData.dat" access=0x40000000 share=0x00000000 disp=2 flags=0x00000080 -> 0x00000BC4 last=0
+[save] WriteFile h=0x00000BC4 n=7856 -> ret=1 put=7856 last=0
+```
+
+Device, probe-only build (`devsave2`), same cold state:
+
+```
+[save] SHGetSpecialFolderPathA hwnd=0 csidl=5 create=0 -> ret=1 path="/data/user/0/org.korra.recomp/files/game"
+[save] FindFirstFileExA pat="/data/user/0/org.korra.recomp/files/game/Korra/*.*" -> 0xFFFFFFFF last=2 (host=".../game/GameData//Korra")
+[save] CreateDirectoryA path="/data/user/0/org.korra.recomp/files/game/Korra/" -> 0x00000001 (host=".../game/GameData//Korra/")
+[save] CreateFileA path="/data/user/0/org.korra.recomp/files/game/Korra/GameData.dat" access=0x40000000 disp=2 -> 0x01000002 (host=".../game/GameData//Korra/GameData.dat")
+[save] WriteFile h=0x01000002 n=7856 -> ret=1 count=7856
+```
+
+**No call answered differently.** The divergence is the translation: the guest
+string is the same expression on both hosts, and Windows opens exactly it,
+while `ka_fs_resolve` dropped the host-root prefix and re-joined the guest cwd
+(`GameData`) - the `(host=...)` field above is the evidence. So the save device
+created and wrote `<root>/GameData/Korra/`, inside the rofs tree; the next
+boot's `[Hw::rofs::fst]` mount then enumerated that empty directory, failed to
+build its file-size table and raised the boot notice
+(`[msgbox] ... [Hw::rofs::fst] ...`, one per boot at `C:\GameData\Korra\*`).
+Both reported symptoms - the save "not appearing" and the boot notice - are
+this one mis-resolution.
+
+**Fix (`481d2c5`, `src/host_android/fs_android.c`).** A path that already starts
+with the host root is host-absolute: strip repeated copies of the root (a leaked
+path can arrive twice) and put exactly one back; never re-home it under the
+guest cwd. Drive paths (`C:\...`) and cwd-relative paths are unchanged.
+
+**Proof ladder.**
+1. Divergence named above: `CreateDirectoryA`/`CreateFileA` on
+   `<root>/Korra/...` resolving to `<root>/GameData//Korra/...` on the device,
+   to the exact string on Windows.
+2. Cold device run after the fix (`devsave3`, 7,334 frames): `CreateDirectoryA
+   host=".../game/Korra/" -> 1`, `CreateFileA host=".../game/Korra/GameData.dat"
+   -> 0x01000002`, `WriteFile 7856`; **zero `[msgbox]` in the whole run**.
+3. File list, pulled with `run-as`:
+   `files/game/Korra/GameData.dat`, **7856 bytes**, 2026-11-22 12:50; and
+   `files/game/GameData/` no longer contains a `Korra` directory.
+4. Second boot (`devboot2`, same APK, save present): **0 msgbox**, **0**
+   `C:\GameData\Korra` enumerations (Windows never enumerates it either), and
+   the boot read takes the Windows branch - `SystemData.dat` missing
+   (`last=2`), `GameData.dat` opens (`0x01000002`, `last=0`). The informational
+   auto-save notice ("This game features an Auto-Save function...") still shows,
+   as it does on Windows; the rofs error notice is gone.
+5. New Game on the device, walked with screenshot+OCR (the touch zone offers no
+   D-pad, so the left stick does DOWN/LEFT): title -> auto-save notice -> main
+   menu -> Story -> stick-down to `New Game` ("Start a new game.") -> A ->
+   difficulty ("...challenges", "Extreme") -> A -> **intro cutscene plays**
+   (OCR "CREATED BY / BAYAN KONIETZKO / MICHAEL DANTE DIMARTINO"), 9,987
+   frames, no "Failed to save data." anywhere.
+
+**Correction to the hand-off.** The save was not bailing before the filesystem.
+The probe-only build already wrote 7856 bytes - into `GameData/Korra`. Two
+things hid it: the `[import]` trace is capped at 12,000 lines (`spine_android.c`,
+reached at log line 14,823), so the write-side calls after that point cannot
+appear in a device log at all; and the expected directory was checked as
+`<root>/Korra` while the host had re-homed it. The r11 `*.*` enumeration at
+4,416 frames was the save step running at the end of a run that was cut short.
+
+**Windows after the change (shared-probe rule).** `scripts\run_selftest.ps1`
+60/60 (the probe files are `src/host/`). The smoke run (`build\run_save.exe`,
+95 s, same pad timeline) shows both boot reads succeeding with the save present
+(`SystemData.dat` -> `0x0000071C`, `GameData.dat` -> `0x000009A8`, `last=0`), no
+new save write (nothing to autosave), and no `[crash]`; the window is black by
+86 s with no GPU work - the known post-cutscene state (flow=0x9), unchanged and
+not chased. The Windows save directory is untouched by the fix
+(`fs_android.c` is Android-only).
+
+**Not verified.** The `SystemData.dat` write (only `GameData.dat` is written in
+this flow on both hosts, so the cold-boot `last` differs from Windows only by
+`2` vs `3` - the same branch); the save *slot* files (`SlotData_%d.dat`) and the
+erase/delete path; a save/load round-trip through Continue (the boot read of the
+written `GameData.dat` succeeds, but nothing was resumed from it); the SAF
+install rung; and whether the auto-save writes anything new after gameplay
+progress (this session only exercised the cold-boot autosave and New Game).
+Blocker #2 (post-cutscene SIGABRT / LOW_MEMORY) untouched, recorded only.

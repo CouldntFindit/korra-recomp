@@ -25,14 +25,14 @@ side (Win32, D3D9 surface, XInput, XAudio2, CRI/Wwise audio, Steam stubs).
 
 ## Status
 
-*Last updated 2026-11-22. Current focus: M3 — the save path, then the first playable area on the device.*
+*Last updated 2026-11-22. Current focus: M3 — the first playable area on the device (the save path is closed).*
 
 | Milestone | What it means | State |
 |---|---|---|
 | M0 | Environment, toolchain pin, repo bootstrap, PE gate | **done** (2026-11-19) |
 | M1 | Seeds + function catalog + full lift to C | **done**: 37,327/37,327 functions, 0 lift failures — see [`docs/LIFT_REPORT.md`](docs/LIFT_REPORT.md) |
 | M2 | Boots to the main menu on Windows (no Steam, silent, movies skipped) | **done (2026-11-20)** — boots without Steam, text renders, new game runs into the first area at 39-58 fps uncapped; the crash and missing-text defects had one cause (the lifter's `pcmpistri` flag model). Log: [`docs/FINDINGS.md`](docs/FINDINGS.md) |
-| M3 | Boots and plays the first area on an Android arm64 device | **in progress** — on the S24: title screen, main menu, New Game, difficulty select and the intro cutscene render, and touch → XInput works end-to-end ([`docs/ANDROID_BRINGUP.md`](docs/ANDROID_BRINGUP.md)). Remaining to the gate: the save path (“Failed to save data” blocks New Game) and the first playable area at 30 fps; the SAF install flow is still to be wired |
+| M3 | Boots and plays the first area on an Android arm64 device | **in progress** — on the S24: title screen, main menu, New Game, difficulty select and the intro cutscene render, and touch → XInput works end-to-end ([`docs/ANDROID_BRINGUP.md`](docs/ANDROID_BRINGUP.md)). The save path is closed (2026-11-22): the save lands in `files/game/Korra/GameData.dat`, New Game passes the save step, and the boot notice the mis-resolved save directory used to raise is gone. Remaining to the gate: the first playable area at 30 fps; the SAF install flow is still to be wired |
 | M4 | Audio: Wwise + CRI behind a host mixer | **sink done + measured (2026-11-21)** - engine keeps its Wwise/CRI mixer; host supplies XAudio2 2.7 + a WASAPI sink. Acceptance 1 passes (RMS -28.14 dBFS, peak -9.77 dBFS); test 2 fails because no Wwise event is posted, tests 3-6 blocked - [`docs/audio.md`](docs/audio.md) |
 | M5 | Gameplay validation, framerate hooks, full playthrough | not started |
 
@@ -59,6 +59,7 @@ agents: [`AGENTS.md`](AGENTS.md).
 | 20.11.2026 | Android scaffold merged: GameActivity shell, SAF install flow, DXVK-native preparation, guest-memory window |
 | 21.11.2026 | **First frame on the S24**: full graphics init over Vulkan — 191/191 imports bound, 37,327 functions dispatched, first `Present` with rendered content; fixed en route: emulated CPUID (Korra-0010), asset-pool teardown join, texture vtable slots, critical-section deadlock, object-table overflow, per-frame staging leak |
 | 22.11.2026 | **Title screen, menu and cutscene on the S24**: touch→XInput drives title → menu → New Game → difficulty → intro cutscene; the last graphics blocker (an unimplemented cube-texture D3DX path that left the technique cache empty) fixed; 160 s / 8,664-frame runs, zero crashes. Next: the save path, then the first playable area |
+| 22.11.2026 | **Save path closed on the S24**: the save device's path (`SHGetSpecialFolderPathA(CSIDL_PERSONAL)` + `Korra/`) now resolves to the directory the engine asked for instead of being re-homed under `GameData` - `files/game/Korra/GameData.dat` (7,856 bytes), New Game passes the save step into the intro cutscene, and the rofs boot notice the empty save directory caused is gone. The same probe on the Windows oracle agrees line for line |
 
 ## Building
 
