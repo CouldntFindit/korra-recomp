@@ -3221,3 +3221,139 @@ written `GameData.dat` succeeds, but nothing was resumed from it); the SAF
 install rung; and whether the auto-save writes anything new after gameplay
 progress (this session only exercised the cold-boot autosave and New Game).
 Blocker #2 (post-cutscene SIGABRT / LOW_MEMORY) untouched, recorded only.
+
+## 2026-11-22 - the post-cutscene death was a thread cap, not memory: 64 guest stacks of 4 MiB filled the 256 MiB region
+
+Device: Galaxy S24 (Exynos 2400, Xclipse 940, stock Vulkan), DXVK-native. Base
+HEAD `a8dc628`; commits `ee5af41` (probe: 1 Hz sampler, crash-buffer pull, route
+replay) and `db1d48c` (fix).
+
+**The death, named.** Two tombstones - 12:58 (uptime 166 s) and 13:59 (uptime
+329 s) - end in the same five frames:
+
+```
+#00 libc.so            abort+160
+#01 libkorra.so        ka_thread_attach+292
+#02 libkorra.so        thread_trampoline
+#03 libc.so            __pthread_start+184
+#04 libc.so            __start_thread+68
+```
+
+and the guest log's last lines before the abort are
+
+```
+thread: create va=0077CAEE param=3466A370 tok=4159 suspended=1
+thread: resume tok=4159 prev=1
+guest stack space exhausted
+FATAL: cannot create guest stack/TIB (CreateThread)
+```
+
+`ka_thread_attach` asked for a 4 MiB guest stack, the 256 MiB stack region
+(`0xC0000000-0xD0000000`) was full, and the old code called `abort()`. That is a
+host death, which is why there was never a guest `[crash]` line: that handler
+covers SIGSEGV/SIGBUS/SIGILL/SIGFPE only, by design.
+
+**Trajectory (1 Hz sampler, capture run 13:54-13:59, 19,473 shell frames /
+9,046 presents).** Two growth phases - boot, and the level load:
+
+| t | guest threads | stack-hi | VmRSS | presents |
+|---|---|---|---|---|
+| 0 s | 0 | 0xC0000000 | 124 MB | 0 |
+| 11 s | 26 | 0xC6C00000 | 229 MB | 378 |
+| 33 s | 50 | 0xCCC00000 | 137 MB | 1,129 |
+| 44 s | 55 | 0xCE000000 | 186 MB | 1,547 |
+| 288 s | 55 | 0xCE000000 | 109 MB | ~8,200 |
+| 298 s | 63 | 0xD0000000 (full) | 121 MB | 8,536 |
+| 327 s | 64 | 0xD0000000 | 118 MB | 9,046 |
+
+Death at t=329 s: the 64th `CreateThread` was the one that could not get a
+stack. `thread: exit` count over the whole run: 0 - the engine's workers are
+pool threads that never return, so every thread cost 4 MiB for the life of the
+process. The same census in the pre-fix logs (`thread: create` 64 =
+`thread: attach` 64 minus the main thread's one) is what named the site.
+
+**The 1.2 GB was not the cause.** `dumpsys meminfo` on the same run:
+TOTAL PSS 1,286,134 kB / RSS 1,193,259 kB, of which **Graphics 1,080,959 kB
+(1.03 GB, dmabuf)**, Native Heap 14,736 kB, TOTAL SWAP PSS 151,227 kB. The
+in-app VmRSS never passed 122 MB (VmHWM 249 MB). The `reason=3 LOW_MEMORY`
+record (02:54:33, `rss=258MB`, `importance=400`) is a cached background process
+lmkd reclaimed, not this death. `android:largeHeap` would not have moved either
+number: the abort was a fixed capacity wall, not an allocation failure.
+
+**Fix (`db1d48c`, `memory_android.c` + `spine_android.c` + `kernel32_android.c`).**
+Decision-table row: "abort in host malloc/allocator -> memory_android.c
+budget/limits; the sampler names the growth site" - the sampler named the site
+as the per-thread stack, and the growth as thread count, not bytes.
+
+- A guest stack is 1 MiB: LoK.exe's own `SizeOfStackReserve` (PE optional
+  header `0x100000`). `CreateThread(dwStackSize=0)` means exactly that reserve
+  on Windows, so 4 MiB was four times the guest's contract and capped the
+  process at 64 concurrent guest threads.
+- `ka_thread_detach` (called when the entry point returns and from
+  `ExitThread`) returns the stack and the TIB; `ka_stack_new` reuses released
+  blocks LIFO. The region now has to hold the threads that are alive, not every
+  thread ever created.
+- The thread table is 256 records (16 KiB) and `CloseHandle` retires a
+  closed+done record, as Windows drops the id once the thread ends and the last
+  handle closes. A full table is now a guest-visible `CreateThread` failure
+  (`INVALID_HANDLE` + `ERROR_NOT_ENOUGH_MEMORY`), never `abort()`.
+
+**Proof.** Same New Game route, OCR-driven so the state is known at every step
+(`scripts/android_route_drive.ps1`): attract 40 s -> auto-save notice 43 s ->
+controller notice 51 s -> main menu 84 s -> Story submenu with New Game
+highlighted 89 s -> difficulty screen (Extreme) 114 s -> intro cutscene
+118-203 s -> **tutorial area with its control HUD at 206 s** (OCR: "Light
+Attack | Heavy Attack | Jump"). Run length 600 s, still alive; final sampler
+line at t=599 s:
+
+```
+[mem] frames=37248 presents=10271 rss=87940kB hwm=309192kB heap=35740000
+      alloc=108228/871475K max=161611776 free=9/14K
+      stack=C1D00000/D0000000 sfree=8/8192K thr=72/72 peak=72
+      flow=00000009 inst=00000001 step=FFFFFFFF mode=00000000
+```
+
+- 72 live guest threads and peak 72, past the old 64-thread wall; the stack
+  region is at 29 MiB of its 256 MiB, and 8 stacks sit on the free list
+  (recycled from threads that ended through `ExitThread`, which logs no
+  `thread: exit` line).
+- Zero `guest stack space exhausted`, zero `thread: cannot create`, zero
+  `thread: table full`; `adb logcat -b crash` empty; the process ended only at
+  600 s by the session's own `am force-stop` -> `reason=10 (USER REQUESTED)`,
+  and no `reason=5`/`reason=3` record exists after 13:59.
+- 271 s past the t=329 s point that killed the pre-fix builds, with the
+  transcript still advancing (37,248 shell frames, 10,271 presents; presents
+  slow to ~10/s in the tutorial area, which is a frame-rate question, not a
+  survival one).
+- The save path still writes: the New Game start opened `Korra/SystemData.dat`
+  (missing, `last=2`, the Windows branch), read `GameData.dat`, then
+  `CreateFileA(GENERIC_WRITE, CREATE_ALWAYS)` + `WriteFile 7856`; the file on
+  device is 7,856 B at 14:30, zero `[msgbox]`, zero "Failed to save".
+
+**Route state for the hand-off.** On the device the New Game route now reaches
+the first playable area: the Story submenu had **New Game already highlighted**
+("Start a new game."), the difficulty screen shows **Extreme** highlighted and
+A confirms, the intro cutscene plays (Skip prompt), and the tutorial area
+follows with the control HUD. The scene words during and after it are
+`flow=0x9 inst=0x1 step=0xFFFFFFFF mode=0` - the same shape the Windows oracle
+reports after the cutscene. That is worth reading twice: on Windows `flow=0x9`
+was recorded as "stuck after the cutscene" because the frame was pure black,
+but the device reaches the tutorial area in exactly that state, so `flow=0x9`
+is a legitimately reachable state and the Windows black frame is a render
+divergence, not a failed transition. Not re-run on Windows this session (no
+shared code changed).
+
+The earlier fixed-timeline run measured the other half of the route: its stick
+deflection never landed, so the Story submenu selected **Continue** and the
+game *read* `Korra/GameData.dat` (7,856 B) instead of writing it - the same
+checkpoint route the M4 session measured. Both routes now survive (that run
+died only at 64 threads).
+
+**Not verified.** Whether the tutorial area is interactive past its HUD (no
+input was sent after t=206 s; the >=5-minute fps/thermal campaign is the next
+session), the Windows re-run of the New Game route, the `reason=3` conditions
+(cached-process LMK, not reproduced), lifecycle pause/resume (no pause or LMK
+event occurred in either run), and the still-open save fields from the previous
+entry (`SlotData_%d.dat`, `SystemData.dat` write, erase path, Continue
+round-trip, SAF).
+

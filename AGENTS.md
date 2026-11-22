@@ -365,3 +365,20 @@ Append only; newest last. Format: date — attempt — outcome — next idea.
   run. The save probe (`debug.korra.trace_save=1`) is uncapped and is the place
   to look. Same trap in reverse: an empty directory + `FindFirstFileExA` is a
   legitimate Windows failure (`ERROR_FILE_NOT_FOUND`), not a host defect.
+- 2026-11-22 - "The post-cutscene SIGABRT is memory pressure (1.2 GB RSS)" -
+  **wrong layer.** `dumpsys meminfo` splits that 1.19 GB into 1.03 GB Graphics
+  (dmabuf), 15 MB native heap and ~110 MB anonymous; the in-app VmRSS never
+  passed 122 MB. The abort was a thread cap: a guest thread took 4 MiB of the
+  256 MiB stack region, so the 65th `ka_thread_attach` found the region full and
+  `abort()`ed. Read the category rows, then the `thr`/`stack` columns of the
+  1 Hz sampler, before calling a death OOM.
+- 2026-11-22 - Driving a menu route with `adb shell input motionevent DOWN` then
+  `MOVE`/`UP` in separate invocations - **does not deflect a stick.** Only the
+  DOWN arrives; the cursor never moves, the route silently selects the first
+  item (it loaded Continue instead of New Game) and nothing notices if the
+  screenshots are stale. Use one `input swipe x1 y1 x2 y2 <ms>` per gesture, and
+  diff each step against a reference screenshot.
+- 2026-11-22 - `Adb-Soft shell screencap -p ...` - **`-p` binds to the
+  PowerShell function, not to adb**, so the capture never ran and every pull
+  returned the first screenshot (identical md5s should have been the tell). Run
+  adb directly with `$ErrorActionPreference = 'Continue'` around it.

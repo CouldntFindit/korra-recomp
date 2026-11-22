@@ -138,7 +138,9 @@ if ($Route -eq "newgame") {
         @{ t = 200; k = "shot"; a = "15_postcut" },
         @{ t = 240; k = "shot"; a = "16_postcut" },
         @{ t = 300; k = "shot"; a = "17_postcut" },
-        @{ t = 380; k = "shot"; a = "18_postcut" }
+        @{ t = 380; k = "shot"; a = "18_postcut" },
+        @{ t = 480; k = "shot"; a = "19_postcut" },
+        @{ t = 570; k = "shot"; a = "20_postcut" }
     )
 } elseif ($Route -eq "continue") {
     $routeSteps = @(
@@ -158,25 +160,30 @@ if ($Route -eq "newgame") {
 function Invoke-RouteStep($step) {
     switch ($step.k) {
         "tap"  { $xy = $step.a -split " "; & $adb shell input tap $xy[0] $xy[1] | Out-Null }
-        # A held stick deflection: DOWN at the anchor, MOVE, hold, UP. One
-        # `input` process per event keeps the pointer id stable (same virtual
-        # touchscreen device), which is what the engine's level signal needs.
+        # A held stick deflection. One `input swipe` process for the whole
+        # gesture: DOWN/MOVE/UP as three `input motionevent` invocations does
+        # NOT hold a pointer (measured 2026-11-22: the DOWN alone arrived, the
+        # MOVE/UP from the next process were dropped, the cursor never moved and
+        # the route silently selected Continue instead of New Game).
         "down" {
-            & $adb shell input motionevent DOWN 421 594 | Out-Null
-            & $adb shell input motionevent MOVE 421 778 | Out-Null
-            Start-Sleep -Milliseconds 1200
-            & $adb shell input motionevent UP 421 778 | Out-Null
+            & $adb shell input swipe 421 540 421 840 1600 | Out-Null
         }
         "left" {
-            & $adb shell input motionevent DOWN 515 670 | Out-Null
-            & $adb shell input motionevent MOVE 140 670 | Out-Null
-            Start-Sleep -Milliseconds 1200
-            & $adb shell input motionevent UP 140 670 | Out-Null
+            & $adb shell input swipe 585 670 105 670 1600 | Out-Null
         }
         "shot" {
             $local = Join-Path $logs ("route_" + $step.a + ".png")
-            Adb-Soft shell screencap -p /sdcard/korra_route.png | Out-Null
-            Adb-Soft pull /sdcard/korra_route.png $local | Out-Null
+            # Native adb calls write progress to stderr, which PowerShell 5.1's
+            # EAP=Stop turns into a NativeCommandError; `-p` also cannot go
+            # through the Adb-Soft wrapper (it parses as a function parameter).
+            $prev = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            try {
+                & $adb shell screencap -p /sdcard/korra_route.png 2>&1 | Out-Null
+                & $adb pull /sdcard/korra_route.png $local 2>&1 | Out-Null
+            } finally {
+                $ErrorActionPreference = $prev
+            }
             Write-Host ("route: shot {0}" -f $step.a)
         }
     }

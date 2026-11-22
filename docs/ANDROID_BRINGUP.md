@@ -788,3 +788,35 @@ exit-info in one command. The SAF picker is unchanged as the user path.
   object is M4).
 - Present-mode order (IMMEDIATE -> MAILBOX -> FIFO) is DXVK's choice; the probe
   of what the surface actually grants is logged at swapchain creation.
+
+### 10.7 Reading a device death: sampler, crash buffer, route replay
+
+A native death leaves three artifacts and the old recipe only pulled one of
+them. Use all three or the report will name the wrong layer:
+
+1. **The 1 Hz sampler.** `adb shell setprop debug.korra.memtrace 1` before the
+   run. `src/host_android/memtrace_android.c` writes one line a second:
+   `[mem] t=.. frames=.. presents=.. rss=..kB hwm=..kB heap=.. alloc=.. free=..
+   stack=hi/end sfree=.. thr=live/used peak=.. flow=.. inst=.. step=.. mode=..`
+   The `thr` and `stack` columns are what turned "1.2 GB RSS" into a thread cap;
+   the scene words are the same four `src/host/scene_probe.c` prints on Windows,
+   so a device run and an oracle run diff line for line.
+2. **The crash buffer.** `adb logcat -b crash -d > logs\crash.txt` on every run.
+   The guest `[crash]` handler deliberately covers only SIGSEGV/SIGBUS/SIGILL/
+   SIGFPE: a SIGABRT is a host abort, so without the crash buffer the death has
+   no frames at all. `scripts/android_run.ps1` now pulls it and stops waiting the
+   moment `pidof` goes empty (the r11 death lost its abort message because the
+   pull happened five minutes after the crash).
+3. **The route, with screenshots that are actually fresh.** `-Route newgame`
+   replays the save session's touch timeline. Check `route_*.png` against
+   `logs\devsave3_*.png`: a stale screenshot looks like a working route. Two
+   traps cost a run each: `input motionevent DOWN/MOVE/UP` as three separate adb
+   invocations does not hold a pointer (use one `input swipe`), and
+   `Adb-Soft shell screencap -p ...` binds `-p` to the PowerShell function, not
+   to adb.
+
+RSS is not one number. `dumpsys meminfo`'s TOTAL RSS of 1.19 GB was 1.03 GB
+**Graphics** (dmabuf), 15 MB native heap and ~110 MB of anonymous pages; the
+in-app VmRSS never exceeded 122 MB. Read the category rows before calling a
+death memory pressure.
+
