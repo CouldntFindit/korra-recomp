@@ -3014,3 +3014,102 @@ main menu). Not an ExitProcess (`exit_probe` printed nothing) and no fault line.
 
 Committed: 459a201 (GetState logging), 5d0698e (`docs/audio.md` 10.5, 10.5.1,
 10.6).
+
+## 2026-11-22 - M3 Task 2 root cause: the technique cache was never filled (D3DX cube gap)
+
+Device: Galaxy S24 (Exynos 2400, Xclipse 940, stock Vulkan 1.3.304), DXVK-native.
+Probes: `debug.korra.gate=1` (`rec`/`pkg` lines, `gate_probe_android.c`),
+`debug.korra.watchlog`, `debug.korra.watch`, `debug.korra.icallfrom`, plus the
+same `rec`/`pkg` lines in `src/host/gate_probe.c` for the Windows reference.
+
+**The previous hypothesis was wrong, and the crash's own registers say so.** The
+run dies at `sub_007492B0` with `ecx=00E4D064`, `eax=00000000`, `edx=00E1DA54`,
+`edi=00000500` and `[crash] addr = guest base + 4`. Decoding the fault:
+`0x7492C0: mov edx,[eax+4]` with `eax = [ebp+0x10]`, i.e. the **technique
+argument** is NULL - nothing reads `[0xE4D094]` on this path. Resolving the
+crash's own `lr` against the unstripped `libkorra.so`
+(`llvm-addr2line -e ... 0x23403d0`) names the caller exactly:
+`sub_00550280`, recomp_0016.c:104336, call site `0x00550321`.
+
+**The guard that produces the NULL.**
+
+```c
+/* 0x5502FF, sub_00550280 */
+if ([0xE46E90] != 0 && [0xDC0F74] != 0) {
+    eax = ([0xE4CCF8] > 0xB) ? [0xE4CCF4] + 0xDC : 0;   /* entry 11 of 15 */
+    sub_007492B0(ctx, 3, eax, 0xE4B5CC);                /* eax = 0 -> [NULL+4] */
+}
+```
+
+`[0xE4CCF4..0xE4CCFC]` is a three-dword cache `{table, count, flag}` filled once
+per session by `sub_0073C4A0(0xDC0988)`, the boot loader at `0x53F94A` that
+resolves two resources out of the package built by `sub_006AACB0` -
+`pre_texture.wta` (`0x95E738`) and `pre_texture.wtp` (`0x95E728`). Each is a
+15-entry `0x14`-byte table; entry 11 is what the recorder binds, hence `> 0xB`.
+
+**Measured, both hosts, same census.**
+
+| | device (before) | Windows |
+|---|---|---|
+| `[gate] rec` | `ccf0=0 ccf4=0 ccf8=0 ccfc=0` all session | `ccf0=1 ccf4=0B3F5EE4 ccf8=0F ccfc=1` |
+| `[gate] pkg` | `d984=2 d988=26173400 head0=500674C9 ...` | `d984=2 d988=115FC320 head0=500674C9 ...` |
+
+The package bytes are identical on both (`head0/4/8/10` match dword for dword),
+so the two name lookups cannot be the difference: the **fill** is. Watching
+`0xDA7340` (the loader's registry lock, `+08` = `0xDA7348`, entry 0) showed
+`sub_007516C0` creating an entry, then `sub_0074CDE0` being entered once per
+record. `debug.korra.icallfrom=754000` then named the single call under it:
+`[icall] from=00754000 target=00759B20`.
+
+**The gap.** `sub_00759B20` is the per-record bind; when `[desc+0xC] == 5`
+(D3DRTYPE_CUBETEXTURE) it calls `0x8FD2E8` and otherwise `0x8FD2E4`. Resolving
+the IAT: `D3DXCreateCubeTextureFromFileInMemoryEx` and
+`D3DXCreateTextureFromFileInMemoryEx`. The Android shim answered the cube one
+with "not implemented" + `D3DERR_INVALIDCALL`:
+
+```
+d3dx: D3DXCreateCubeTextureFromFileInMemoryEx not implemented   (1 per boot)
+```
+
+One failed record is enough: `sub_00751A90` returns 0, `sub_0074CDE0`,
+`sub_00754000` and `sub_007516C0` all return 0 with it, the registry entry is
+never written, and the cache stays `{0,0,0}`. The `[hr]` trampoline could not
+see it: that one only wraps synthetic COM slots (names with `:`), not plain
+d3dx imports.
+
+**Fix (`5ee204d`).** Implement it: `dds_upload_cube` in
+`src/host_android/d3d9_android.cpp` walks the same header as `dds_upload`, checks
+`DDSCAPS2_CUBEMAP` (dword 27), creates a cube in the requested pool (through a
+SYSTEMMEM staging copy and `UpdateTexture` when the pool cannot be locked), and
+uploads the six faces, skipping each face's mip chain with `dds_mip_bytes`. The
+token goes through `ppCubeTexture` = `A32(13)` (this signature has no height),
+never through EAX.
+
+**Evidence after the fix.** Same run command, stock driver:
+
+- five `d3dx: dds cube ...` uploads (128x128 DXT1, 16x16 DXT5, ...);
+- `[gate] rec e46e90=... ccf0=00000001 ccf4=20043E04 ccf8=0000000F ccfc=00000001`
+  - the Windows shape, `count=15`;
+- **160 s, 8664 frames (54 fps), zero `[crash]`, one brief `flag=1` sample**
+  (device-lost during a swapchain change), no pause/LMK event: the >2-minute
+  question is closed for an idle boot;
+- touch -> XInput works: a 1-1.2 s press of the virtual A zone advances
+  `PRESS ANY BUTTON` -> auto-save notice -> main menu -> STORY -> New Game ->
+  difficulty; the intro cutscene renders with its Skip prompt. A 50 ms
+  `input tap` does **not** work: the engine polls XInput far less often than it
+  draws (44 polls in 70 s), so the button must be held for about a second.
+
+**Not verified / open.** The first playable area (rung f): after the cutscene
+the process dies twice, once `reason=5 APP CRASH(NATIVE) status=6` (SIGABRT,
+1.2 GB RSS, no guest `[crash]` line) and once `reason=3 LOW_MEMORY`, and a
+separate "Failed to save data." dialog blocks New Game on some boots. The save
+path is a real host gap - `k_CreateFileA` ignored `dwCreationDisposition`, so
+`open()` never passed `O_CREAT` and no new save could be created; that contract
+is now implemented (`ka_file_open_ex`, `SetEndOfFile`, `FlushFileBuffers`,
+`1dbadaa`..`work`), but no save file appeared and **no file open or mkdir
+failed**, so the engine bails before it touches the filesystem; the next session
+should trace the save routine's first step (the `Korra` directory at
+`GameData/Korra` exists and is empty). The SAF install rung (d) is untouched.
+Nothing was re-tested on Windows after the cube change (it was already correct
+there).
+
