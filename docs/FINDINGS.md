@@ -3409,7 +3409,7 @@ that line. The new probe prints the guest frame itself.
 | - of which 1 ms `nanosleep` (42 polls/frame, max arg 1 ms) | 54.3 ms | 52.3 ms | 42 % |
 | - of which blocked re-entering the machine lock | 62.3 ms | 61.3 ms | **49 %** |
 | residual lifted work on the render thread | 8.6 ms | 8.4 ms | 7 % |
-| bridged calls / frame | 7,493 | 6,843 | - |
+| bridged calls / frame (all guest threads) | 7,493 | 6,843 | - |
 | `InterlockedCompareExchange` / frame (engine spinlock) | 1,050 | 9,398 | - |
 | process CPU | 99 % of 1 core | 99 % of 1 core | - |
 | guest threads | 72 | 56 | - |
@@ -3428,6 +3428,9 @@ For scale, the Windows oracle on the same content (`docs/FINDINGS.md`
 threads, main thread waiting 16-21 ms of a 25 ms frame on 34
 `WaitForSingleObject` calls. Same shape, 5x the wall time: the device does ~3x
 the per-frame CPU on a core that is slower, with 2-3x the threads to serialize.
+The call counts are not directly comparable: the Windows probe counted the main
+thread's own bridged calls, this one counts every guest thread's in the frame
+interval (`ka_import_calls()` is process-wide).
 
 **The 30 fps cap is active and costs nothing here.** `int=100` in every sample,
 `[fps] limiter interval 50 -> 100 (cap 30 fps)` at boot, and in the tutorial the
