@@ -814,6 +814,20 @@ them. Use all three or the report will name the wrong layer:
    invocations does not hold a pointer (use one `input swipe`), and
    `Adb-Soft shell screencap -p ...` binds `-p` to the PowerShell function, not
    to adb.
+4. **The frame probe.** `adb shell setprop debug.korra.perf 1` makes
+   `src/host_android/frame_probe_android.c` write one line a second from the
+   Present path: `dt` (present-to-present), time inside `Present`, time in the
+   engine's 1 ms `WaitForSingleObject` polls, time blocked re-acquiring the
+   machine lock, guest critical sections, the residual, bridged calls/frame,
+   the limiter's `[frameMgr+0x58]`/`+0x5c`, `DAT_00e4d210` and process CPU.
+   `debug.korra.perf.frames 1` adds slow-frame lines (`debug.korra.perf.slow`,
+   default 50 ms). It writes fd 2 **and** its own `files/perf.txt` and logcat
+   tag `KorraPerf`: one run lost every line from the shell's log pump at
+   `t=266 s` while the game kept rendering, so pull `perf.txt` too and never
+   read a silent log as a dead process (`pidof`, then the screenshots).
+   The frame cap is `debug.korra.fps` (default 30, `0` = the engine's own
+   30/60 mode); `[fps] limiter interval 50 -> 100 (cap 30 fps)` in the log is
+   the proof it was applied.
 
 RSS is not one number. `dumpsys meminfo`'s TOTAL RSS of 1.19 GB was 1.03 GB
 **Graphics** (dmabuf), 15 MB native heap and ~110 MB of anonymous pages; the

@@ -389,3 +389,36 @@ Append only; newest last. Format: date — attempt — outcome — next idea.
   PowerShell function, not to adb**, so the capture never ran and every pull
   returned the first screenshot (identical md5s should have been the tell). Run
   adb directly with `$ErrorActionPreference = 'Continue'` around it.
+- 2026-11-22 - Replacing `WaitForSingleObject`'s 1 ms poll loop with a per-object
+  condvar (broadcast on `SetEvent`/`ReleaseSemaphore`) to remove the render
+  thread's 42 lock hand-overs per frame - **made the frame 60x worse**: 77 s per
+  frame on the Story submenu and 94 ms on the menus (34 ms before). The poll
+  loop is a shim cost worth attacking - it is 42 polls/frame and 61 of the
+  frame's 124 ms is blocked re-entering the machine lock inside it - but a
+  broadcast is the wrong primitive: it wakes every waiter, and for auto-reset
+  events/semaphores several waiters then decide they were signalled, so the
+  engine's pool pump sees slots complete out of order and retries. Reverted
+  (the `src/host_android` tree carries the probe only). Next: one signal must
+  wake exactly one waiter (a token/futex-style hand-off per wait), and measure
+  the tutorial frame again before touching the menus.
+- 2026-11-22 - A device run whose `log.txt` AND logcat both stop mid-run -
+  **not a crash.** Run `fix1` has no line after `t=266 s` in either channel
+  while the game kept rendering (play screenshots differ across the whole
+  screen, `pidof` answers, the process ends only on our force-stop). The shell's
+  single log-pump thread is the only writer to fd 2; when it stops, both channels
+  go with it. `frame_probe_android.c` now also keeps its own append fd
+  (`files/perf.txt`) and writes logcat directly, which is what produced the
+  next run's numbers. Do not read a silent log as a dead process: check
+  `pidof`, and pull `perf.txt` too.
+- 2026-11-22 - Classifying the Story submenu by "Continue" and "New Game" -
+  **parked the route for 200 s** on a screen that plainly showed "New Game":
+  Windows OCR reads "Continue" as "Cpntinue" about half the time. Classify on
+  the strings that survive (the item, the description), never on both.
+- 2026-11-22 - Starting the route with the phone locked - the driver OCR'd the
+  lock screen ("vodafone TR ... 59 m until full") as a game screen and pressed A
+  at it for 190 s. `adb shell wm dismiss-keyguard` before `am start`, and treat
+  lock-screen text as its own state.
+- 2026-11-22 - the `frames=` column of the `[mem]` line - **it is the shell's
+  16 ms `ALooper_pollOnce` tick, not guest frames.** It reads ~60/s from boot to
+  shutdown whatever the game does, so "frames/s high, presents low" says
+  nothing about the guest loop. Use the frame probe's `dt`/`n`.

@@ -3357,3 +3357,175 @@ event occurred in either run), and the still-open save fields from the previous
 entry (`SlotData_%d.dat`, `SystemData.dat` write, erase path, Continue
 round-trip, SAF).
 
+
+## 2026-11-22 - first-area frame time, decomposed: 92% of a 124 ms frame is the render thread waiting on its serialized workers, not the GPU
+
+Device: Galaxy S24 (SM-S921B, Exynos 2400 / `erd9945`, Xclipse 940, stock
+Vulkan 1.3.304, Android 17 / API 37). Base HEAD `4c80cec`; commits `3d9825d`
+(probe + cap + ADPF) and `8c85f57` (route driver). No lifted code, no pcrecomp
+or DXVK patch: everything here is `src/host_android` and the shell.
+
+The question this session owned: the tutorial area presents ~10/s, the M3 gate
+wants 30. The instrument answers *where* the 100 ms sits, and the answer is not
+the GPU, not the swap chain, and not the frame cap.
+
+**The `[mem]` `frames=` column is not a frame count.** It is
+`ka_shell_frames()`: the shell's 16 ms `ALooper_pollOnce` tick
+(`android/app/src/main/cpp/jni_bridge.cpp` -> `korra_guest_frame`). It reads
+~60/s from boot to shutdown whatever the game does, so "frames/s high while
+presents sag" from the old line was reading the shell, not the guest. Presents
+(`g_presents`, counted inside `IDirect3DDevice9::Present`) is the only rate in
+that line. The new probe prints the guest frame itself.
+
+### The instrument (`3d9825d`)
+
+- `src/host_android/frame_probe_android.c`, `debug.korra.perf=1`, one line a
+  second from the Present path (no thread of its own):
+  `dt=avg/min/max`, time inside `Present`, time in the engine's 1 ms
+  `WaitForSingleObject` polls, time blocked re-acquiring the machine lock, time
+  blocked on guest critical sections, the residual, bridged calls/frame, the
+  limiter's own fields and process CPU. `debug.korra.perf.frames=1` adds one
+  line per frame slower than `debug.korra.perf.slow` (ms).
+- It writes three channels: fd 2 (the shell's pump), its own `files/perf.txt`
+  (O_APPEND) and logcat tag `KorraPerf`. That is not belt-and-braces: one run
+  lost every line after `t=266s` while the game kept rendering (below).
+- `src/host_android/fps_cap_android.c` - the port's cap on the engine's own
+  limiter, `debug.korra.fps` (default 30, `0` = engine's 30/60 mode), the
+  `src/host/fps_cap.c` pattern: `[frameMgr+0x58] = round(3000/fps)` = 100 for
+  30 fps, re-applied from the Present path after `FUN_0074c580` recomputes it.
+- `perf_android.c`: the ADPF session had never been created - `createSession`
+  was passed an empty thread list, hence `session=no` in every log since the
+  scaffold. It now passes the calling thread, logs the rate it hints, takes its
+  deadline from `debug.korra.fps`, and reports the guest frame's work
+  (`korra_perf_guest_frame`), not the shell poll's microseconds.
+
+### Where the frame goes (tutorial area, two runs agreeing within 2 ms)
+
+| bucket | dec1 (130 s play) | camp2 (330 s play) | share |
+|---|---|---|---|
+| frame `dt` (present-to-present) | 127.0 ms | 123.9 ms | 100 % |
+| inside `Present` (DXVK + WSI) | 1.9 ms | 1.8 ms | **1.5 %** |
+| engine `WaitForSingleObject` polls | 116.2 ms | 113.3 ms | **91 %** |
+| - of which 1 ms `nanosleep` (42 polls/frame, max arg 1 ms) | 54.3 ms | 52.3 ms | 42 % |
+| - of which blocked re-entering the machine lock | 62.3 ms | 61.3 ms | **49 %** |
+| residual lifted work on the render thread | 8.6 ms | 8.4 ms | 7 % |
+| bridged calls / frame | 7,493 | 6,843 | - |
+| `InterlockedCompareExchange` / frame (engine spinlock) | 1,050 | 9,398 | - |
+| process CPU | 99 % of 1 core | 99 % of 1 core | - |
+| guest threads | 72 | 56 | - |
+
+Matched row of the hand-off table: **"presents cheap, guest loop slow ->
+hot shim fixable; if the ceiling is structural (the single machine lock),
+measure it"**. Measured: the render thread spends 116 of 124 ms waiting on the
+engine's own worker threads, and the whole process burns exactly one core's
+worth of CPU (99 %) in a 124 ms frame. That is the single machine lock doing
+what it says: every guest thread's lifted work is serialized, so the frame is
+the *sum* of all of it, and the port's throughput is total serialized CPU per
+frame - not the GPU, not vsync, not the cap.
+
+For scale, the Windows oracle on the same content (`docs/FINDINGS.md`
+2026-11-20): 17.5-25 ms frames, 40-58 fps, ~2,200 bridged calls/frame, 24 guest
+threads, main thread waiting 16-21 ms of a 25 ms frame on 34
+`WaitForSingleObject` calls. Same shape, 5x the wall time: the device does ~3x
+the per-frame CPU on a core that is slower, with 2-3x the threads to serialize.
+
+**The 30 fps cap is active and costs nothing here.** `int=100` in every sample,
+`[fps] limiter interval 50 -> 100 (cap 30 fps)` at boot, and in the tutorial the
+sleep histogram's largest requested value is **1 ms** - the limiter's
+`while (elapsed < interval) Sleep((interval-elapsed)/3)` never runs its body
+when the frame is already 124 ms. The cap paces the menus (22-30 presents/s,
+sleep args up to 21-24 ms) and is a no-op in the first area.
+
+### The one fix tried, and why it is not in the tree
+
+Hypothesis from the table: the 42 x 1 ms polls per frame are a host-shim cost,
+and an event-driven `WaitForSingleObject` (a condvar per object, broadcast by
+`SetEvent`/`ReleaseSemaphore`) would remove 32 of the 42 lock hand-overs per
+frame. Implemented, built, run: **the frame became 77 s** (submenu, stalling),
+and even the menus went from 34 ms to 94 ms. Cause: over-waking. A broadcast
+wakes every waiter of an object, and for auto-reset events/semaphores that turns
+one signal into several waiters deciding they were signalled - the engine's job
+pump saw slots complete out of order and retried. Reverted in full, ledgered in
+`AGENTS.md` section 6. A one-signal-one-waiter rework (futex-style token per
+wait) is the shape of any retry, not another broadcast.
+
+### The campaign (>=5 minutes of active play, 30 fps default)
+
+`scripts\android_route_drive.ps1` now detects the tutorial HUD
+("Light Attack / Heavy Attack / Jump") and drives held-stick swipes and
+1.2-1.4 s button holds for `-PlaySeconds`, with a screencap + OCR every 25 s and
+`dumpsys battery` + `dumpsys thermalservice` every 30 s from the PC side. Run
+camp2: New Game -> Extreme -> cutscene -> HUD at 172 s, then **330 s of active
+play, 186 gestures, 13 screenshots, process alive at 503 s**.
+
+| metric (318 s in the tutorial, 3,159 presents) | value |
+|---|---|
+| presents/s | 9.9 |
+| fps min / avg / max (per-second averages) | 3.9 / 9.4 / 18.5 |
+| frame dt avg (min-max) | 123.9 ms (47-315) |
+| frames > 50 ms | 3,154 (99.8 %) |
+| frames > 100 ms | 1,191 (37.7 %) |
+| limiter interval seen | 100 in every sample |
+| process CPU | 99 % of one core |
+| VmRSS / HWM at the end | 116 MB / 310 MB |
+| guest threads (peak) | 56 (56) |
+| battery temperature | 37.0 -> 39.7 C |
+| thermal status (`dumpsys thermalservice`) | 0 (NONE) -> 1 (LIGHT) at ~255 s, never higher |
+| battery level | 86 -> 89 % (USB charging) |
+| `logcat -b crash` | empty |
+| exit | `reason=10 (USER REQUESTED)` after the session's own force-stop |
+
+No throttling: presents/s is flat across the 330 s and the temperature is
+within 3 C of the start, so the fps number is the port's, not the thermals'.
+
+### Interactivity, measured
+
+The HUD alone is not proof that input reaches the player. The driver ends with
+two shots 3 s apart with **no input**, then two shots while the stick is held
+right (two 1.4 s swipes), and the view's best horizontal shift is measured:
+
+| pair | best shift | score at that shift | score at 0 |
+|---|---|---|---|
+| idle A -> idle B (no input) | **+0 px** | 8.1 | 8.1 |
+| move A -> move B (2 held-right swipes) | **+78 px** | 10.5 | 11.8 |
+
+The camera pans under held-stick input and not while idle; mean per-channel
+frame difference over the 318 s of play is 31.6/31.5 (G/B) against 7.1/9.3 for
+the idle pair, i.e. the player traversed the area. The HUD stayed on screen for
+all 13 samples (one sample OCR'd as blank under a flash effect, one as
+"N ...tac").
+
+### Traps (also in `AGENTS.md` section 6)
+
+- **A log that stops mid-run is not a crash.** Run `fix1` has no line after
+  `t=266s` in `log.txt` *or* in logcat, while the game kept rendering (whole
+  screen pixel diffs of the play screenshots; the process answered `pidof` to
+  the end and exited on our force-stop). The shell's log pump is a single
+  thread; when it stops, fd 2 goes with it. The probe's own `perf.txt` channel
+  was added because of this and produced the camp2 numbers when the same build
+  logged normally.
+- The route's Story submenu classifier required "Continue" and it OCRs as
+  "Cpntinue" about half the time: one run sat on that screen for 200 s with
+  "New Game" plainly visible. Classify on the item that survives OCR.
+- A locked phone gets OCR'd as gameplay input: run camp1 pressed A at the lock
+  screen for 190 s ("vodafone TR ... 59 m until full"). `wm dismiss-keyguard`
+  before launch, and a lockscreen text match as a state.
+- The `[mem]` `frames=` column is the shell tick (see above). Do not read it as
+  guest frame rate.
+
+### Not verified / open
+
+- The Windows oracle was **not re-run** this session: the Windows host still has
+  no working synthetic input path (DInput ignores injected keys; `KORRA_PAD_AUTO`
+  is out of scope and known to regress), so the fresh render state of the
+  `flow=0x9` frame and a fresh New Game run on Windows remain open. The
+  2026-11-20 numbers are the Windows reference used above.
+- Whether a one-signal-one-waiter wait removes enough of the 61 ms lock re-entry
+  to matter (it is 49 % of the frame, so a correct implementation is the obvious
+  next lever - but it is a runtime/shim redesign, and the 30-vs-structural
+  decision is the owner's).
+- The log-pump stall's cause (reproduced once in four runs, not again).
+- Continue route, lifecycle pause/resume, and the in-game pause menu were not
+  exercised this session.
+- fps min 3.9/s is a per-second average of frames that reached 315 ms; no
+  frame-time histogram beyond the >50/>100 ms counters is kept.
