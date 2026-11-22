@@ -60,14 +60,37 @@ const char *ka_fs_resolve(const char *guest_path, char *out, size_t cap) {
         norm[w] = 0;
     }
 
-    /* Defensive: if a host path leaked through (GetModuleFileNameA used to hand
-     * the engine one), drop leading copies of the host root. */
+    /* A path the host itself handed to the guest is already absolute: it must
+     * resolve to itself, never be re-homed under the guest cwd.
+     *
+     * The save device asks SHGetSpecialFolderPathA(CSIDL_PERSONAL) for its
+     * folder and appends "/Korra/<file>" (0x76CB50, derived from the original
+     * exe). On Windows that folder is ...\Documents, so the save lives in
+     * ...\Documents\Korra - outside the game tree, and the exact string is what
+     * CreateFileA receives. Here the shim answers with the app's files
+     * directory (<root>), so the engine asks for "<root>/Korra/<file>". The
+     * old code dropped the <root> prefix and joined the *guest cwd*
+     * ("GameData"), which quietly created the save directory inside the game
+     * data tree as "<root>/GameData/Korra" - and the next boot's
+     * [Hw::rofs::fst] mount enumerated that empty directory, failed to build
+     * its file-size table and raised the boot notice. Same expression, two
+     * hosts, different directories: this is the divergence.
+     *
+     * Strip repeated copies of the root (a leaked host path can arrive with it
+     * twice) and put exactly one back. */
     {
         size_t rl = strlen(g_root);
+        int had_root = 0;
         while (rl && strncmp(norm, g_root, rl) == 0 && (norm[rl] == 0 || norm[rl] == '/')) {
             const char *rest = norm + rl;
             while (*rest == '/') rest++;
             memmove(norm, rest, strlen(rest) + 1);
+            had_root = 1;
+        }
+        if (had_root) {
+            if (norm[0]) snprintf(out, cap, "%s/%s", g_root, norm);
+            else snprintf(out, cap, "%s", g_root);
+            return out;
         }
     }
 
