@@ -92,6 +92,8 @@ int ka_guest_run(const char *game_root) {
     /* After the image map: the sampler reads guest globals, and those are not
      * addressable until the window and the .data section exist. */
     ka_memtrace_start();
+    ka_frame_probe_start();
+    ka_fps_cap_start();
 
     {
         pthread_t th;

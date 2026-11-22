@@ -431,8 +431,12 @@ void d_Reset() {
     RET((uint32_t)hr, 1);
 }
 void d_Present() {
+    uint64_t fp_t0 = ka_fp_begin();
     HRESULT hr = DEV->Present((const RECT *)P(A32(0)), (const RECT *)P(A32(1)),
                               (HWND)(uintptr_t)A32(2), (const RGNDATA *)P(A32(3)));
+    /* Times the frame, reports it to the platform hint session and runs the
+     * frame cap's watchdog (frame_probe_android.c / fps_cap_android.c). */
+    ka_fp_end_present(fp_t0);
     g_presents++;
     RET((uint32_t)hr, 4);
 }

@@ -202,11 +202,13 @@ static uint64_t mono_ns(void) {
 static void guest_sleep_ms(uint32_t ms) {
     extern int ka_spine_depth(void);
     int depth = 0;
+    uint64_t fp_t0 = ka_fp_on() ? ka_fp_begin() : 0;
     struct timespec ts;
     ts.tv_sec = ms / 1000; ts.tv_nsec = (long)(ms % 1000) * 1000000L;
     /* Release the machine lock so other guest threads run while we sleep. */
     while (ka_spine_depth() > 0) { mach_leave(); depth++; }
     nanosleep(&ts, NULL);
+    ka_fp_end_sleep(fp_t0, ms);
     while (depth-- > 0) mach_enter();
 }
 
@@ -444,6 +446,7 @@ static void k_EnterCriticalSection(void) {
         if (pthread_mutex_trylock(m) != 0) {
             extern int ka_spine_depth(void);
             int depth = 0;
+            uint64_t cs_t0 = ka_fp_on() ? ka_fp_now() : 0;
             static int logged;
             if (logged < 20) {
                 logged++;
@@ -453,6 +456,7 @@ static void k_EnterCriticalSection(void) {
             while (ka_spine_depth() > 0) { mach_leave(); depth++; }
             pthread_mutex_lock(m);
             while (depth-- > 0) mach_enter();
+            if (cs_t0) ka_fp_cs_waited(ka_fp_now() - cs_t0);
         }
     }
     RETV(1);
@@ -567,6 +571,7 @@ static void k_InterlockedExchangeAdd(void) {
 static void k_InterlockedCompareExchange(void) {
     uint32_t p = A32(0), x = A32(1), c = A32(2);
     if (p) {
+        ka_fp_icx();
         /* The API returns the PREVIOUS value, not whether it swapped: the CRT's
          * once-init patterns branch on it, so a boolean here silently sends them
          * down the "already initialised" path. __atomic_* leaves the comparison
@@ -1077,8 +1082,9 @@ static void k_WaitForSingleObject(void) {
         }
     }
     if (o) {
-        uint32_t waited = 0;
         int ismain = (g_fs_base && g_fs_base == ka_spine_main_fs());
+        uint64_t wt0 = ka_fp_on() ? ka_fp_now() : 0;
+        uint32_t waited = 0;
         while (!o->signaled && (ms == 0xFFFFFFFFu || waited < ms)) {
             guest_sleep_ms(1);
             waited++;
@@ -1098,13 +1104,7 @@ static void k_WaitForSingleObject(void) {
         }
         if (!o->signaled) RET(258u, 2);   /* WAIT_TIMEOUT */
         if (!o->manual) o->signaled = 0;
-        if (waited) {
-            static int n2;
-            if (n2 < 40) {
-                n2++;
-                ka_log("wait: h=%08X woke after %u polls fs=%08X", h, waited, g_fs_base);
-            }
-        }
+        if (waited && wt0) ka_fp_wait_done(wt0);
         /* What the slot held when its worker was let through. This cannot ride
          * on the 40-wake budget above: the file pool's early wakes spend it long
          * before the asset pool's critical one. Dump when the block names a
@@ -1206,12 +1206,13 @@ static void k_CreateEventW(void) {
     RET(obj_new(OBJ_EVENT, A32(1) != 0, A32(2) != 0), 4);
 }
 static void k_SetEvent(void) {
-    ka_obj *o = obj_get(A32(0));
+    uint32_t h = A32(0);
+    ka_obj *o = obj_get(h);
     {
         static int n;
         if (n < 60) {
             n++;
-            ka_log("setevent: h=%08X %s fs=%08X", A32(0),
+            ka_log("setevent: h=%08X %s fs=%08X", h,
                    o ? (o->kind == OBJ_EVENT ? "event" : "other") : "not an object", g_fs_base);
         }
     }

@@ -10,13 +10,26 @@
  *     refresh rate (a 60 Hz game on a 120 Hz panel otherwise runs the panel at
  *     120 and fights the limiter).
  *
- * The scaffold only wires the calls: reporting real work durations belongs to
- * the M3 session once the guest loop exists.
+ * The deadline is the port's capped rate (debug.korra.fps, default 30, the same
+ * property src/host_android/fps_cap_android.c applies to the engine), not a
+ * hard-coded 60: hinting 60 while the port runs at 30 lets the panel and the
+ * governor chase a frame the port never asked for.
+ *
+ * The work duration is reported by the *guest's* frame, not by the shell's
+ * 16 ms poll: the shell loop's own body is microseconds, and reporting that
+ * would tell the platform the app finishes instantly. src/host_android's frame
+ * probe calls korra_perf_guest_frame() once per Present with the real frame
+ * time.
  */
 #include "korra_android.h"
 
 #include <dlfcn.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/system_properties.h>
+#include <unistd.h>
 
 typedef struct APerformanceHintManager APerformanceHintManager;
 typedef struct APerformanceHintSession APerformanceHintSession;
@@ -35,12 +48,31 @@ static set_threads_fn set_threads;
 static set_frame_rate_fn set_frame_rate;
 static APerformanceHintSession* session;
 static int initialised;
+static long long target_ns = 33333333LL;   /* 30 fps: the port's default */
+static float hinted_fps = 30.0f;
+static int report_failed;
+
+/* The rate the port asks for and the hints follow. Property first, so a run can
+ * ask for the engine's 60 (debug.korra.fps=60) or an uncapped probe (0). */
+long long korra_perf_target_ns(void) {
+    if (!initialised) {
+        char v[PROP_VALUE_MAX] = {0};
+        long fps = 30;
+        __system_property_get("debug.korra.fps", v);
+        if (v[0]) fps = strtol(v, NULL, 0);
+        if (fps <= 0 || fps > 240) fps = 30;
+        target_ns = 1000000000LL / fps;
+        hinted_fps = (float)fps;
+    }
+    return target_ns;
+}
 
 void korra_perf_init(void) {
     if (initialised) {
         return;
     }
     initialised = 1;
+    korra_perf_target_ns();
 
     void* lib = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
     if (lib) {
@@ -53,26 +85,36 @@ void korra_perf_init(void) {
 
     if (get_manager && create_session) {
         APerformanceHintManager* manager = get_manager();
-        int32_t thread = 0;
+        /* A session needs at least one real thread id; the empty list this
+         * used to pass made createSession answer NULL ("session=no" in every
+         * log so far). The shell thread is the one this call runs on. */
+        int32_t thread = (int32_t)gettid();
         if (manager) {
-            /* 16.666 ms: the engine's own limiter targets 30 or 60 fps (see
-             * docs/quirks.md); the hint session starts at 60 and the M3 session
-             * can switch it from DAT_00e4d210. */
-            session = create_session(manager, &thread, 0, 16666667LL);
+            session = create_session(manager, &thread, 1, target_ns);
         }
     }
-    korra_logv("perf: adpf=%s setFrameRate=%s session=%s",
+    korra_logv("perf: adpf=%s setFrameRate=%s session=%s target=%.1fms (%.0ffps)",
                get_manager && create_session ? "yes" : "no",
                set_frame_rate ? "yes" : "no",
-               session ? "yes" : "no");
+               session ? "yes" : "no",
+               (double)target_ns / 1e6, (double)hinted_fps);
 }
 
-void korra_perf_frame(void* native_window, long long work_ns, long long target_ns) {
+void korra_perf_frame(void* native_window, long long work_ns, long long target) {
+    (void)work_ns;
     if (native_window && set_frame_rate) {
-        set_frame_rate(native_window, target_ns > 0 ? (float)(1e9 / (double)target_ns) : 60.0f,
-                       0 /* ADAPTIVE */);
+        set_frame_rate(native_window, hinted_fps, 0 /* ADAPTIVE */);
     }
-    if (session && report_actual && work_ns > 0) {
-        report_actual(session, (int64_t)work_ns);
+    (void)target;
+}
+
+/* Called once per guest Present (src/host_android/frame_probe_android.c) with
+ * the frame's wall time: the only number worth reporting, because it is the one
+ * the player sees. */
+void korra_perf_guest_frame(long long work_ns) {
+    if (!session || !report_actual || work_ns <= 0) return;
+    if (report_actual(session, (int64_t)work_ns) < 0 && !report_failed++) {
+        korra_logv("perf: reportActualWorkDuration rejected (session targets another thread)");
     }
 }
+

@@ -36,6 +36,11 @@ int korra_install_probe(const char* external_files);
  * ANativeWindow_setFrameRate (API 30). */
 void korra_perf_init(void);
 void korra_perf_frame(void* native_window, long long work_ns, long long target_ns);
+/* The deadline the port asks for (debug.korra.fps, default 30 fps). */
+long long korra_perf_target_ns(void);
+/* One per guest frame, from src/host_android's Present probe: the number the
+ * platform should size the CPU budget against. */
+void korra_perf_guest_frame(long long work_ns);
 
 /* ---- jni_bridge.cpp ------------------------------------------------------
  * The placeholder the real guest entry replaces after the M2 gate. */

@@ -42,6 +42,8 @@ static uint32_t g_trace_left = 12000;
  * The engine's spin-waits call InterlockedExchange in a loop that has no
  * instrumented lift back edge, so recomp_yield_hook never fires there. */
 static uint32_t g_import_calls;
+/* Read by the frame probe's calls/frame column (frame_probe_android.c). */
+uint32_t ka_import_calls(void) { return g_import_calls; }
 /* Set from the guest's main thread (ka_spine_note_main); lets the import trace
  * above stay silent for the main thread and log only spawned workers. */
 static uint32_t g_main_fs;
@@ -161,7 +163,19 @@ static volatile uintptr_t g_wd_pt;
 static __thread uintptr_t g_my_pt;
 
 void mach_enter(void) {
-    pthread_mutex_lock(&g_mach);
+    /* With the frame probe on, time the acquire when it actually blocks: the
+     * render thread waiting behind a worker is the single-machine-lock cost,
+     * and "how much of the frame is that" is the question the fix layer hangs
+     * on. trylock keeps the uncontended path a single CAS. */
+    if (ka_fp_lock_timing()) {
+        if (pthread_mutex_trylock(&g_mach) != 0) {
+            uint64_t t0 = ka_fp_now();
+            pthread_mutex_lock(&g_mach);
+            ka_fp_lock_waited(ka_fp_now() - t0);
+        }
+    } else {
+        pthread_mutex_lock(&g_mach);
+    }
     if (!g_ts.inited) {
         pthread_mutex_unlock(&g_mach);
         ka_thread_attach("mach_enter");

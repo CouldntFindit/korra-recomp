@@ -35,7 +35,8 @@ extern "C" void ka_input_touch(int action, int id, float x, float y, int w, int 
 
 namespace {
 
-constexpr long long kTargetFrameNs = 16666667LL; /* 60 Hz */
+/* The frame deadline comes from korra_perf_target_ns() (debug.korra.fps,
+ * default 30 fps), so the shell and the engine's limiter ask for one rate. */
 
 struct AppState {
     android_app* app = nullptr;
@@ -231,7 +232,7 @@ extern "C" void android_main(android_app* app) {
             korra_guest_frame(state.window);
         }
         const long long frame_end = now_ns();
-        korra_perf_frame(state.window, frame_end - frame_start, kTargetFrameNs);
+        korra_perf_frame(state.window, frame_end - frame_start, korra_perf_target_ns());
 
         state.frames++;
         if (frame_end - state.last_report_ns >= 1000000000LL) {

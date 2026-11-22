@@ -213,6 +213,30 @@ int ka_guest_run(const char *game_root);
 /* 1 Hz stability sampler, started by ka_guest_run when debug.korra.memtrace=1
  * (memtrace_android.c). */
 void ka_memtrace_start(void);
+
+/* Per-second frame-time decomposition, started by ka_guest_run when
+ * debug.korra.perf=1 (frame_probe_android.c). ka_fp_begin returns 0 when off,
+ * so a call site can pass the value straight back and pay only a branch. */
+void     ka_frame_probe_start(void);
+int      ka_fp_on(void);
+uint64_t ka_fp_begin(void);
+void     ka_fp_end_present(uint64_t t0);
+void     ka_fp_end_sleep(uint64_t t0, uint32_t ms);
+void     ka_fp_wait_done(uint64_t t0);
+void     ka_fp_lock_waited(uint64_t ns);
+void     ka_fp_cs_waited(uint64_t ns);
+void     ka_fp_icx(void);
+int      ka_fp_lock_timing(void);
+uint64_t ka_fp_now(void);
+
+/* The port's frame cap on the engine's own limiter (fps_cap_android.c):
+ * debug.korra.fps, default 30, 0 = the engine's 30/60 mode. */
+void     ka_fps_cap_start(void);
+void     ka_fps_tick(void);
+unsigned ka_fps_cap_value(void);
+
+/* Bridged import dispatches so far, for the probe's calls/frame column. */
+uint32_t ka_import_calls(void);
 /* Shell loop iterations (jni_bridge -> main_android.c korra_guest_frame). */
 uint32_t ka_shell_frames(void);
 
