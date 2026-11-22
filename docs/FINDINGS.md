@@ -3532,3 +3532,112 @@ all 13 samples (one sample OCR'd as blank under a flash effect, one as
   exercised this session.
 - fps min 3.9/s is a per-second average of frames that reached 315 ms; no
   frame-time histogram beyond the >50/>100 ms counters is kept.
+
+
+## 2026-11-22 - rung (d) closes: the first-run SAF picker installs the game root and the phone boots from it
+
+Device: Galaxy S24 (SM-S921B, Exynos 2400, Xclipse 940, stock Vulkan 1.3.304,
+Android 17 / API 37). Base HEAD `6076b25`; commits `260a690` (install flow) and
+this docs commit.
+
+**What the launch path did before (measured first).** After `adb shell pm
+clear`, the activity drew a static prompt and waited for a tap - the picker
+never opened by itself (`logs/fresh_old3.png`). The space gate could not pass
+either: it asked `File.getUsableSpace()` on `files/game` before that directory
+existed, and the device answered **0 bytes** ("Not enough free space: 2.60 GB
+needed, 0 MB available", `logs/fresh_old2.png`). Validation also ran *after*
+the copy, so a `GameData`-only pick copied 2.7 GB and then threw.
+
+**The flow now** (`260a690`; Java only, the native hand-off is unchanged):
+
+- launch: installed = `install.complete` + `LoK.exe` + both CPKs. Missing -> the
+  picker opens 400 ms after `onCreate`. A partial tree whose persisted tree
+  grant still resolves resumes without the picker.
+- validate before copying (name what is missing, copy nothing): the folder needs
+  a `GameData` directory **and** `LoK.exe`; `GameData` needs `data000.cpk` and
+  `data001.cpk`. Source size is measured in the same pass, for the space check
+  and the bar.
+- copy: one `ContentResolver.openInputStream` per document (not `DocumentFile`
+  chunk APIs), 1 MiB buffers; a target file with the source's exact size is
+  skipped (resume); progress on a 400 ms byte clock with a bar and a rate, and
+  `GameData` / `LoK.exe` timed separately in the log.
+- space: measured source size minus what is already on disk, plus 128 MB slack,
+  checked after the target directory exists.
+- grant: `takePersistableUriPermission` at pick time, URI in SharedPreferences,
+  re-checked against `getPersistedUriPermissions()` on every launch.
+
+**Measured, two fresh installs** (source = a game tree kept in shared storage,
+selected through the system picker; `pm clear` before each startup):
+
+| step | run 1 | run 2 |
+|---|---|---|
+| picker opened by itself | 400 ms after onCreate | 400 ms after onCreate |
+| validation | 820 files, 2,844,528,439 B | same |
+| `GameData` copy | 15,609 ms, 182 MB/s | 19,473 ms, 146 MB/s |
+| `LoK.exe` | 20 ms | 27 ms |
+| result | 820 files, 0 EACCES | 820 files, 0 EACCES |
+| ready -> `guest: entry 0x0077C3B7` | 9 ms | 9 ms |
+| title screen | 48 s after launch | 47 s after launch |
+
+A clean marker reads `files=820 skipped=0 bytes=2844528439 total=2844528439
+seconds=15`. The copy rate is page-cache warm (the tree had just been written to
+the same partition); a cold source will be slower, but it is still I/O-bound
+seconds, not the "minutes" the plan assumed.
+
+**A wrong pick is rejected before anything is copied.** Run 2's first selection
+had no `GameData`: validation failed in 34 ms, logged "That folder has no
+GameData folder. Pick the folder that contains GameData and LoK.exe.", and the
+next pick installed. Zero bytes were copied.
+
+**Resume, measured twice.** Deleting the marker and two files and relaunching:
+the new process logged "install: resuming an interrupted copy from
+content://...", copied 2 files, skipped 818, finished in **523 ms** (marker
+`skipped=818`) - no picker. Repeated after `adb reboot`: the persisted grant
+survived, 1 file + `LoK.exe` copied in **3,298 ms**, marker `skipped=819`, then
+the title screen. That is the scoped-storage re-check after reboot, measured.
+
+**Second launch** (also re-run on the final binary). `install: probed
+.../LoK.exe - ready (internal)`, `game data present at .../files/game`, no
+picker, loading screen at 3 s, title at ~47 s
+(`logs/saf2_07_second_launch_title2.png`).
+
+**Save path in the SAF-installed tree.** The OCR-driven New Game route (Story ->
+New Game -> Extreme -> intro cutscene) reached the tutorial HUD at 260 s.
+`CreateDirectoryA <root>/Korra/`, `CreateFileA(GENERIC_WRITE, CREATE_ALWAYS)
+<root>/Korra/GameData.dat`, `WriteFile 7856`; the file is 7,856 B on disk. The
+next boot has zero `[msgbox]` and zero `[Hw::rofs::fst]` lines and reaches the
+title screen (`logs/saf2_08_boot2_attract.png`).
+
+**Continue (opportunistic).** The Story submenu highlighted "Continue - Resume
+the game from where you stopped playing"; A loaded the checkpoint straight into
+gameplay ("FIGHT!" over the tree arena, `logs/cont_04_after_continue.png`) and
+`GameData.dat` was rewritten at 23:56. So the checkpoint route works in the
+SAF-installed tree as well.
+
+**Lifecycle pause/resume (opportunistic): it crashes, and not by LMK.** HOME
+while in gameplay, 15 s later: `lifecycle: pause` -> `window: destroyed` ->
+`swapchain: recreate n=3` -> `D3D9SwapChainEx: Failed to recreate swap chain`
+(`88760870` at `0x759E70`) -> `[crash] signal 11 ... guest_func=0x007524C0`;
+exit-info `reason=2 (SIGNALED) status=11`, importance 400. The engine cannot
+survive losing its swap chain on backgrounding; the in-game pause menu could
+not be reached because that death comes first. Open, not touched this session.
+
+**Dev path kept.** `scripts\android_run.ps1` writes the same `install.complete`
+marker after its `run-as` copy and keys its "already installed" test on it, so a
+dev tree is not covered by the picker. The native probe is unchanged.
+
+**Caveat on the picker interaction.** The taps that walked the system picker in
+these runs were not produced by a script - logcat has no `input` command from
+this session at those moments, and the device has Microsoft Phone Link running
+(which can inject input). The app's own log records, in order, the picker
+opening, a rejected selection, the validated selection, the copy and the boot,
+so the path is proven end to end; a fully scripted picker walk is not.
+
+**Not verified.** A cold (non-page-cache) copy rate; the storage-full path (the
+`SpaceProblem` branch is implemented, not triggered - the device had 22 GB
+free); the picker on a device without a documents provider; a fully scripted
+picker navigation; the in-game pause menu (unreachable while the backgrounding
+crash stands); slot saves / erase / `SystemData.dat` (unchanged from the save
+entry); and the Windows oracle for anything here (no shared code changed).
+
+

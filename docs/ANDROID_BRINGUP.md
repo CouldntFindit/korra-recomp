@@ -127,22 +127,43 @@ mistaken for a working port, in `log.txt` or in logcat.
 The picker is `ACTION_OPEN_DOCUMENT_TREE` (not `ACTION_OPEN_DOCUMENT`, which
 ngbrecomp uses for its single ISO): Korra ships a directory
 (`GameData\` with `data000.cpk` 265 MB, `data001.cpk` 1.60 GB, plus loose
-`sound\` and `movie\`); the engine opens several files by path at different
-times. Both picker shapes are accepted — the game root that *contains*
-`GameData`, or `GameData` itself — because that is the mistake users make.
+`sound\` and `movie\`). The selection must be the **game root** - the folder that
+contains both `GameData\` and `LoK.exe` - because the exe's data sections are
+part of the image the lift reads. Picking `GameData` itself is rejected by name
+before anything is copied.
 
-- Copy target: `getExternalFilesDir(null)/game/GameData/` →
-  `/storage/emulated/0/Android/data/org.korra.recomp/files/game/GameData/`.
-  No storage permission is needed for that path on API 29+.
-- Refuse under 2.6 GB free (`REQUIRED_BYTES`), checked before copying.
-- The copy is Java-side on a worker thread with toasts every 32 files; a
-  `install.complete` marker is written only after a complete pass, so a killed
-  copy is retried on next launch.
+- Copy target: `getFilesDir()/game/` →
+  `/data/user/0/org.korra.recomp/files/game/`. Internal, not external: Android
+  16+ denies the app `fopen` on files adb pushed into its own external files
+  dir (`EACCES`), so internal storage is the one path that serves both the
+  picker and the dev `run-as` loop. No storage permission is needed.
+- Validate first: the folder must have a `GameData` directory and `LoK.exe`;
+  `GameData` must have `data000.cpk` + `data001.cpk`. The message names what is
+  missing, and the picker re-opens on a tap.
+- Space: free space is compared against the measured source size (minus what is
+  already on disk) plus 128 MB slack. The check runs after the target directory
+  exists; `File.getUsableSpace()` on a path that does not exist answers 0, which
+  is how the first version could never pass the gate after `pm clear`.
+- The copy is Java-side on a worker thread, one
+  `ContentResolver.openInputStream` per document (not `DocumentFile` chunk
+  APIs), 1 MiB buffers. Progress is on a 400 ms byte clock with a progress bar
+  and a rate, because the first two files are 265 MB and 1.6 GB and a file-count
+  tick would look frozen. `GameData` and `LoK.exe` are timed separately in the
+  log.
+- Resume: a file whose target already exists with the source's exact size is
+  skipped. `install.complete` is written only after a complete pass, so an
+  interrupted copy is offered again next launch; the tree URI is persisted at
+  pick time and re-checked against `getPersistedUriPermissions()`, so the same
+  interrupted copy resumes without the picker, including after a reboot.
 - The native side never sees a `content://` URI. It gets one plain directory
-  path, because the file layer it will host (CRI FS over POSIX `open`) cannot
-  read a SAF document.
-- The marker + both CPKs are the "installed" test; `GameDataInstaller.isInstalled`
-  and the native log line both report it.
+  path, because the file layer it hosts (CRI FS over POSIX `open`) cannot read a
+  SAF document.
+- The marker + `LoK.exe` + both CPKs are the "installed" test;
+  `GameDataInstaller.isInstalled` and the native log line both report it.
+  `scripts\android_run.ps1` writes the same marker after its `run-as` copy, so
+  the dev tree is never mistaken for a first run. Device measurements of the
+  flow are in section 10.8.
+
 
 ### Logging
 
@@ -833,4 +854,89 @@ RSS is not one number. `dumpsys meminfo`'s TOTAL RSS of 1.19 GB was 1.03 GB
 **Graphics** (dmabuf), 15 MB native heap and ~110 MB of anonymous pages; the
 in-app VmRSS never exceeded 122 MB. Read the category rows before calling a
 death memory pressure.
+
+### 10.8 The first-run SAF install, measured (2026-11-22)
+
+Rung (d) of the M3 gate. Two fresh installs (`adb shell pm clear` before each)
+from a game tree the user keeps in shared storage; the folder was selected
+through the system picker, not by the dev scripts.
+
+**What the shell did before this session, measured.** With no `files/game`, the
+activity drew a static prompt and waited for a tap; the picker never opened by
+itself. The space gate could not pass after `pm clear` either: it read
+`File.getUsableSpace()` on `files/game` before that directory existed, and the
+device answered **0 bytes** ("Not enough free space: 2.60 GB needed, 0 MB
+available"). Validation also ran after the copy, so a `GameData`-only pick
+copied 2.7 GB and then threw.
+
+**The flow now** (Java: `MainActivity`, `GameDataInstaller`; native hand-off
+unchanged):
+
+- launch: installed = `install.complete` + `LoK.exe` + both CPKs. Missing → the
+  picker opens 400 ms after `onCreate`. A partial tree with a live persisted
+  grant resumes without the picker.
+- validate before copying (name what is missing, nothing copied): game root
+  needs a `GameData` directory and `LoK.exe`; `GameData` needs `data000.cpk` and
+  `data001.cpk`. Source size is measured in the same pass.
+- copy: 1 MiB buffered `openInputStream` per document, skip when the target's
+  size equals the source's, byte-clock progress (400 ms) + bar + rate, and
+  `GameData` / `LoK.exe` timed separately.
+- grant: `takePersistableUriPermission` at pick time, URI in SharedPreferences,
+  re-checked on every launch.
+
+**Numbers.**
+
+| step | run 1 | run 2 |
+|---|---|---|
+| picker opened by itself | 400 ms after onCreate | 400 ms after onCreate |
+| validation | 820 files, 2,844,528,439 B | same |
+| `GameData` copy | 15,609 ms, 182 MB/s | 19,473 ms, 146 MB/s |
+| `LoK.exe` | 20 ms | 27 ms |
+| copy result | 820 files, 0 EACCES | 820 files, 0 EACCES |
+| ready → `guest: entry 0x0077C3B7` | 9 ms | 9 ms |
+
+The marker after a clean install is
+`files=820 skipped=0 bytes=2844528439 total=2844528439 seconds=15`.
+
+**A wrong pick is rejected before the copy (measured).** Run 2's first selection
+had no `GameData`: validation failed in 34 ms with "That folder has no GameData
+folder. Pick the folder that contains GameData and LoK.exe." and the next pick
+installed. Zero bytes were copied.
+
+**Resume is real, not claimed.** Deleting the marker and two files, then
+relaunching, logged "install: resuming an interrupted copy from
+content://…", copied 2 files, skipped 818, finished in 523 ms
+(`skipped=818` in the marker) - no picker. Repeated after `adb reboot`: the
+persisted grant survived, 1 file + `LoK.exe` copied in 3,298 ms,
+`skipped=819`, then the title screen. This is the scoped-storage re-check after
+reboot, measured.
+
+**Second launch.** `install: probed …/LoK.exe - ready (internal)`, `game data
+present at …/files/game`, no picker, title screen after ~45 s.
+
+**Save path in the SAF-installed tree.** The OCR-driven New Game route (Story →
+New Game → Extreme → intro cutscene) reached the tutorial HUD at 260 s;
+`CreateDirectoryA <root>/Korra/`, `CreateFileA(GENERIC_WRITE, CREATE_ALWAYS)`
+`<root>/Korra/GameData.dat`, `WriteFile 7856`; on disk 7,856 B. The next boot
+has zero `[msgbox]` and zero `[Hw::rofs::fst]` lines.
+
+**Dev path.** `scripts\android_run.ps1` writes the same `install.complete`
+marker after its `run-as` copy and keys its "already installed" test on it, so a
+dev tree is not covered by the picker. `install_android.c`'s native probe is
+unchanged.
+
+**Caveat on the picker interaction.** The taps that walked the system picker in
+these runs were not produced by a script (logcat shows no `input` command from
+this session at those moments; the device also has Microsoft Phone Link running,
+which can inject input). The app's own log records the picker open, the rejected
+selection, the validated selection, the copy and the boot in order, so the
+install path is proven end to end; a fully scripted picker walk is not.
+
+**Also measured (opportunistic).** Continue loads the checkpoint straight into
+gameplay ("FIGHT!") and rewrites `Korra/GameData.dat`. Backgrounding the game
+during gameplay kills the process: `window: destroyed` -> `Failed to recreate
+swap chain` (`88760870`) -> SIGSEGV at guest `0x7524C0`, exit
+`reason=2 (SIGNALED) status=11` - a swapchain-lifecycle death, not an LMK kill.
+The in-game pause menu is unreachable until that is fixed.
+
 
