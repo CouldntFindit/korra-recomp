@@ -38,6 +38,9 @@ static void s_SHGetSpecialFolderPathA(void) {
         memcpy(ka_host(out), p, n);
         ((char *)ka_host(out))[n] = 0;
     }
+    if (ka_save_on())
+        ka_log("[save] SHGetSpecialFolderPathA hwnd=%u csidl=%u create=%u -> ret=1 path=\"%s\"",
+               A32(0), A32(2), A32(3), out ? (const char *)ka_host(out) : "");
     RET(1, 4);
 }
 

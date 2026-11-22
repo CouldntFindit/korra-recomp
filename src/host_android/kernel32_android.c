@@ -604,10 +604,14 @@ static void k_FlsSetValue(void) { ka_tls_set(A32(0), A32(1)); RET(1, 2); }
 static void k_CreateFileA(void) {
     uint32_t name = A32(0);
     uint32_t access = A32(1);
+    uint32_t share = A32(2);
     uint32_t disp = A32(4);
     int want_write, create = 0, truncate = 0;
     uint32_t h;
+    char host[1024];
     if (!name) RET(INVALID_HANDLE, 7);
+    host[0] = 0;
+    ka_fs_resolve((const char *)ka_host(name), host, sizeof host);
     /* dwDesiredAccess / dwCreationDisposition, as Windows means them. Without
      * them every open was read-only and never created anything, so the engine's
      * first save answered FILE_NOT_FOUND and New Game stopped at "Failed to
@@ -623,8 +627,12 @@ static void k_CreateFileA(void) {
     h = ka_file_open_ex((const char *)ka_host(name), want_write, create, truncate);
     if (!h) {
         ka_last_error_set(2);               /* ERROR_FILE_NOT_FOUND */
+        ka_save_file("CreateFileA", (const char *)ka_host(name), host, access,
+                     share, disp, INVALID_HANDLE, 2);
         RET(INVALID_HANDLE, 7);
     }
+    ka_save_file("CreateFileA", (const char *)ka_host(name), host, access,
+                 share, disp, h, 0);
     RET(h, 7);
 }
 static void wstr_to_ascii(const uint16_t *w, char *out, size_t cap) {
@@ -647,7 +655,16 @@ static void k_CreateFileW(void) {
     }
     {
         uint32_t h = ka_file_open_ex(name, want_write, create, truncate);
-        if (!h) { ka_last_error_set(2); RET(INVALID_HANDLE, 7); }
+        char host[1024];
+        host[0] = 0;
+        ka_fs_resolve(name, host, sizeof host);
+        if (!h) {
+            ka_last_error_set(2);
+            ka_save_file("CreateFileW", name, host, access, A32(2), disp,
+                         INVALID_HANDLE, 2);
+            RET(INVALID_HANDLE, 7);
+        }
+        ka_save_file("CreateFileW", name, host, access, A32(2), disp, h, 0);
         RET(h, 7);
     }
 }
@@ -655,8 +672,13 @@ static void k_ReadFile(void) {
     uint32_t h = A32(0), buf = A32(1), n = A32(2), got = A32(3);
     uint32_t g = 0;
     if (h == STD_IN) RET(0, 5);
-    if (!ka_file_read(h, ka_host(buf), n, &g)) { ka_last_error_set(6); RET(0, 5); }
+    if (!ka_file_read(h, ka_host(buf), n, &g)) {
+        ka_last_error_set(6);
+        ka_save_io("ReadFile", h, n, 0, 0, 6);
+        RET(0, 5);
+    }
     if (got) MEM32(got) = g;
+    ka_save_io("ReadFile", h, n, 1, g, 0);
     RET(1, 5);
 }
 static void k_WriteFile(void) {
@@ -669,8 +691,13 @@ static void k_WriteFile(void) {
         if (put) MEM32(put) = n;
         RET(1, 5);
     }
-    if (!ka_file_write(h, ka_host(buf), n, &w)) { ka_last_error_set(6); RET(0, 5); }
+    if (!ka_file_write(h, ka_host(buf), n, &w)) {
+        ka_last_error_set(6);
+        ka_save_io("WriteFile", h, n, 0, 0, 6);
+        RET(0, 5);
+    }
     if (put) MEM32(put) = w;
+    ka_save_io("WriteFile", h, n, 1, w, 0);
     RET(1, 5);
 }
 static void k_GetFileSize(void) {
@@ -684,18 +711,32 @@ static void k_GetFileType(void) {
     if (h == STD_OUT || h == STD_ERR || h == STD_IN) RET(2, 1);
     RET(1, 1);
 }
-static void k_FlushFileBuffers(void) { RET(ka_file_sync(A32(0)) ? 1 : 0, 1); }
-static void k_SetEndOfFile(void) { RET(ka_file_truncate(A32(0)) ? 1 : 0, 1); }
+static void k_FlushFileBuffers(void) {
+    int ok = ka_file_sync(A32(0));
+    ka_save_plain("FlushFileBuffers", "", ok ? 1 : 0, 0);
+    RET(ok ? 1 : 0, 1);
+}
+static void k_SetEndOfFile(void) {
+    int ok = ka_file_truncate(A32(0));
+    ka_save_plain("SetEndOfFile", "", ok ? 1 : 0, 0);
+    RET(ok ? 1 : 0, 1);
+}
 static void k_DeleteFileA(void) {
     char p[1024];
+    int ok;
     ka_fs_resolve(ASTR(0), p, sizeof p);
-    RET(unlink(p) == 0 ? 1 : 0, 1);
+    ok = unlink(p) == 0;
+    ka_save_str("DeleteFileA", ASTR(0), "", ok ? 1 : 0, ok ? 0 : errno);
+    RET(ok ? 1 : 0, 1);
 }
 static void k_MoveFileA(void) {
     char a[1024], b[1024];
+    int ok;
     ka_fs_resolve(ASTR(0), a, sizeof a);
     ka_fs_resolve(ASTR(1), b, sizeof b);
-    RET(rename(a, b) == 0 ? 1 : 0, 2);
+    ok = rename(a, b) == 0;
+    ka_save_str("MoveFileA", ASTR(0), ASTR(1), ok ? 1 : 0, ok ? 0 : errno);
+    RET(ok ? 1 : 0, 2);
 }
 static void k_CreateDirectoryA(void) {
     char p[1024];
@@ -704,20 +745,33 @@ static void k_CreateDirectoryA(void) {
     rc = mkdir(p, 0755);
     if (rc != 0 && errno != EEXIST)
         ka_log("[fs] mkdir FAILED %s -> %s: %s", ASTR(0), p, strerror(errno));
-    RET(rc == 0 || errno == EEXIST, 2);
+    {
+        int ok = (rc == 0 || errno == EEXIST);
+        ka_save_file("CreateDirectoryA", ASTR(0), p, 0, 0, 0, ok ? 1 : 0,
+                     ok ? 0 : errno);
+        RET(ok, 2);
+    }
 }
 static void k_SetCurrentDirectoryA(void) {
     extern void ka_fs_set_cwd(const char *);
     ka_log("fs: SetCurrentDirectoryA(%s)", ASTR(0));
     ka_fs_set_cwd(ASTR(0));
+    ka_save_str("SetCurrentDirectoryA", ASTR(0), "cwd", 1, 0);
     RET(1, 1);
 }
 static void k_GetFileAttributesA(void) {
     char p[1024];
     struct stat st;
+    uint32_t r;
     ka_fs_resolve(ASTR(0), p, sizeof p);
-    if (stat(p, &st) != 0) RET(INVALID_HANDLE, 1);
-    RET(S_ISDIR(st.st_mode) ? 0x10u : 0x20u, 1);
+    if (stat(p, &st) != 0) {
+        ka_save_file("GetFileAttributesA", ASTR(0), p, 0, 0, 0, INVALID_HANDLE,
+                     errno);
+        RET(INVALID_HANDLE, 1);
+    }
+    r = S_ISDIR(st.st_mode) ? 0x10u : 0x20u;
+    ka_save_file("GetFileAttributesA", ASTR(0), p, 0, 0, 0, r, 0);
+    RET(r, 1);
 }
 static void k_SetFilePointer(void) {
     uint32_t h = A32(0), lo = A32(1), hip = A32(2), method = A32(3);
@@ -807,7 +861,7 @@ static uint32_t find_next_matching(uint32_t slot, uint32_t out) {
     return 0;
 }
 
-static uint32_t find_first_impl(const char *pat, uint32_t out) {
+static uint32_t find_first_impl(const char *call, const char *pat, uint32_t out) {
     char path[1024];
     char *slash;
     uint32_t slot;
@@ -826,6 +880,7 @@ static uint32_t find_first_impl(const char *pat, uint32_t out) {
     g_finds[FIND_MAX - 1].d = opendir(path);
     if (!g_finds[FIND_MAX - 1].d) {
         ka_log("fs: FindFirstFileA(%s) -> opendir(%s) failed: %s", pat, path, strerror(errno));
+        ka_save_find(call, pat, path, INVALID_HANDLE, errno, "");
         return INVALID_HANDLE;
     }
     ka_log("fs: FindFirstFileA(%s) -> %s mask=%s", pat, path, g_finds[FIND_MAX - 1].mask);
@@ -846,14 +901,20 @@ static uint32_t find_first_impl(const char *pat, uint32_t out) {
     if (!find_next_matching(slot, out)) {
         closedir(g_finds[slot - 1].d);
         g_finds[slot - 1].d = NULL;
+        /* Windows answers an empty (or unmatched) wildcard with
+         * INVALID_HANDLE_VALUE and ERROR_FILE_NOT_FOUND; that pair, not just
+         * the handle, is what the caller distinguishes. */
+        ka_save_find(call, pat, path, INVALID_HANDLE, 2, "");
         return INVALID_HANDLE;
     }
+    ka_save_find(call, pat, path, FIND_TOKEN_BASE + slot, 0,
+                 out ? (const char *)ka_host(out + 44) : "");
     return FIND_TOKEN_BASE + slot;
 }
 
-static void k_FindFirstFileA(void) { RET(find_first_impl(ASTR(0), A32(1)), 2); }
+static void k_FindFirstFileA(void) { RET(find_first_impl("FindFirstFileA", ASTR(0), A32(1)), 2); }
 /* (name, infoLevel, data, searchOp, filter, flags) */
-static void k_FindFirstFileExA(void) { RET(find_first_impl(ASTR(0), A32(2)), 6); }
+static void k_FindFirstFileExA(void) { RET(find_first_impl("FindFirstFileExA", ASTR(0), A32(2)), 6); }
 
 static void k_FindNextFileA(void) {
     uint32_t h = A32(0), out = A32(1), slot;
@@ -864,8 +925,10 @@ static void k_FindNextFileA(void) {
         closedir(g_finds[slot - 1].d);
         g_finds[slot - 1].d = NULL;
         ka_last_error_set(18);         /* ERROR_NO_MORE_FILES */
+        ka_save_io("FindNextFileA", h, 0, 0, 0, 18);
         RET(0, 2);
     }
+    ka_save_io("FindNextFileA", h, 0, 1, 0, 0);
     RET(1, 2);
 }
 static void k_FindClose(void) {

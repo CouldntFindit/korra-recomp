@@ -127,6 +127,22 @@ extern int ka_trace_files;
 void ka_trace_init(void);
 void ka_crash_init(void);       /* guest registers on SIGSEGV/SIGBUS/SIGILL/SIGFPE */
 
+/* ------------------------------------------------- save-path probe (debug)
+ * debug.korra.trace_save=1: one line per call in the save device's init chain
+ * with the guest path, the host path it resolved to, and the answer. Same
+ * format as src/host/save_probe.c (KORRA_TRACE_SAVE=1) so the two logs diff. */
+int  ka_save_on(void);
+void ka_save_str(const char *call, const char *guest, const char *arg,
+                 uint32_t res, int last);
+void ka_save_file(const char *call, const char *guest, const char *host,
+                  uint32_t access, uint32_t share, uint32_t disp,
+                  uint32_t res, int last);
+void ka_save_find(const char *call, const char *pat, const char *host,
+                  uint32_t res, int last, const char *first);
+void ka_save_io(const char *call, uint32_t h, uint32_t n, uint32_t res,
+                uint32_t count, int last);
+void ka_save_plain(const char *call, const char *arg, uint32_t res, int last);
+
 /* ------------------------------------------------------------ services */
 void     ka_set_guest_module(const char *exe_path);
 uint32_t ka_last_error_get(void);

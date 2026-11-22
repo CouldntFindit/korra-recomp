@@ -34,6 +34,7 @@ void korra_set_guest_module(const char *path);
 void korra_install_fault_handlers(void);
 void korra_quirk_probe_init(void);
 void korra_file_probe_init(void);
+void korra_save_probe_init(void);   /* KORRA_TRACE_SAVE=1: save-chain calls */
 void korra_msg_probe_init(void);
 void korra_crash_probe_init(void);
 void korra_perf_probe_init(void);
@@ -131,6 +132,7 @@ int main(int argc, char **argv) {
     korra_install_fault_handlers();
     korra_quirk_probe_init();
     korra_file_probe_init();
+    korra_save_probe_init();   /* KORRA_TRACE_SAVE=1: the save-init chain */
     korra_windowed_init();
     korra_msg_probe_init();
     korra_crash_probe_init();
