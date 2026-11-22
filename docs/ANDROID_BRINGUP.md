@@ -893,7 +893,7 @@ unchanged):
 | `GameData` copy | 15,609 ms, 182 MB/s | 19,473 ms, 146 MB/s |
 | `LoK.exe` | 20 ms | 27 ms |
 | copy result | 820 files, 0 EACCES | 820 files, 0 EACCES |
-| ready → `guest: entry 0x0077C3B7` | 9 ms | 9 ms |
+| ready → `guest: entry 0x0077C3B7` | 24 ms | 26 ms |
 
 The marker after a clean install is
 `files=820 skipped=0 bytes=2844528439 total=2844528439 seconds=15`.
@@ -912,7 +912,7 @@ persisted grant survived, 1 file + `LoK.exe` copied in 3,298 ms,
 reboot, measured.
 
 **Second launch.** `install: probed …/LoK.exe - ready (internal)`, `game data
-present at …/files/game`, no picker, title screen after ~45 s.
+present at …/files/game`, no picker, title screen at ~50 s.
 
 **Save path in the SAF-installed tree.** The OCR-driven New Game route (Story →
 New Game → Extreme → intro cutscene) reached the tutorial HUD at 260 s;

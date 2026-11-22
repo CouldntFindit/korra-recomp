@@ -3576,8 +3576,8 @@ selected through the system picker; `pm clear` before each startup):
 | `GameData` copy | 15,609 ms, 182 MB/s | 19,473 ms, 146 MB/s |
 | `LoK.exe` | 20 ms | 27 ms |
 | result | 820 files, 0 EACCES | 820 files, 0 EACCES |
-| ready -> `guest: entry 0x0077C3B7` | 9 ms | 9 ms |
-| title screen | 48 s after launch | 47 s after launch |
+| ready -> `guest: entry 0x0077C3B7` | 24 ms | 26 ms |
+| title screen | captured (`logs/saf_title1.png`) | ~50 s after the next launch (`logs/saf2_07_second_launch_title2.png`) |
 
 A clean marker reads `files=820 skipped=0 bytes=2844528439 total=2844528439
 seconds=15`. The copy rate is page-cache warm (the tree had just been written to
@@ -3598,7 +3598,7 @@ the title screen. That is the scoped-storage re-check after reboot, measured.
 
 **Second launch** (also re-run on the final binary). `install: probed
 .../LoK.exe - ready (internal)`, `game data present at .../files/game`, no
-picker, loading screen at 3 s, title at ~47 s
+picker, loading screen at 3 s, title at ~50 s
 (`logs/saf2_07_second_launch_title2.png`).
 
 **Save path in the SAF-installed tree.** The OCR-driven New Game route (Story ->
