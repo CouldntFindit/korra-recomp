@@ -26,14 +26,14 @@ side (Win32, D3D9 surface, XInput, XAudio2, CRI/Wwise audio, Steam stubs).
 
 ## Status
 
-*Last updated 2026-11-22. Current focus: M3 — the first-area frame-rate/thermal campaign (save path and post-cutscene stability are closed).*
+*Last updated 2026-11-22. Current focus: M4 audio, then the deferred performance block (all M3 rungs are recorded closed; the 30 fps gate line awaits the owner's rescope).*
 
 | Milestone | What it means | State |
 |---|---|---|
 | M0 | Environment, toolchain pin, repo bootstrap, PE gate | **done** (2026-11-19) |
 | M1 | Seeds + function catalog + full lift to C | **done**: 37,327/37,327 functions, 0 lift failures — see [`docs/LIFT_REPORT.md`](docs/LIFT_REPORT.md) |
 | M2 | Boots to the main menu on Windows (no Steam, silent, movies skipped) | **done (2026-11-20)** — boots without Steam, text renders, new game runs into the first area at 39-58 fps uncapped; the crash and missing-text defects had one cause (the lifter's `pcmpistri` flag model). Log: [`docs/FINDINGS.md`](docs/FINDINGS.md) |
-| M3 | Boots and plays the first area on an Android arm64 device | **in progress** — on the S24: title screen, main menu, New Game, difficulty select and the intro cutscene render, and touch → XInput works end-to-end ([`docs/ANDROID_BRINGUP.md`](docs/ANDROID_BRINGUP.md)). The save path is closed (2026-11-22): the save lands in `files/game/Korra/GameData.dat`, New Game passes the save step, and the boot notice the mis-resolved save directory used to raise is gone. Remaining to the gate: the 30 fps frame-rate/thermal record for the first playable area (it renders and survives 600 s on the New Game route; the fps campaign is the next session); the SAF install flow is still to be wired |
+| M3 | Boots and plays the first area on an Android arm64 device | **in progress** - on the S24: title screen, main menu, New Game, difficulty select and the intro cutscene render, touch → XInput works end-to-end, the save path is closed (2026-11-22), post-cutscene stability is closed (2026-11-22), and the own-copy install is proven end to end (`docs/ANDROID_BRINGUP.md` §10.8): the picker opens on a fresh install, validation rejects a wrong folder before copying, 2.84 GB copies in 15-20 s with resume after a kill or a reboot, and the installed tree boots to the title. Remaining to the gate: the 30 fps frame-rate/thermal target for the first playable area (the measured ceiling is the single machine lock and the rescope is the owner's decision) |
 | M4 | Audio: Wwise + CRI behind a host mixer | **sink done + measured (2026-11-21)** - engine keeps its Wwise/CRI mixer; host supplies XAudio2 2.7 + a WASAPI sink. Acceptance 1 passes (RMS -28.14 dBFS, peak -9.77 dBFS); test 2 fails because no Wwise event is posted, tests 3-6 blocked - [`docs/audio.md`](docs/audio.md) |
 | M5 | Gameplay validation, framerate hooks, full playthrough | not started |
 
@@ -62,6 +62,7 @@ agents: [`AGENTS.md`](AGENTS.md).
 | 22.11.2026 | **Title screen, menu and cutscene on the S24**: touch→XInput drives title → menu → New Game → difficulty → intro cutscene; the last graphics blocker (an unimplemented cube-texture D3DX path that left the technique cache empty) fixed; 160 s / 8,664-frame runs, zero crashes. Next: the save path, then the first playable area |
 | 22.11.2026 | **Save path closed on the S24**: the save device's path (`SHGetSpecialFolderPathA(CSIDL_PERSONAL)` + `Korra/`) now resolves to the directory the engine asked for instead of being re-homed under `GameData` - `files/game/Korra/GameData.dat` (7,856 bytes), New Game passes the save step into the intro cutscene, and the rofs boot notice the empty save directory caused is gone. The same probe on the Windows oracle agrees line for line |
 | 22.11.2026 | **Post-cutscene stability on the S24**: the `reason=5` SIGABRT was a thread cap, not memory - a guest thread cost 4 MiB of the 256 MiB stack region, so the 65th guest thread aborted with no guest `[crash]` line (1.03 GB of the reported 1.2 GB RSS was Graphics/dmabuf; the native heap was 15 MB). A guest stack is now 1 MiB (the exe's own stack reserve) and returns to a free list when its thread ends. New Game walks the intro cutscene into the tutorial area, and the run survives 600 s with 72 live guest threads and 29 MiB of the stack region in use |
+| 22.11.2026 | **Own-copy install (rung d) closed on the S24**: a fresh install opens the system folder picker by itself, validates that the picked folder is the game root (`LoK.exe` + `GameData\`) before copying a byte, and copies 820 files / 2.84 GB into internal storage in 15-20 s with progress and per-item timings. Interrupted copies resume by size-matched skip, including after a reboot (the persisted tree grant is re-checked); the installed tree boots to the title screen, the save path and Continue work in it, and the second launch goes straight into the game. The dev `run-as` path is unchanged |
 
 ## Building
 
