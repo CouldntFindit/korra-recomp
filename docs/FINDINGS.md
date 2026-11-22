@@ -447,7 +447,7 @@ notes trusted). All headline claims hold:
 - In-CPK Wwise banks: 62 (45 + 17), generator `0x58` except `pl/plffff.dat`
   `0x48`, `bank_id == fnv1(stem)` for 61/62 (`pl/pl00f1` = `fnv1("pl0000")`).
 
-Corrections the pass found (both now fixed in `docs/assets.md`, commit `91cce7b`):
+Corrections the pass found (both now fixed in `docs/assets.md`, commit `4bd99ef`):
 
 - "1.87 GB → 2.05 GB, ~9 %" was wrong arithmetic: it is **~10 %** (2,053,247,987
   vs 1,865,341,798 = +10.1 %).
@@ -459,7 +459,7 @@ Also tightened: §2 now states the base rule as an explicit formula
 
 ## 2026-11-19 — Track E: publishing (Codeberg mirror, README, notices)
 
-Commit `4a1c868`. New: `scripts/sync_codeberg.ps1`, `tests/sync_codeberg_selftest.ps1`,
+Commit `6973a3d`. New: `scripts/sync_codeberg.ps1`, `tests/sync_codeberg_selftest.ps1`,
 `docs/PUBLISHING.md`; refreshed `README.md`, `THIRD_PARTY_NOTICES.md`,
 `AGENTS.md` §3. `check_content` clean on all 44 tracked files.
 
@@ -1313,9 +1313,9 @@ file was edited and no game run was made (the perf session owns those).
 
 ### STEP 0 - merge and re-validation
 
-- `m3-prep` (forked at `16a241a`, before the SF/OF fix and the relift) was
-  rebased onto `origin/main` (`470ab9e`) with no conflicts, pushed, and
-  fast-forwarded into `main`: `origin/main` = `c27500a`.
+- `m3-prep` (forked at `3b037e6`, before the SF/OF fix and the relift) was
+  rebased onto `origin/main` (`03dfc01`) with no conflicts, pushed, and
+  fast-forwarded into `main`: `origin/main` = `e1f8537`.
 - `tools/scan_pcmpistri.py` on the shipped exe still reports 6 sites:
   `0x77A34F`/`0x77A38B` imm8 `0x0C`, `0x77C33B` imm8 `0x40`,
   `0x77CF3D`/`0x77CF53`/`0x77CF88` imm8 `0x0D`. The current lifted tree has 28
@@ -1413,7 +1413,7 @@ shift count > 1 OF) are deliberately not modelled and are not defects.
 
 Owner report: menus ~59 fps, first area ~3 fps / 298 ms, cause unknown, M2 gate held
 until it is explained. This session owns that defect. Runs use `build\run_perf.exe`
-(copy of the 470ab9e build); `run_text.exe` was never touched.
+(copy of the 03dfc01 build); `run_text.exe` was never touched.
 
 New instruments (host-only, inert unless their env var is set):
 
@@ -2259,10 +2259,10 @@ the fill code never ran before because framework start aborted.
 ## 2026-11-21 — M3: the phone renders; a two-slot texture vtable and a machine-lock deadlock
 
 Device: SM-S921B (Xclipse 940), phone serial <device-serial>, APK built from
-`9d00ec8` plus the fixes below. Three separate defects, each proven by a run
+`ea585596d` plus the fixes below. Three separate defects, each proven by a run
 that reached one step further.
 
-### 1. Texture vtable was two slots short (commit `809fb5c`)
+### 1. Texture vtable was two slots short (commit `a75f4b7720f5`)
 
 `d3d9: vtable tex has 20 slots` before the fix. `IDirect3DBaseTexture9` in
 `d3d9.h` begins with `SetLOD`/`GetLOD`; the host table went straight from
@@ -2283,7 +2283,7 @@ Fix: `bt_SetLOD`/`bt_GetLOD` shims, table now 22 entries
 next mismatch is visible in the log instead of only in a crash. Device run
 after it: `dev:17` x3, `tex:19` dispatched, 0 ICALL, 0 crash, no ExitProcess.
 
-### 2. A guest thread deadlocked while holding the machine lock (commit `e83ea41`)
+### 2. A guest thread deadlocked while holding the machine lock (commit `c26262cb47b8`)
 
 After the vtable fix the run froze after three Presents:
 
@@ -2388,7 +2388,7 @@ on the thread doing `EnterCriticalSection`/`LeaveCriticalSection` around
 `0x8D1990`/`0x8D19D0`, and the check caught the write within 8 imports of
 its occurrence.
 
-Fix (`1eb7979`): the table grows (`objs_ensure`, doubling from 4096,
+Fix (`954648543d8d`): the table grows (`objs_ensure`, doubling from 4096,
 `calloc` + `memcpy`, logs `d3d9: object table grew to N entries`) so it
 can never write outside itself, and `new_token` returns the existing
 token when the same kind and COM pointer are already registered - the
@@ -2477,7 +2477,7 @@ are still absent and this path did not mint one.
 ## 2026-11-21 - M3: the phone renders at 30 fps, then faults on a NULL technique pointer
 
 Two corrections and one new fault, measured on the S24 (Xclipse 940, DXVK-native,
-MAILBOX, 1280x720) with the build from commit 2c4126f.
+MAILBOX, 1280x720) with the build from commit 4a7bdc3.
 
 **1. The present count in earlier entries was a trace artefact.** [import] tracing
 stops at 12,000 lines (g_trace_left in spine_android.c; logs/log12.txt, line 14,757
@@ -2500,7 +2500,7 @@ every single Present while reporting identical properties
 creates 3 swap chains instead of ~1,000.
 
 **2. The run now ends in a guest fault at about 1,300 frames.** After the D3DX fix
-(2c4126f) nothing refuses in the log before the fault: no missing shim, no failed
+(4a7bdc3) nothing refuses in the log before the fault: no missing shim, no failed
 D3DX load, no heap exhaustion.
 
     [crash] signal 11 code=2 addr=0x6b532a2004 guest_func=0x007492B0 esp=0xC2BFFD58
@@ -2830,7 +2830,7 @@ the deref).
 **1. Shared host selftest - green; the earlier red was a script gap, not an
 untracked file.** `scripts\run_selftest.ps1` compiled only
 `tests\selftest_host_shims.c`, `src\host\xaudio2_stub.c`,
-`src\host\steam_stub.c`. Since `d594acf` the stub calls
+`src\host\steam_stub.c`. Since `65936bdb2137` the stub calls
 `korra_audio_sink_start/live/note_underrun`, which live in the **committed**
 `src\host\wasapi_sink.c`, so the link failed with `LNK2019` x3 on a clean tree.
 Fix: add `src\host\wasapi_sink.c` to the compile line and `winmm.lib` to the
@@ -2860,7 +2860,7 @@ real menu:
   limit.
 * Gate/device state stayed clean in both (`flag=0`, `ctx30` cycling
   `0x009DF3D8`/`0x00E1DA54`/`0`, `tce=0`, no `[crash]`), matching the Windows
-  oracle: there is no pass-queue fault to bisect here, and `d594acf` was not
+  oracle: there is no pass-queue fault to bisect here, and `65936bdb2137` was not
   bisected because the regression did not reproduce.
 
 **3. Acceptance tests, measured.** `KORRA_AUDIO_DUMP` + `KORRA_AUDIO_LOG=1`:
@@ -2907,7 +2907,7 @@ the `PostEventWork` RTTI name), then the same three assertions as before.
 ## 2026-11-22 - Task 2 root cause: two D3D9 shim argument contracts, both host-side
 
 Device: Galaxy S24 (Exynos 2400, Xclipse 940, stock Vulkan 1.3.304), DXVK-native,
-build c2d05d0. Probes: `debug.korra.gate=1`
+build 656a371. Probes: `debug.korra.gate=1`
 (`src/host_android/gate_probe_android.c`, three lines every 250 ms) plus the
 `[hr]` trampoline in `spine_android.c`; the Windows reference ran the same
 census from `src/host/gate_probe.c` with `KORRA_GATE=1`.
@@ -2952,14 +2952,14 @@ sub_00749020). Not yet identified.
 screen capture, first-area fps, SAF install. Nothing was re-tested on Windows
 after these fixes.
 
-Committed: c2d05d0 (shims), 56df681 (probes).
+Committed: 656a371 (shims), f170e9a (probes).
 
 ## 2026-11-22 - M4 audio acceptance with gameplay: the cutscene is a CRI movie, Wwise is still never fed
 
 Scope: `docs/audio.md` 9.4 tests 2-7, re-run with real gameplay on
 `build\run_m4c.exe` (SHA256 `7C286C2251CE8968E3E9F6D02129AA56DD03049BBC7D0E7AFC299D5131528DC7`).
 No host behaviour was changed; one logging line was added to
-`src/host/xaudio2_stub.c` (`GetState` polls at verbose 2, `459a201`).
+`src/host/xaudio2_stub.c` (`GetState` polls at verbose 2, `751f85b10dd7`).
 
 **The route, which is why tests 3-6 were "BLOCKED".** Every run ever made pressed
 A on the STORY submenu's first item, which is `Continue` - a save exists from the
@@ -3008,11 +3008,11 @@ which is what the perf session measured as "first area".
 
 **Open, not mine to fix here:** the current build + `KORRA_PAD_AUTO` freezes the
 guest at t=54-55 s (tick 0/s, natcalls 0, all 24 guest threads parked in ntdll
-waits, sink thread alive), while the 470ab9e copy `build\run_perf.exe` survives
+waits, sink thread alive), while the 03dfc01 copy `build\run_perf.exe` survives
 the same input to 300 s (and, with START every 9 s, backs out of gameplay to the
 main menu). Not an ExitProcess (`exit_probe` printed nothing) and no fault line.
 
-Committed: 459a201 (GetState logging), 5d0698e (`docs/audio.md` 10.5, 10.5.1,
+Committed: 751f85b10dd7 (GetState logging), bba3704 (`docs/audio.md` 10.5, 10.5.1,
 10.6).
 
 ## 2026-11-22 - M3 Task 2 root cause: the technique cache was never filled (D3DX cube gap)
@@ -3077,7 +3077,7 @@ never written, and the cache stays `{0,0,0}`. The `[hr]` trampoline could not
 see it: that one only wraps synthetic COM slots (names with `:`), not plain
 d3dx imports.
 
-**Fix (`5ee204d`).** Implement it: `dds_upload_cube` in
+**Fix (`d0b2cda0ec69`).** Implement it: `dds_upload_cube` in
 `src/host_android/d3d9_android.cpp` walks the same header as `dds_upload`, checks
 `DDSCAPS2_CUBEMAP` (dword 27), creates a cube in the requested pool (through a
 SYSTEMMEM staging copy and `UpdateTexture` when the pool cannot be locked), and
@@ -3106,7 +3106,7 @@ separate "Failed to save data." dialog blocks New Game on some boots. The save
 path is a real host gap - `k_CreateFileA` ignored `dwCreationDisposition`, so
 `open()` never passed `O_CREAT` and no new save could be created; that contract
 is now implemented (`ka_file_open_ex`, `SetEndOfFile`, `FlushFileBuffers`,
-`1dbadaa`..`work`), but no save file appeared and **no file open or mkdir
+`dda67c92be2d`..`work`), but no save file appeared and **no file open or mkdir
 failed**, so the engine bails before it touches the filesystem; the next session
 should trace the save routine's first step (the `Korra` directory at
 `GameData/Korra` exists and is empty). The SAF install rung (d) is untouched.
@@ -3117,7 +3117,7 @@ there).
 ## 2026-11-22 - the save lands where the engine asked: a host path is absolute (save-path session)
 
 Device: Galaxy S24 (Exynos 2400, Xclipse 940, stock Vulkan), DXVK-native. Base
-HEAD `245fd37`; commits `77adf45` (probe), `481d2c5` (fix). Probes:
+HEAD `56b20b22f18f`; commits `baad46bc89ea` (probe), `a8c28fbcf962` (fix). Probes:
 `KORRA_TRACE_SAVE=1` (`src/host/save_probe.c`, chained onto
 `native32_post_hook`) and `debug.korra.trace_save=1`
 (`src/host_android/save_probe_android.c`); both print the call, its arguments,
@@ -3168,7 +3168,7 @@ build its file-size table and raised the boot notice
 Both reported symptoms - the save "not appearing" and the boot notice - are
 this one mis-resolution.
 
-**Fix (`481d2c5`, `src/host_android/fs_android.c`).** A path that already starts
+**Fix (`a8c28fbcf962`, `src/host_android/fs_android.c`).** A path that already starts
 with the host root is host-absolute: strip repeated copies of the root (a leaked
 path can arrive twice) and put exactly one back; never re-home it under the
 guest cwd. Drive paths (`C:\...`) and cwd-relative paths are unchanged.
@@ -3225,8 +3225,8 @@ Blocker #2 (post-cutscene SIGABRT / LOW_MEMORY) untouched, recorded only.
 ## 2026-11-22 - the post-cutscene death was a thread cap, not memory: 64 guest stacks of 4 MiB filled the 256 MiB region
 
 Device: Galaxy S24 (Exynos 2400, Xclipse 940, stock Vulkan), DXVK-native. Base
-HEAD `a8dc628`; commits `ee5af41` (probe: 1 Hz sampler, crash-buffer pull, route
-replay) and `db1d48c` (fix).
+HEAD `503f93653f85`; commits `6a2bd5877f93` (probe: 1 Hz sampler, crash-buffer pull, route
+replay) and `c4ba953bbbec` (fix).
 
 **The death, named.** Two tombstones - 12:58 (uptime 166 s) and 13:59 (uptime
 329 s) - end in the same five frames:
@@ -3280,7 +3280,7 @@ record (02:54:33, `rss=258MB`, `importance=400`) is a cached background process
 lmkd reclaimed, not this death. `android:largeHeap` would not have moved either
 number: the abort was a fixed capacity wall, not an allocation failure.
 
-**Fix (`db1d48c`, `memory_android.c` + `spine_android.c` + `kernel32_android.c`).**
+**Fix (`c4ba953bbbec`, `memory_android.c` + `spine_android.c` + `kernel32_android.c`).**
 Decision-table row: "abort in host malloc/allocator -> memory_android.c
 budget/limits; the sampler names the growth site" - the sampler named the site
 as the per-thread stack, and the growth as thread count, not bytes.

@@ -1,7 +1,7 @@
 /*
  * perf_probe.c - where the first area's 298 ms frame goes.
  *
- * The defect this exists for: build 470ab9e renders the menus at ~59 fps and
+ * The defect this exists for: build 03dfc01 renders the menus at ~59 fps and
  * the first playable area at a few fps (measured on the machine's overlay as
  * 3 fps / 298 ms). A one-second average cannot say *where* inside the frame the
  * time sits, so this probe reports per frame:
