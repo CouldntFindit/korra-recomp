@@ -3546,7 +3546,12 @@ never opened by itself (`logs/fresh_old3.png`). The space gate could not pass
 either: it asked `File.getUsableSpace()` on `files/game` before that directory
 existed, and the device answered **0 bytes** ("Not enough free space: 2.60 GB
 needed, 0 MB available", `logs/fresh_old2.png`). Validation also ran *after*
-the copy, so a `GameData`-only pick copied 2.7 GB and then threw.
+the copy, so a `GameData`-only pick copied 2.7 GB and then threw. One detail
+worth recording: the dev tree on the device carried an `install.complete`
+marker dated 2026-11-21 whose byte count matches a complete 820-file pass, and
+no pulled log documents that copy - the picker flow had been run at least once
+before this session without being written up, which is why the app had been
+booting without a picker.
 
 **The flow now** (`260a690`; Java only, the native hand-off is unchanged):
 
