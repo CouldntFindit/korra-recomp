@@ -888,6 +888,8 @@ static HRESULT __stdcall dev_CreateSourceVoice(xa2_device *self, void **pp, cons
             if (!xa2_readable(e, 0x38)) break;
             cfg = e[1];
             xa2_log("  entry %u: key=%08X%08X cfg=%08X", i, e[5], e[4], cfg);
+            /* The guest reads frames/depth from the cfg object; printing them
+             * while cfg == 0 would print garbage. */
             if (cfg && xa2_readable((const void *)(uintptr_t)cfg, 0x6C)) {
                 const UINT32 *c = (const UINT32 *)(uintptr_t)cfg;
                 xa2_log("    cfg: state=%08X frames=%u depth=%u", c[8],

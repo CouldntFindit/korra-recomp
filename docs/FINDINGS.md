@@ -3699,13 +3699,19 @@ so the level through the device's own 6x2 matrix matches.
    overwrote the file's start (a 138 s run produced a 192,044-byte file whose
    header claimed 138 s). Patched to seek back to the end. This is a
    hand-off-code defect, not an AAudio one.
-2. *A torn sample at a slice edge.* When the queue ran dry, the mixer clamped
-   `pos` backwards to `played` (the Windows code does this); with a live sink
-   that re-reads a buffer whose `OnBufferEnd` has already fired, and CRI is free
-   to refill it. Measured once: `voice 2 out of range: l=-20071.188` at
-   `pos=58064`, hearing a 3e4-magnitude float in the mix. The cursor is now
-   monotonic (`next_end = pos`, never backwards). A 70 s run that previously
-   hit the 11-13 s window is clean, and the one-shot probe stays in the shim.
+2. *Out-of-range samples at slice edges.* When the queue ran dry, the mixer
+   clamped `pos` backwards to `played` (the Windows code does this); with a live
+   sink that re-reads a buffer whose `OnBufferEnd` has already fired, and CRI is
+   free to refill it. Measured: `voice 2 out of range: l=-20071.188` at
+   `pos=58064`. The cursor is now monotonic (`next_end = pos`, never backwards),
+   and that window no longer reproduces - but **the fix is not the whole cause**:
+   the same probe still fires on the final build, twice in a 50 s run
+   (`l=-8.637` at 18.2 s and `l=-39504.168` at 24.9 s, `pos=5208`, `q=3`), always
+   on channel 0 of the 6 ch voice with the other channels near zero. Two
+   candidates remain and the probe cannot yet tell them apart: a torn refill of
+   the guest buffer we are reading, or the engine handing over an `AudioBytes`
+   region whose tail is not decoded PCM. One frame per ~25 s, inaudible in the
+   RMS (-21.6 dBFS around it) and a click at worst; recorded open.
 
 **Underruns are real and worse than Windows.** The engine submits 800-frame
 (16.7 ms) buffers with a 4-deep ring; the phone's guest loop runs at ~30 fps
@@ -3757,16 +3763,14 @@ probe added to `src/host/xaudio2_stub.c` reads the guest globals directly):
 [xa2] 539.5 sound table: count=1 entry0 key=0000000000000000 (from 0x007B25DC)
 ```
 
-and the key never changes through a 100 s run to the title. On the device the
-same table is the same shape but only its head was measured:
-`debug.korra.watchlog CA2438` logs `+00 = 2241C670`, `+04 = 00000001` written by
-`0x00829000` - one entry, allocated. The key itself sits in the array that
-pointer names, which the watch probe does not follow, so "key 0" is Windows'
-measurement; the device-side probe that reads it is built into the APK but the
-phone's USB link dropped before that build ran (see below). So the device is
-created at 0.0-0.4 s with the table inert by the Windows measurement, and its
-prefill is skipped; the game's own sound manager never activates the entry on
-any screen this build reaches.
+and the key never changes through a 100 s run to the title. **The device now
+measures the same thing**: with the probe in the Android shim,
+`debug.korra.xa2=2` prints `Hw sound table: ptr=2241C670 count=1` and
+`entry 0: key=0000000000000000 cfg=00000000` at `CreateSourceVoice`, i.e. count 1
+and an inactive entry, exactly as on Windows (the earlier watchlog had only
+proven the allocated head). So the device is created at 0.0-0.4 s with the table
+inert, and its prefill is skipped; the game's own sound manager never activates
+the entry on any screen this build reaches.
 
 **Why no host fix.** The prefill needs `frames per buffer` and `queue depth`
 from the entry's config object; inventing them would be inventing the mix
@@ -3778,13 +3782,12 @@ The device itself is correct and now answers everything it is asked.
 
 **Windows re-test after the shared-tree change.** `scripts/run_selftest.ps1`:
 60 passed, 0 failed. Acceptance re-run on the final binary
-(`build/run_m4e.exe`, 100 s, WASAPI shared): buffer 1056 frames (22.0 ms),
-first audible block 0.022 s, 3-22 s **peak -9.77 dBFS, RMS -27.27 dBFS**,
-1 underrun at the first feed and 4 by 20 s (the movie device teardown), 0 per
-minute in steady state, 0 `OnVoiceError`; the Wwise voice is still created,
-started and never fed. The only shared-tree changes are `aaudio_sink.c`
-(compiles to nothing on Windows) and two diagnostic probes in
-`xaudio2_stub.c`.
+(`build/run_m4e.exe`, 75 s, WASAPI shared): buffer 1056 frames (22.0 ms),
+first audible block 0.032 s, 3-22 s **peak -9.77 dBFS, RMS -27.16 dBFS**,
+2 underruns by 20 s (the first feed and the movie teardown), 0 per minute in
+steady state, 0 `OnVoiceError`; the Wwise voice is still created, started and
+never fed. The only shared-tree changes are `aaudio_sink.c` (compiles to
+nothing on Windows) and the sound-table probe in `xaudio2_stub.c`.
 
 **Not verified.** The intro cutscene on the device: the scripted New Game route
 ran to its cutscene screenshots but the taps did not leave the title (all
@@ -3792,5 +3795,6 @@ mean ~91, the title's own brightness) and the dump is silent after the boot
 movies, so the 5.1 path is proven on device only by the boot movie's 6 ch
 stream. Audio after the cutscene (no Wwise event is posted). The 44.1 kHz
 resampler path: the S24 hands back 48000 Hz, so the resampler compiled and
-stayed idle. Underruns under load (see above). The feed's caller and the
-sound-table activation are named, not fixed.
+stayed idle. Underruns under load (see above). The rare out-of-range samples
+(above: 2 in 50 s; the rewind fix removed one cause, not all). The feed's
+caller and the sound-table activation are named, not fixed.

@@ -644,12 +644,17 @@ static uint32_t dev_call(int slot) {
             uint32_t tbl = MEM32(0xCA2438), n = MEM32(0xCA243C), i;
             xv_log("Hw sound table: ptr=%08X count=%u", tbl, n);
             for (i = 0; i < n && i < 4; i++) {
-                uint32_t e = tbl + 0x38 * i;
+                uint32_t e = tbl + 0x38 * i, cfg;
                 if (!xv_readable(e, 0x38)) break;
-                xv_log("  entry %u: key=%08X%08X cfg=%08X state=%08X "
-                       "frames=%u depth=%u", i, MEM32(e + 0x14), MEM32(e + 0x10),
-                       MEM32(e + 0x04), MEM32(e + 0x24), MEM16(e + 0x48),
-                       MEM32(e + 0x6C));
+                cfg = MEM32(e + 0x04);
+                xv_log("  entry %u: key=%08X%08X cfg=%08X", i, MEM32(e + 0x14),
+                       MEM32(e + 0x10), cfg);
+                /* The guest reads frames/depth from the cfg object, not from the
+                 * entry; printing them while cfg == 0 would print garbage. */
+                if (cfg && xv_readable(cfg, 0x6C)) {
+                    xv_log("    cfg: state=%08X frames=%u depth=%u", MEM32(cfg + 0x20),
+                           MEM16(cfg + 0x44), MEM32(cfg + 0x68));
+                }
             }
         }
         break;

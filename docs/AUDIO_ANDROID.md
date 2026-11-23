@@ -210,6 +210,9 @@ an audio defect: the sink has nothing to play, which is why the title is quiet.
   `played` when the queue empties; with a live sink that re-reads a slice whose
   `OnBufferEnd` has already fired, and CRI is free to refill it. Measured as one
   torn float (`-20071`) at a slice edge. `next_end = pos`, never `pos = played`.
+  That fixed one cause, not the symptom: rare out-of-range samples still appear
+  (2 in a 50 s device run, channel 0 of the 6 ch voice) and the probe cannot yet
+  tell a torn refill from a partially decoded buffer. Keep the probe.
 * **A COM vtable's slot count is the ABI.** Each thunk must pop exactly
   `1 + params`; `GetState` in 2.7 is one argument. The Android shim's slots are
   the same 16/19/29 layout as the Windows one for this reason.

@@ -457,3 +457,11 @@ Append only; newest last. Format: date — attempt — outcome — next idea.
   AAUDIO_ERROR_INVALID_STATE`**, the sink closed itself and the run went silent
   with the mixer's clock fallback working fine. Read the `requestStart failed`
   line before blaming the device; the failure is loud and exact.
+- 2026-11-23 - "The monotonic cursor fixed the torn sample" - **half right.** The
+  rewind into a refilled CRI buffer was real and is gone, but the same
+  out-of-range probe still fires on the final build: 2 samples in a 50 s device
+  run (`l=-8.637` at 18.2 s, `l=-39504.168` at 24.9 s, always channel 0 of the
+  6 ch voice with the other channels near zero). Do not read "a clean run" as
+  "fixed": one 70 s run was clean and the next 50 s run was not. The probe stays
+  one-shot per voice; next step is to log the slice `[start,end)` and `i0` in the
+  same line to tell a torn refill from a partially decoded `AudioBytes` region.

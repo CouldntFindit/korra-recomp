@@ -902,7 +902,11 @@ Two defects in the hand-off code were found by measurement and fixed: the dump's
 header patch left the stream at offset 44 (so a long run kept only its last
 second), and the mixer's cursor was clamped backwards when the queue ran dry,
 re-reading a buffer CRI had already been told it could refill (one torn sample,
-`l=-20071`, at a slice edge). The cursor is monotonic now.
+`l=-20071`, at a slice edge). The cursor is monotonic now. **That was one cause,
+not all**: the same per-voice out-of-range probe still fires rarely on the final
+build (2 samples in a 50 s run, always channel 0 of the 6 ch voice), and the
+probe cannot yet separate a torn guest refill from a partially decoded
+`AudioBytes` region - recorded open, inaudible in the RMS.
 
 ### 10.9 The Wwise break, named (2026-11-23)
 
