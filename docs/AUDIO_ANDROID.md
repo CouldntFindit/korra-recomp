@@ -4,10 +4,12 @@ Written by the M4 (Windows audio) session on 2026-11-21 as a hand-off. **It was
 picked up on 2026-11-23 and is now integrated and measured on the device**: the
 Android XAudio2 shim exists (`src/host_android/xaudio2_android.c`), the AAudio
 sink runs, and the CRI movie audio is audible with the numbers in §6. The Wwise
-voice is still never fed - the break is in the game's own sound-table
-activation, named in `docs/audio.md` §10.9 and `docs/FINDINGS.md` (2026-11-23),
-not in this contract. Sections 1-7 are kept as written: the contract did not
-change, and each pitfall below cost exactly what it says.
+voice is now fed as well: the missing piece was the **voice callback** the shim
+never invoked (the engine's `OnVoiceProcessingPassStart` is the feed and
+`OnBufferEnd` credits the mixer), fixed with an XAudio2-style worker thread and
+measured as continuous menu music - see `docs/audio.md` §10.9. Sections 1-7 are
+kept as written: the contract did not change, and each pitfall below cost
+exactly what it says.
 
 Read `docs/audio.md` section 9 first: it is the reason the host provides a sink
 at all. The engine (Wwise, inside the lifted C) decodes and mixes; the host only
@@ -175,11 +177,19 @@ first 26 s, because the guest's ~30 fps feed cannot keep a 22 ms buffer fed
 (the 1056-frame setting was measured too and did not remove them). Tests 2-6
 remain blocked by the Wwise feed, whose break is now named (see below).
 
-Tests 2-6 need a posted Wwise event. On Windows those are **not reachable
-today**: the game never posts one on any screen it can reach, and the
-title-to-menu transition dies upstream of audio (see `docs/FINDINGS.md`,
-2026-11-21, frame-pass-queue fault). Treat that as a separate blocker, not as
-an audio defect: the sink has nothing to play, which is why the title is quiet.
+Tests 2-6 need a posted Wwise event. The title/menu now prove that events were
+posted and mixed all along: the voice was never *queued* because the shim did
+not invoke the engine's `IXAudio2VoiceCallback`. With the callback worker in
+`xaudio2_android.c` (see `docs/audio.md` §10.9) the Hw voice is fed from
+152-418 ms and the 360 s route's dump has continuous menu music from 73 s to
+the New Game at 322 s (peak -7.5..0 dBFS, RMS -30..-35 dBFS), then the loading
+transition at RMS -17..-25 dBFS. The 5.1 cutscene remains unmeasured on the
+device (the route had 10 s left when it reached the New Game, and no new CRI
+6 ch voice is created on that path). The Windows oracle is still unfed: its
+shim has the same missing invocation. The sink's float meter also reports
+`peak=186.6 dBFS rms=nan` in one run once the Wwise mix plays (the boot movies
+are clean), and the dump clips 0.2-0.3 % of samples - a new, open break in the
+mix data (NaN/Inf is invisible to the `|x| > 2` probe).
 
 ## 7. Pitfalls, all learned the hard way
 

@@ -465,3 +465,35 @@ Append only; newest last. Format: date — attempt — outcome — next idea.
   "fixed": one 70 s run was clean and the next 50 s run was not. The probe stays
   one-shot per voice; next step is to log the slice `[start,end)` and `i0` in the
   same line to tell a torn refill from a partially decoded `AudioBytes` region.
+- 2026-11-23 - "Wwise is silent because its prefill is skipped / the sound-table
+  entry is inert" - **wrong in both halves, and the fix was elsewhere.** The
+  prefill at `0x0088B2E2` jumps *to* its body when the 64-bit key is **zero**
+  (`or eax,[ecx+4]; je 0x88B2F3`), so key 0 is the selector for the default
+  output device, not an "inactive" marker; and entry+4 (cfg) is stored by
+  `0x8727F0` *after* the device's Init returns (`0x872815`), so the probe at
+  `CreateSourceVoice` must see cfg=0. Measured from `CommitChanges` the entry is
+  live (`cfg=2241C6C0 state=1 ring=4 depth=4`; cfg is the Hw device). The feed
+  `0x0088B440` is the engine's `IXAudio2VoiceCallback` slot 0
+  (`OnVoiceProcessingPassStart`), registered at `CreateSourceVoice` as
+  `device+0x28` (vtable `0x0091ECC8`); slot 4 (`0x0088B3F0`) decrements the
+  credit counter and wakes the mixer. The shim never invoked either, so the
+  voice stayed unqueued. Check the callback registration before blaming a data
+  table: `debug.korra.icall=88B440` counted zero calls while the mixer had four
+  buffers ready.
+- 2026-11-23 - Sampling the Wwise feed's `OnVoiceProcessingPassStart` at a fixed
+  100 Hz without a credit guard - **8,669,699 submits in 90 s**, an 843 MB log
+  and frame times of 1.76 s (1.7 s waiting for the machine lock). The guest loop
+  is `while (credits - BuffersQueued != 0) submit` and re-reads `credits` every
+  iteration; if the host calls it when `credits < queued`, the local counter
+  can never reach the target and runs until the 32-bit counter wraps. The host
+  must hold the machine lock across its decision and call the feed only when
+  `credits > queued` by at most the ring depth (8). With that guard the credits
+  oscillate 4<->3 and the feed is stable. Delivering `OnBufferEnd` from the sink
+  callback is not allowed either: count retirements there and call the guest
+  from the worker thread.
+- 2026-11-23 - "The Wwise voice plays cleanly now" - **the sink says otherwise.**
+  Once the Hw voice is fed, its float meter reports `peak=47.3 dBFS` in one run
+  and `peak=186.6 dBFS rms=nan` in another, and the 16-bit dump clips 0.23 % of
+  the menu samples (boot movies before it are clean). The one-shot probe only
+  checks `|x| > 2`, so NaN/Inf passes silently. Next: log the slice
+  `[start,end)` and `i0` with the value and classify non-finite samples.

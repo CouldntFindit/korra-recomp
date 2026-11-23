@@ -90,6 +90,8 @@ typedef struct {
     uint32_t last_ctx;
     uint32_t cb;           /* guest IXAudio2VoiceCallback VA or 0 */
     uint32_t cb_kind;      /* 0 none, 1 CRI counter, 2 other */
+    uint32_t cb_retired;   /* buffers retired since the callback thread last ran */
+    uint32_t overflow_logged, cb_logs;
     uint32_t submits, gs_calls, last_logged_q;
     int had_data, dry, oor_warned;
     uint32_t matrix_ch;
@@ -154,6 +156,40 @@ static int xv_readable(uint32_t va, uint32_t bytes) {
     if (va >= KA_IMAGE_BASE && end <= KA_IMAGE_BASE + ka_pe_span()) return 1;
     if (va >= XV_STACK_LO && end <= XV_STACK_HI) return 1;
     return 0;
+}
+
+/* ------------------------------------------------ the game's sound table
+ * The Hw output device (0x0088B0C0) reads [0xCA243C]/[0xCA2438] once, while
+ * it is being constructed. Its prefill takes the first entry whose 64-bit key
+ * at +0x10 is zero -- the key is a selector, not an "active" flag -- and then
+ * needs that entry's cfg pointer (+0x04) to be a live output device: the
+ * base constructor 0x879260 writes the tag 1 at cfg+0x20, and the prefill
+ * copies cfg+0x44/+0x68 into its own ring bookkeeping. Sampling the table
+ * after creation says whether the entry ever gets its cfg, and the call site
+ * that stores it. */
+static void xv_table_sample(const char *why) {
+    static uint32_t last_cfg, last_key_lo, last_key_hi, calls;
+    uint32_t tbl, n, cfg = 0, key_lo = 0, key_hi = 0, state = 0, ring = 0, depth = 0;
+    if (g_verbose < 2) return;
+    tbl = MEM32(0xCA2438);
+    n = MEM32(0xCA243C);
+    if (n && tbl && xv_readable(tbl, 0x38)) {
+        uint32_t e = tbl;
+        key_lo = MEM32(e + 0x10);
+        key_hi = MEM32(e + 0x14);
+        cfg = MEM32(e + 0x04);
+        if (cfg && xv_readable(cfg, 0x6C)) {
+            state = MEM32(cfg + 0x20);
+            ring = MEM16(cfg + 0x44);
+            depth = MEM32(cfg + 0x68);
+        }
+    }
+    calls++;
+    if (calls != 1 && cfg == last_cfg && key_lo == last_key_lo && key_hi == last_key_hi)
+        return;
+    last_cfg = cfg; last_key_lo = key_lo; last_key_hi = key_hi;
+    xv_log("[table] %s: count=%u e0 key=%08X%08X cfg=%08X state=%u ring=%u depth=%u (from=0x%08X)",
+           why, n, key_hi, key_lo, cfg, state, ring, depth, g_cur_func);
 }
 
 static float xv_f(uint32_t bits) {
@@ -238,6 +274,15 @@ static uint64_t xv_voice_cursor(xv_voice *v) {
  * on the counter it passes in pBufferContext, and only OnBufferEnd moves it.
  * Called on whichever thread consumed the buffer (the sink's, usually). */
 static void xv_dispatch_buffer_end(xv_voice *v, uint32_t ctx) {
+    if (v->cb_kind == 2) {
+        /* The Hw output device's callback object: OnBufferEnd is 0x0088B3F0,
+         * which credits one more buffer and wakes the engine's mixer. It runs
+         * on the callback thread, never here (the sink callback must not take
+         * the machine lock). The feed submits these buffers with pContext = 0,
+         * so the credit cannot be conditioned on ctx. */
+        __atomic_add_fetch(&v->cb_retired, 1u, __ATOMIC_RELAXED);
+        return;
+    }
     if (!ctx) return;
     if (v->cb_kind == 1) {
         if (xv_readable(ctx, 4)) {
@@ -247,8 +292,97 @@ static void xv_dispatch_buffer_end(xv_voice *v, uint32_t ctx) {
         }
         return;
     }
-    if (v->cb_kind == 2 && g_verbose) {
-        v->cb_kind = 2;   /* warn once per voice, see CreateSourceVoice */
+}
+
+/* --------------------------------------------- the XAudio2 callback thread
+ * XAudio2 2.7 invokes IXAudio2VoiceCallback on its own worker thread. The
+ * engine's Hw output device registers the object at device+0x28 as its voice
+ * callback: slot 0 (OnVoiceProcessingPassStart) is the feed 0x0088B440 that
+ * tops the source voice up from the device's 8-slot ring, and slot 4
+ * (OnBufferEnd) is 0x0088B3F0, which credits one more buffer and wakes the
+ * mixer. Before this thread existed the shim only performed CRI's counter in
+ * C, so the Hw voice was never queued (measured: the mixer had produced four
+ * buffers; the voice had zero) - the feed is the caller 0x0088B440 was
+ * waiting for.
+ *
+ * The shipped bodies are plain __stdcall with `this` as the first stack
+ * argument (slots 0 and 4 both end in `ret 8`), which hle_call_guest
+ * reproduces exactly. The thread is the host twin of XAudio2's worker: it
+ * never holds the mixer lock while entering guest code, and it reports buffer
+ * ends the sink retired rather than calling from the sink callback. */
+#define XV_CB_PERIOD_NS 10000000ull
+
+static pthread_t g_cb_thread;
+static int g_cb_thread_started, g_cb_stop;
+
+static void xv_call_slot(uint32_t cb, uint32_t slot, uint32_t arg) {
+    uint32_t vt, fn, args[2];
+    if (!xv_readable(cb, 4)) return;
+    vt = MEM32(cb);
+    if (!vt || !xv_readable(vt + slot * 4, 4)) return;
+    fn = MEM32(vt + slot * 4);
+    if (!fn) return;
+    args[0] = cb;
+    args[1] = arg;
+    hle_call_guest(fn, 2, args);
+}
+
+static void *xv_cb_thread_main(void *arg) {
+    (void)arg;
+    if (!ka_thread_attach("xa2-callback")) {
+        ka_log("[xa2] callback thread: no guest stack/TIB; the Hw voice stays unfed");
+        return NULL;
+    }
+    while (!g_cb_stop) {
+        struct timespec ts = { 0, (long)XV_CB_PERIOD_NS };
+        int i;
+        xv_lock();
+        for (i = 0; i < XV_MAX_VOICES; i++) {
+            xv_voice *v = &g_v[i];
+            uint32_t cb, n, credits = 0, qc = 0;
+            int log;
+            if (v->magic != XV_MAGIC || v->cb_kind != 2 || !v->cb) continue;
+            cb = v->cb;
+            n = __atomic_exchange_n(&v->cb_retired, 0u, __ATOMIC_RELAXED);
+            if (n > 8) n = 8;                     /* ring depth; a tick cannot owe more */
+            qc = v->qcount;
+            if (xv_readable(cb + 0x40, 4)) credits = MEM32(cb + 0x40);
+            log = v->cb_logs < 12;
+            if (log) v->cb_logs++;
+            xv_unlock();
+            /* The guest's loop re-reads the credit counter on every iteration
+             * (`while (credits - BuffersQueued != 0) submit`), so a credit
+             * that falls while it runs never converges: measured as 8.6M
+             * dropped submits in 90 s. Hold the machine lock across the
+             * decision and the call, so nothing can decrement credits between
+             * them, and never ask for more than the ring can hold. */
+            mach_enter();
+            if (log)
+                xv_log("cb tick(%d): credits=%u qcount=%u end=%u",
+                       (int)(v - g_v), credits, qc, n);
+            while (n--) xv_call_slot(cb, 4, 0);   /* OnBufferEnd */
+            xv_lock();
+            qc = v->qcount;
+            credits = xv_readable(cb + 0x40, 4) ? MEM32(cb + 0x40) : 0;
+            xv_unlock();
+            if (credits > qc && credits - qc <= XV_QUEUE_MAX)
+                xv_call_slot(cb, 0, 0);           /* OnVoiceProcessingPassStart */
+            mach_leave();
+            xv_lock();
+        }
+        xv_unlock();
+        nanosleep(&ts, NULL);
+    }
+    ka_thread_detach();
+    return NULL;
+}
+
+static void xv_cb_ensure_thread(void) {
+    if (g_cb_thread_started) return;
+    g_cb_thread_started = 1;
+    if (pthread_create(&g_cb_thread, NULL, xv_cb_thread_main, NULL) != 0) {
+        g_cb_thread_started = 0;
+        ka_log("[xa2] callback thread: pthread_create failed");
     }
 }
 
@@ -627,6 +761,7 @@ static uint32_t dev_call(int slot) {
         }
         MEM32(out) = obj;
         xv_unlock();
+        if (v->cb_kind == 2) xv_cb_ensure_thread();
         if (g_verbose)
             xv_log("CreateSourceVoice(%u ch, %u Hz, %u bits %s, tag 0x%04X, mask 0x%X, "
                    "maxratio %.3f) -> #%d (cb=%08X %s)",
@@ -636,27 +771,10 @@ static uint32_t dev_call(int slot) {
                    v->cb_kind == 1 ? "CRI counter" : v->cb_kind == 2 ? "other" : "none");
         /* The Hw output device copies its prefill parameters out of the game's
          * sound table at creation (0x0088B2CD reads [0xCA243C], walks entries
-         * comparing the 64-bit key at +0x10). If no entry is active yet, the
-         * prefill is skipped and the device's top-up target stays 0, which
-         * makes its feed a permanent no-op. This reads that table at the one
-         * moment it matters, so the break is measured rather than inferred. */
-        if (mask == 3 && g_verbose >= 2) {
-            uint32_t tbl = MEM32(0xCA2438), n = MEM32(0xCA243C), i;
-            xv_log("Hw sound table: ptr=%08X count=%u", tbl, n);
-            for (i = 0; i < n && i < 4; i++) {
-                uint32_t e = tbl + 0x38 * i, cfg;
-                if (!xv_readable(e, 0x38)) break;
-                cfg = MEM32(e + 0x04);
-                xv_log("  entry %u: key=%08X%08X cfg=%08X", i, MEM32(e + 0x14),
-                       MEM32(e + 0x10), cfg);
-                /* The guest reads frames/depth from the cfg object, not from the
-                 * entry; printing them while cfg == 0 would print garbage. */
-                if (cfg && xv_readable(cfg, 0x6C)) {
-                    xv_log("    cfg: state=%08X frames=%u depth=%u", MEM32(cfg + 0x20),
-                           MEM16(cfg + 0x44), MEM32(cfg + 0x68));
-                }
-            }
-        }
+         * and takes the first zero key). Read it here -- during the device's
+         * own Init -- and again from CommitChanges, where the cfg store that
+         * follows Init becomes visible. */
+        if (mask == 3) xv_table_sample("voice-create");
         break;
     }
     case 9: {   /* CreateSubmixVoice(this, pp, in_ch, rate, flags, stage, sends, chain) */
@@ -712,6 +830,7 @@ static uint32_t dev_call(int slot) {
         xv_lock();
         xv_pump_all();
         xv_unlock();
+        xv_table_sample("commit");
         if (g_verbose > 1) xv_log("CommitChanges(0x%X) from 0x%08X", opset, g_cur_func);
         break;
     }
@@ -917,7 +1036,14 @@ static uint32_t src_call(int slot) {
         if (v->qcount == XV_QUEUE_MAX) {
             v->qhead = (v->qhead + 1) % XV_QUEUE_MAX;
             v->qcount--;
-            if (g_verbose) xv_log("SubmitSourceBuffer: queue overflow, dropped one");
+            if (g_verbose && !v->overflow_logged) {
+                uint32_t credits = (v->cb && xv_readable(v->cb + 0x40, 4))
+                                       ? MEM32(v->cb + 0x40) : 0;
+                v->overflow_logged = 1;
+                xv_log("SubmitSourceBuffer(%d): queue full (credits=%u qcount=%u "
+                       "pos=%.0f) - dropping oldest", (int)(v - g_v), credits,
+                       v->qcount, v->pos);
+            }
         }
         cursor = xv_voice_cursor(v);
         start = v->next_end > cursor ? v->next_end : cursor;
@@ -989,7 +1115,7 @@ static uint32_t src_call(int slot) {
          * engine polls it 60 times a second or not at all. */
         if (g_verbose >= 2) {
             v->gs_calls++;
-            if (v->gs_calls == 1 || v->gs_calls % 600 == 0)
+            if (v->gs_calls <= 12 || v->gs_calls % 600 == 0)
                 xv_log("GetState(%d): poll #%u queued=%u played=%llu from 0x%08X",
                        (int)(v - g_v), v->gs_calls, v->qcount,
                        (unsigned long long)now, g_cur_func);
@@ -1109,6 +1235,7 @@ uint32_t ka_xaudio2_create_instance(uint32_t riid, uint32_t out) {
 
 void ka_xaudio2_shutdown(void) {
     int i;
+    g_cb_stop = 1;
     xv_lock();
     for (i = 0; i < XV_MAX_VOICES; i++)
         if (g_v[i].magic == XV_MAGIC) xv_kill_voice(&g_v[i]);

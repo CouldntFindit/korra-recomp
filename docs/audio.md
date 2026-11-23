@@ -908,40 +908,68 @@ build (2 samples in a 50 s run, always channel 0 of the 6 ch voice), and the
 probe cannot yet separate a torn guest refill from a partially decoded
 `AudioBytes` region - recorded open, inaudible in the RMS.
 
-### 10.9 The Wwise break, named (2026-11-23)
+### 10.9 The Wwise voice: the callback the host never invoked (2026-11-23, corrected)
 
-The Hw output device (`0x0088B000`, vtable `0x0091EC80`, embedded output
-interface at `+0x28` with vtable `0x0091ECC8`) creates and starts its 2 ch float
-voice correctly, and its feed function `FUN_0088B440` is complete: `GetState`
-(slot `0x64`), then while `[this+0x40] != BuffersQueued` submit
-`[this+0x44] << 10` bytes from an 8-slot ring through slot `0x54`. Nothing ever
-calls it, and the init is why.
+The Hw output device (`0x0088B000`, vtable `0x0091EC80`) creates and starts its
+2 ch float voice correctly, and its feed function `FUN_0088B440` is complete:
+`GetState` (slot `0x64`), then while `credits - BuffersQueued != 0` submit
+`[this+0x44] << 10` bytes from an 8-slot ring through slot `0x54`. **Nothing
+called it because the host shim never invoked the voice callback.** The earlier
+"inert sound table" reading was wrong in two ways:
 
-After `SetVolume`, `0x0088B0C0` prefills the ring only if the game's sound table
-has an **active** entry:
+* `0x0088B2E2` computes the 64-bit key and jumps **to** the prefill when it is
+  zero (`je 0x88B2F3`), so key 0 is the selector for the default output device,
+  not an "active" flag.
+* Entry+4 (cfg) is stored by the insert path *after* the device's Init returns
+  (`0x872815`), so a probe inside `CreateSourceVoice` necessarily sees cfg=0.
+  Measured from `CommitChanges`, the entry is live: `count=1 key=0
+  cfg=2241C6C0 state=1 ring=4 depth=4` - cfg is the device, and the engine's
+  mixer has already produced four 1024-frame buffers.
 
-```
-0x0088B2CD  edi = [0xCA243C]         ; count
-0x0088B2D7  je 0x88B33D              ; 0 -> skip the prefill
-0x0088B2E2  eax = [entry+0x10] | [entry+0x14]   ; 64-bit key
-0x0088B2E7  je  ...next / skip       ; key 0 -> not active
-0x0088B314  [device+0x44] = word[[entry+4]+0x44]  ; frames per buffer
-0x0088B31B  [device+0x68] = [[entry+4]+0x68]      ; queue depth (= feed target)
-0x0088B330  call 0x88B720 x N        ; submit N buffers
-```
+The callback the device registers at `CreateSourceVoice` is
+`pCallback = device+0x28`, vtable `0x0091ECC8`:
 
-With the prefill skipped, `device+0x68` (the feed's `[this+0x40]`) stays 0 and
-the feed's condition is `0 != 0` forever. Measured on Windows (the probe reads
-`0xCA2438`/`0xCA243C` from the shim): **count 1, entry 0 key 0, cfg 0** at
-device creation and for the whole 100 s run. On the device the table's head is
-the same (`debug.korra.watchlog CA2438`: `+04 = 1`, written by `0x00829000`);
-the entry's key is one indirection further and that build never ran (the USB
-link dropped), so the key measurement is Windows'. The entry is allocated but
-never activated, so this is not a host refusal and not a sink defect.
+| slot | method | guest body | effect |
+|---|---|---|---|
+| 0 | `OnVoiceProcessingPassStart` | `0x0088B440` | top up: submit `credits - BuffersQueued` ring buffers |
+| 4 | `OnBufferEnd` | `0x0088B3F0` | `InterlockedDecrement(device+0x68)`, `SetEvent` to wake the mixer |
+| 1/2 | pass-end / stream-end | `0x401D90` | `ret 4` |
+| 3/5 | buffer-start / loop-end | `0x4F5A70` | `ret 8` |
+| 6 | voice-error | `0x411330` | `ret 0xC` |
 
-No host fix is legitimate: the prefill needs the entry's own frame size and
-queue depth. The next lead is the layer that activates the entry (the feed's
-caller lives there too), not the device.
+Every shipped body takes `this` as its **first stack argument** (slots 0 and 4
+both `ret 8`), matching the host shim's COM model. The Android shim only
+performed CRI's counter in C and logged all other callbacks as "other", so the
+Hw voice was never queued: `debug.korra.icall=88B440` counted **zero** feed
+entries over a 255 s route run while the mixer held four buffers.
+
+**Fix (Android, `src/host_android/xaudio2_android.c`).** A worker thread now
+calls slot 4 once per buffer the sink retired (counted on the sink thread,
+delivered here, never from the sink callback) and slot 0 only when
+`device+0x68 > BuffersQueued` and the difference fits the ring. The guard is
+load-bearing: the guest loop re-reads the credit counter every iteration, so a
+tick with `credits < queued` makes it submit until the counter wraps. Measured
+without the guard: 8,669,699 submits in 90 s, 843 MB of log and 1.76 s frames
+with 1.7 s waiting on the machine lock; with it: credits 4<->3, `qcount` 2..4,
+no queue-full events.
+
+**Measured after the fix (S24, 360 s route).** Hw voice fed from 152-418 ms
+(`GetState`/`SubmitSourceBuffer` from `0x0088B440`; first buffer 8192 bytes =
+1024 stereo float frames). The dump has continuous music from 73 s to the New
+Game at 322 s (peak -7.5..0 dBFS, RMS -30..-35 dBFS) and through the
+loading/cutscene transition (322-359 s, RMS -17..-25 dBFS). AAudio xruns 13
+(all early), mixer-dry 259/359 s.
+
+**New, open: NaNs/huge floats in the Wwise mix.** The sink's float meter
+reports `peak=47.3 dBFS` in one run and `peak=186.6 dBFS rms=nan` in another as
+soon as the Hw voice plays (the boot movies before it are clean at -14.7/-11.9
+dBFS). The dump clips 0.23 % of samples in the menu and 0.34 % during the
+loading transition. The one-shot mixer probe (`|x| > 2`) logs only two modest
+values because NaN comparisons are false. Next step: log the slice
+`[start,end)` and `i0` with the value and classify NaN/Inf, then decide whether
+it is a torn guest refill or an `AudioBytes` region that is not decoded PCM.
+The Windows shim still lacks the callback invocation, so the oracle remains
+unfed; that divergence is recorded.
 
 ---
 

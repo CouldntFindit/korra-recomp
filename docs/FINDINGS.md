@@ -3798,3 +3798,97 @@ resampler path: the S24 hands back 48000 Hz, so the resampler compiled and
 stayed idle. Underruns under load (see above). The rare out-of-range samples
 (above: 2 in 50 s; the rewind fix removed one cause, not all). The feed's
 caller and the sound-table activation are named, not fixed.
+
+## 2026-11-23 - M4 activation: the Wwise feed was always there; the host never invoked the voice callback
+
+The Wwise 2 ch float voice now plays. The break was not the game's sound table:
+the table was live, and the feed the previous session looked for is the engine's
+`IXAudio2VoiceCallback`, which the Android shim never invoked. Input is not
+regressed; the earlier "the taps did not leave the title" run did not reproduce.
+
+**Input, on the current audio build.** Two OCR route runs on the same APK
+(`scripts\android_route_drive.ps1`, `debug.korra.memtrace=1`) walk
+attract -> auto-save notice -> pad notice -> main menu -> Story -> New Game ->
+confirm -> loading -> tutorial HUD, first at 201 s and again at 212 s; held taps
+and 1.4 s stick swipes advance every menu. The 19:19 screenshots that motivated
+the regression check are all the attract screen and no route log from that run
+survives, so the earlier reading is not reproducible on this build. The route
+does stall on the Story submenu in some runs (OCR reads "Continue" as
+"Cpntinue"); that is the known driver weakness, not input.
+
+**The sound table is not inert.** `0x0088B2E2` builds the 64-bit key and
+`je 0x88B2F3` when it is **zero**, so key 0 is the *selector* for the default
+output device, not an "inactive" marker. The cfg pointer at entry+4 is stored
+by the insert path after the device's Init returns (`0x872815`), so a probe
+taken inside `CreateSourceVoice` must see cfg=0. Sampling from `CommitChanges`
+shows the live entry:
+
+```
+[table] voice-create: count=1 e0 key=0000000000000000 cfg=00000000 state=0 ring=0 depth=0
+[table] commit:       count=1 e0 key=0000000000000000 cfg=2241C6C0 state=1 ring=4 depth=4
+```
+
+`cfg` is the Hw device; `state=1` is the base-constructor tag from `0x879260`;
+`ring=4 depth=4` is the engine's mixer having produced four 1024-frame buffers.
+Nothing in the table gates the feed.
+
+**The break: the voice callback.** `0x88B2A8` calls `CreateSourceVoice` with
+`pCallback = device+0x28` (vtable `0x0091ECC8`). That object is the game's
+`IXAudio2VoiceCallback`, and its slots are the missing call path:
+
+| slot | method | guest body | what it does |
+|---|---|---|---|
+| 0 | `OnVoiceProcessingPassStart` | `0x0088B440` | `GetState`, then submit `[device+0x68] - BuffersQueued` buffers from the 8-slot ring |
+| 4 | `OnBufferEnd` | `0x0088B3F0` | `InterlockedDecrement(device+0x68)` and `SetEvent` to wake the mixer |
+| 1/2 | pass-end / stream-end | `0x401D90` | `ret 4` |
+| 3/5 | buffer-start / loop-end | `0x4F5A70` | `ret 8` |
+| 6 | voice-error | `0x411330` | `ret 0xC` |
+
+Every shipped body takes `this` as its **first stack argument** (slot 0 and
+slot 4 both end in `ret 8`), which is exactly the host shim's COM model. The
+shim only performed CRI's completion counter in C and logged every other
+callback as "other", so the Hw voice's callback was never called:
+`debug.korra.icall=88B440` recorded **zero** feed calls over a 255 s route run
+while the mixer held four buffers and the voice had `BuffersQueued=0`.
+
+**The fix (`src/host_android/xaudio2_android.c`).** An XAudio2-style worker
+thread now calls the callback object: slot 4 once per buffer the sink retired
+(counted by the mixer, never called from the sink callback), and slot 0 only
+when the engine's credit counter at `device+0x68` is ahead of the voice's queue
+and by no more than the ring depth. The guard is load-bearing: the guest loop
+re-reads the counter on every iteration (`while (credits - BuffersQueued != 0)
+submit`), so when the host samples faster than the mixer refills, one tick with
+`credits < queued` makes the loop run until the counter wraps. Measured without
+it: **8,669,699** submitted buffers in 90 s, 843 MB of log, and frame times of
+1.76 s with 1.7 s waiting for the machine lock. With it: credits oscillate 4<->3,
+`qcount` 2..4, zero queue-full events, and the feed's back-edge yields stop.
+
+**Measured after the fix (S24, stock driver, 360 s route, `debug.korra.audio.dump=1`,
+`debug.korra.xa2=2`).** The Hw voice is fed from 152-418 ms:
+`GetState(1): poll #1 ... from 0x0088B440`, then `SubmitSourceBuffer(1): first
+buffer 8192 bytes, 1024 frames (48000 Hz, 2 ch, float)`; the dump has continuous
+menu/title audio from 73 s to the New Game at 322 s (peak -7.5..0 dBFS,
+RMS -30..-35 dBFS) and continues through the loading/cutscene transition
+(322-359 s, RMS -17..-25 dBFS). The 5.1 path is still the boot movie's 6 ch
+stream: no new CRI voice is created at the in-engine intro. AAudio xruns 13 (all
+early), mixer-dry 259 in 359 s.
+
+**New break exposed by the fix: the Wwise mix contains NaNs/huge floats.** The
+sink's own meter (float, before the 16-bit dump) reports `peak=47.3 dBFS` in one
+run and `peak=186.6 dBFS rms=nan` in another once the Hw voice plays; the boot
+movies before it are clean (-14.7/-11.9 dBFS). The 16-bit dump therefore clips
+0.23 % of samples in 73-250 s (longest run 1442 samples) and 0.34 % in
+322-359 s. The one-shot mixer probe (`fabsf > 2.0`) caught only two modest
+values (`-6.7` on the 6 ch voice at 16.7 s, `-2.6` on the Hw voice at 44.3 s)
+because a NaN comparison is false. This is the "partially decoded/overwritten
+`AudioBytes`" half of the old out-of-range question, now with a large signal;
+the next step is to log the slice `[start,end)` and `i0` with the value, and
+classify NaN/Inf in the probe. The Windows shim has the same missing callback
+(it is unfed too); that divergence is recorded, not closed.
+
+**Not verified.** The in-engine intro cutscene was reached only at 322 s, with
+10 s left before the run ended, so its 5.1/6 ch measurement is not taken; no CRI
+6 ch voice is created on that path (the old "cutscene = CRI movie" reading holds
+only for the boot movies). The 44.1 kHz resampler is still idle. The NaN source
+is named only by the sink meter; no slice-level evidence yet. Windows acceptance
+was not re-run: no `src/host/` file changed.
