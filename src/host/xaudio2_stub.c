@@ -872,6 +872,29 @@ static HRESULT __stdcall dev_CreateSourceVoice(xa2_device *self, void **pp, cons
                 fmt->wFormatTag, v->channel_mask, max_ratio, (int)(v - g_voices), cb,
                 v->cb_kind == XA2_CB_CRI_COUNTER ? "CRI counter" :
                 v->cb_kind == XA2_CB_OTHER ? "other" : "none");
+    /* The Hw output device copies its prefill parameters out of the game's
+     * sound table at creation (0x0088B2CD reads [0xCA243C], walks 0x38-byte
+     * entries comparing the 64-bit key at +0x10; 0x0088B2FF/0x0088B30E skip
+     * the prefill when no entry is active). This reads that table at the one
+     * moment it matters, so the break is measured rather than inferred. The
+     * guest runs in this process on the Windows host, so the addresses are
+     * directly dereferenceable. */
+    if (v->channel_mask == 3 && g_verbose >= 2 && xa2_readable((void *)0xCA2438, 8)) {
+        UINT32 tbl = *(const UINT32 *)0xCA2438, n = *(const UINT32 *)0xCA243C, i;
+        xa2_log("Hw sound table: ptr=%08X count=%u", tbl, n);
+        for (i = 0; i < n && i < 4; i++) {
+            const UINT32 *e = (const UINT32 *)(uintptr_t)(tbl + 0x38 * i);
+            UINT32 cfg;
+            if (!xa2_readable(e, 0x38)) break;
+            cfg = e[1];
+            xa2_log("  entry %u: key=%08X%08X cfg=%08X", i, e[5], e[4], cfg);
+            if (cfg && xa2_readable((const void *)(uintptr_t)cfg, 0x6C)) {
+                const UINT32 *c = (const UINT32 *)(uintptr_t)cfg;
+                xa2_log("    cfg: state=%08X frames=%u depth=%u", c[8],
+                        ((const UINT16 *)c)[0x22], c[0x1A]);
+            }
+        }
+    }
     return XA2_HR_OK;
 }
 
@@ -893,6 +916,27 @@ static HRESULT __stdcall dev_CommitChanges(xa2_device *self, UINT32 opset) {
     xa2_lock();
     xa2_pump_all();
     xa2_unlock();
+    /* Does the game's sound table ever get an active entry? The Hw output
+     * device needs one at creation to prefill (0x0088B2CD), and it is created
+     * at boot with the table empty. Sample entry 0's 64-bit key on the engine's
+     * own 50 Hz commit cadence and log every change. */
+    if (g_verbose >= 2) {
+        static UINT32 last_lo = 1u, last_hi = 1u;
+        UINT32 tbl = 0, n = 0, lo = 0, hi = 0;
+        if (xa2_readable((const void *)0xCA2438, 8)) {
+            tbl = *(const UINT32 *)0xCA2438;
+            n = *(const UINT32 *)0xCA243C;
+        }
+        if (n && tbl && xa2_readable((const void *)(uintptr_t)(tbl + 0x10), 8)) {
+            lo = *(const UINT32 *)(uintptr_t)(tbl + 0x10);
+            hi = *(const UINT32 *)(uintptr_t)(tbl + 0x14);
+        }
+        if (lo != last_lo || hi != last_hi) {
+            last_lo = lo; last_hi = hi;
+            xa2_log("sound table: count=%u entry0 key=%08X%08X (from 0x%08X)",
+                    n, hi, lo, g_cur_func);
+        }
+    }
     if (g_verbose > 1) xa2_log("CommitChanges(0x%X) -> 0 (from 0x%08X)", opset, g_cur_func);
     return XA2_HR_OK;
 }
