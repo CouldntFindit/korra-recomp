@@ -3773,12 +3773,14 @@ the feed's caller also lives (no code path calls `FUN_0088B440` in these runs).
 The device itself is correct and now answers everything it is asked.
 
 **Windows re-test after the shared-tree change.** `scripts/run_selftest.ps1`:
-60 passed, 0 failed. Acceptance re-run (`build/run_m4e.exe`, 70 s, WASAPI
-shared): buffer 1056 frames (22.0 ms), first audible block 0.032 s,
-3-22 s **peak -9.77 dBFS, RMS -26.72 dBFS**, 0 underruns to 10 s, 0
-`OnVoiceError`; the Wwise voice is still created, started and never fed. The
-only shared-tree changes are `aaudio_sink.c` (compiles to nothing on Windows)
-and two diagnostic probes in `xaudio2_stub.c`.
+60 passed, 0 failed. Acceptance re-run on the final binary
+(`build/run_m4e.exe`, 100 s, WASAPI shared): buffer 1056 frames (22.0 ms),
+first audible block 0.022 s, 3-22 s **peak -9.77 dBFS, RMS -27.27 dBFS**,
+1 underrun at the first feed and 4 by 20 s (the movie device teardown), 0 per
+minute in steady state, 0 `OnVoiceError`; the Wwise voice is still created,
+started and never fed. The only shared-tree changes are `aaudio_sink.c`
+(compiles to nothing on Windows) and two diagnostic probes in
+`xaudio2_stub.c`.
 
 **Not verified.** The intro cutscene on the device: the scripted New Game route
 ran to its cutscene screenshots but the taps did not leave the title (all
