@@ -3758,11 +3758,15 @@ probe added to `src/host/xaudio2_stub.c` reads the guest globals directly):
 ```
 
 and the key never changes through a 100 s run to the title. On the device the
-same table is the same shape: `debug.korra.watchlog CA2438` logs
-`+00 = 2241C670`, `+04 = 00000001` written by `0x00829000` - i.e. one entry,
-allocated, never keyed. So the device is created at 0.0-0.4 s with the table
-inert, and the prefill is skipped by design; the game's own sound manager never
-activates the entry on any screen this build reaches.
+same table is the same shape but only its head was measured:
+`debug.korra.watchlog CA2438` logs `+00 = 2241C670`, `+04 = 00000001` written by
+`0x00829000` - one entry, allocated. The key itself sits in the array that
+pointer names, which the watch probe does not follow, so "key 0" is Windows'
+measurement; the device-side probe that reads it is built into the APK but the
+phone's USB link dropped before that build ran (see below). So the device is
+created at 0.0-0.4 s with the table inert by the Windows measurement, and its
+prefill is skipped; the game's own sound manager never activates the entry on
+any screen this build reaches.
 
 **Why no host fix.** The prefill needs `frames per buffer` and `queue depth`
 from the entry's config object; inventing them would be inventing the mix

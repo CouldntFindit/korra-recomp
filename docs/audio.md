@@ -927,12 +927,13 @@ has an **active** entry:
 ```
 
 With the prefill skipped, `device+0x68` (the feed's `[this+0x40]`) stays 0 and
-the feed's condition is `0 != 0` forever. Measured: the table has **count 1,
-entry 0 key 0, cfg 0** at device creation and for the whole run, on Windows (the
-probe reads `0xCA2438`/`0xCA243C` from the shim) and on the device
-(`debug.korra.watchlog CA2438`: `+04 = 1` written by `0x00829000`, key never
-set). The entry is allocated but never activated by the game's own sound
-manager, so this is not a host refusal and not a sink defect.
+the feed's condition is `0 != 0` forever. Measured on Windows (the probe reads
+`0xCA2438`/`0xCA243C` from the shim): **count 1, entry 0 key 0, cfg 0** at
+device creation and for the whole 100 s run. On the device the table's head is
+the same (`debug.korra.watchlog CA2438`: `+04 = 1`, written by `0x00829000`);
+the entry's key is one indirection further and that build never ran (the USB
+link dropped), so the key measurement is Windows'. The entry is allocated but
+never activated, so this is not a host refusal and not a sink defect.
 
 No host fix is legitimate: the prefill needs the entry's own frame size and
 queue depth. The next lead is the layer that activates the entry (the feed's
