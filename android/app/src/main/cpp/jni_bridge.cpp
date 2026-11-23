@@ -134,7 +134,11 @@ extern "C" void android_main(android_app* app) {
                "non-arm64"
 #endif
     );
+    korra_logv("shell: internal files %s", internal ? internal : "(null)");
     korra_logv("shell: external files %s", external ? external : "(null)");
+    /* The audio sink's dump lives in a directory this process may write and adb
+     * may read. The shell owns that path; the sink only consumes it. */
+    if (external) setenv("KORRA_AUDIO_DIR", external, 1);
     /* Internal first: on Android 16+ only the app may write into its own
      * external files dir (adb-pushed files there are EACCES), so a dev install
      * lives in internal storage and is copied in with `run-as`. The SAF flow

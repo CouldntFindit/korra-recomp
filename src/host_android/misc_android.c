@@ -61,20 +61,55 @@ static void o_OleUninitialize(void) { RETV(0); }
 static void o_CoSetProxyBlanket(void) { RET(0, 8); }
 static void o_CreateStreamOnHGlobal(void) { RET(0x80004005u, 3); }
 
-/* CLSIDs the engine asks for (docs/audio.md section 12): XAudio2 2.7. Audio is
- * M4; until the 2.7 object exists, answering CLASS_E_CLASSNOTREG makes CRI take
- * its documented silent fallback instead of running a half-implemented device. */
+/* CLSIDs the engine asks for through this import (docs/audio.md 9.1): the
+ * XAudio2 2.7 pair. Both are answered by src/host_android/xaudio2_android.c,
+ * which builds the guest COM object and its vtables; every other CLSID still
+ * gets CLASS_E_CLASSNOTREG (no DirectSound8, no WASAPI enumerator on Android,
+ * and the engine has a path for that - it is the same answer as before M4). */
 static const uint8_t kClsidXAudio2[16] = {
-    0x85, 0x86, 0x50, 0x5a, 0xa2, 0x54, 0xba, 0x4f,
+    /* {5A508685-A254-4FBA-9B82-9A24B00306AF}: Data1..Data3 are stored
+     * little-endian, so A254 is the bytes 54 A2 (not A2 54). Getting that wrong
+     * is invisible: the comparison just misses and every XAudio2 request looks
+     * like "the engine never asked", which is what this tree did until
+     * 2026-11-23. */
+    0x85, 0x86, 0x50, 0x5a, 0x54, 0xa2, 0xba, 0x4f,
     0x9b, 0x82, 0x9a, 0x24, 0xb0, 0x03, 0x06, 0xaf
 };
+/* {db05ea35-0329-4d4b-a53a-6dead03d3852} - the Debug variant. The engine asks
+ * for both by CLSID and treats a refusal as "no device". */
+static const uint8_t kClsidXAudio2Debug[16] = {
+    0x35, 0xea, 0x05, 0xdb, 0x29, 0x03, 0x4b, 0x4d,
+    0xa5, 0x3a, 0x6d, 0xea, 0xd0, 0x3d, 0x38, 0x52
+};
+extern uint32_t ka_xaudio2_create_instance(uint32_t riid, uint32_t out);
 static void o_CoCreateInstance(void) {
-    uint32_t clsid = A32(0), out = A32(4);
-    int match = 1;
-    for (int i = 0; i < 16; i++)
-        if (MEM8(clsid + (uint32_t)i) != kClsidXAudio2[i]) { match = 0; break; }
+    uint32_t clsid = A32(0), riid = A32(3), out = A32(4);
+    int is_xa2 = clsid ? 1 : 0, is_dbg = clsid ? 1 : 0;
+    uint32_t hr;
+    /* The audio route is only visible if this import says what it was handed:
+     * the engine creates XAudio2, DirectSound8 and the MMDeviceEnumerator here,
+     * and a CLSID comparison that silently misses looks exactly like "the
+     * engine never asked for a device". First few calls only. */
+    static int logged;
+    for (int i = 0; i < 16 && clsid; i++) {
+        if (MEM8(clsid + (uint32_t)i) != kClsidXAudio2[i]) is_xa2 = 0;
+        if (MEM8(clsid + (uint32_t)i) != kClsidXAudio2Debug[i]) is_dbg = 0;
+    }
+    if (clsid && (is_xa2 || is_dbg)) {
+        hr = ka_xaudio2_create_instance(riid, out);
+        RET(hr, 5);
+    }
     if (out) MEM32(out) = 0;
-    RET(match ? 0x80004005u : 0x80040154u, 5);  /* E_FAIL / REGDB_E_CLASSNOTREG */
+    if (clsid && logged < 8) {
+        logged++;
+        ka_log("[com] CoCreateInstance clsid={%08X-%04X-%04X-%02X%02X-"
+               "%02X%02X%02X%02X%02X%02X} -> REGDB_E_CLASSNOTREG (from 0x%08X)",
+               MEM32(clsid), MEM16(clsid + 4), MEM16(clsid + 6),
+               MEM8(clsid + 8), MEM8(clsid + 9), MEM8(clsid + 10), MEM8(clsid + 11),
+               MEM8(clsid + 12), MEM8(clsid + 13), MEM8(clsid + 14), MEM8(clsid + 15),
+               g_cur_func);
+    }
+    RET(0x80040154u, 5);  /* REGDB_E_CLASSNOTREG */
 }
 
 /* ------------------------------------------------------------- oleaut32 */

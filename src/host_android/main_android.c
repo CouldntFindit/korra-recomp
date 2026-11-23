@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "host_android.h"
+#include "audio_sink.h"
 
 /* The shell's entry points (android/app/src/main/cpp/korra_android.h). Declared
  * here instead of including the shell header so the host tree stays buildable
@@ -147,5 +148,9 @@ void korra_guest_frame(void *native_window) {
 uint32_t ka_shell_frames(void) { return g_shell_frames; }
 
 void korra_guest_stop(void) {
+    /* Clean shutdown order: the sink first (it closes the device and waits for
+     * its callback), then the mixer's voices, then graphics. */
+    korra_audio_sink_stop();
+    ka_xaudio2_shutdown();
     ka_d3d9_shutdown();
 }

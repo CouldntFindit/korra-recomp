@@ -250,7 +250,14 @@ extern const ka_shim ka_user32_shims[];
 extern const ka_shim ka_gdi32_shims[];
 extern const ka_shim ka_misc_shims[];      /* winmm, shell32, oleaut32, ole32 */
 extern const ka_shim ka_steam_shims[];
-extern const ka_shim ka_xaudio2_shims[];
+/* XAudio2 is not a module shim table: the engine creates the device through
+ * ole32!CoCreateInstance, so misc_android.c's shim hands the CLSID to
+ * src/host_android/xaudio2_android.c, which builds the guest COM object and
+ * registers one shim per vtable slot ("XA2dev:N", "XA2voice:N", "XA2src:N"). */
+uint32_t ka_xaudio2_create_instance(uint32_t riid, uint32_t out);
+void     ka_xaudio2_shutdown(void);
+/* The mix entry the AAudio sink calls (one output thread, stereo float 48k). */
+void     ka_xa2_render(float *dst, int frames);
 extern const ka_shim ka_input_shims[];     /* xinput, dinput8 */
 extern const ka_shim ka_d3dx_shims[];
 

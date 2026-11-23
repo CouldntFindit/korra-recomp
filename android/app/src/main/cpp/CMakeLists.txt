@@ -77,10 +77,16 @@ if(KORRA_LINK_GUEST)
             "The Win32 host in src/host is not portable; see docs/ANDROID_BRINGUP.md.")
     endif()
 
-    add_library(korra_guest OBJECT ${KORRA_GEN_SOURCES} ${KORRA_HOST_SOURCES})
+    add_library(korra_guest OBJECT ${KORRA_GEN_SOURCES} ${KORRA_HOST_SOURCES}
+        # M4 audio: the shared sink contract and its AAudio implementation live
+        # in src/host (Windows owns wasapi_sink.c there; this file is
+        # `#ifdef __ANDROID__` and compiles to nothing on Windows).
+        "${KORRA_REPO_ROOT}/src/host/audio_sink.h"
+        "${KORRA_REPO_ROOT}/src/host/aaudio_sink.c")
     target_include_directories(korra_guest PRIVATE
         "${KORRA_GEN_DIR}"
         "${KORRA_HOST_ANDROID_DIR}"
+        "${KORRA_REPO_ROOT}/src/host"
         "${KORRA_PCRECOMP_DIR}/runtime/recomp32"
         "${KORRA_PCRECOMP_DIR}/runtime/win32hle")
     # -fwrapv / -fno-strict-aliasing match the MSVC host's semantics: the lifted
@@ -99,6 +105,9 @@ if(KORRA_LINK_GUEST)
     endforeach()
     target_compile_definitions(korra_guest PRIVATE KORRA_ANDROID=1)
     target_link_libraries(korra PRIVATE korra_guest)
+    # AAudio (API 26+): the M4 output stage. korra_guest is an OBJECT library,
+    # so the library belongs on the final target.
+    target_link_libraries(korra PRIVATE aaudio)
     target_compile_definitions(korra PRIVATE KORRA_LINK_GUEST=1)
     find_package(Threads REQUIRED)
     target_link_libraries(korra PRIVATE Threads::Threads)
