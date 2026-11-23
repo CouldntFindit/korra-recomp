@@ -1,10 +1,13 @@
 # Audio on Android - the AAudio side (M4 hand-off to M3)
 
-Written by the M4 (Windows audio) session on 2026-11-21. The Windows sink is
-built, run and measured; the Android sink is **code only** - it has been
-compile-checked with the NDK for arm64-v8a but has never been linked into the
-Android target and has never run on a device. Do not read this file as evidence
-that audio works on Android.
+Written by the M4 (Windows audio) session on 2026-11-21 as a hand-off. **It was
+picked up on 2026-11-23 and is now integrated and measured on the device**: the
+Android XAudio2 shim exists (`src/host_android/xaudio2_android.c`), the AAudio
+sink runs, and the CRI movie audio is audible with the numbers in §6. The Wwise
+voice is still never fed - the break is in the game's own sound-table
+activation, named in `docs/audio.md` §10.9 and `docs/FINDINGS.md` (2026-11-23),
+not in this contract. Sections 1-7 are kept as written: the contract did not
+change, and each pitfall below cost exactly what it says.
 
 Read `docs/audio.md` section 9 first: it is the reason the host provides a sink
 at all. The engine (Wwise, inside the lifted C) decodes and mixes; the host only
@@ -42,8 +45,9 @@ backend/get_stats/note_underrun plus `korra_audio_stats`.
 |---|---|---|
 | `src/host/audio_sink.h` | both | the contract above |
 | `src/host/wasapi_sink.c` | Windows only (`#ifndef __ANDROID__`) | built, run, measured: WASAPI shared event-driven with `AUTOCONVERTPCM`, waveOut fallback, null-pacing fallback, WAV dump, per-second peak/RMS/underrun log |
-| `src/host/aaudio_sink.c` | Android only (`#ifdef __ANDROID__`) | compile-checked, **not** built into the APK, never run |
-| `src/host/xaudio2_stub.c` | Windows host | the 2.7 XAudio2 shim **and** the mixer (slice queue, resampling, matrix, retirement) - the reference the Android shim must match |
+| `src/host/aaudio_sink.c` | Android only (`#ifdef __ANDROID__`) | built into the APK, run on the S24, measured (§6); device-rate resampler added |
+| `src/host_android/xaudio2_android.c` | Android host | the 2.7 XAudio2 shim **and** the mixer - the port of `xaudio2_stub.c`, measured against it |
+| `src/host/xaudio2_stub.c` | Windows host | the 2.7 XAudio2 shim **and** the mixer (slice queue, resampling, matrix, retirement) - the reference the Android shim matches |
 
 `aaudio_sink.c` in one paragraph: `start()` builds an AAudio stream
 (exclusive first, shared on refusal, low-latency, float32, 48 kHz, 2 ch,
@@ -106,28 +110,19 @@ Keep these semantics exactly (each one cost a defect on Windows):
 
 ## 4. Integration steps (exact)
 
-1. Copy `src/host/audio_sink.h` and `src/host/aaudio_sink.c` into
-   `src/host_android/`. The CMake `file(GLOB KORRA_HOST_SOURCES ...)` already
-   picks up every `.c`/`.cpp` there, so no new source line is needed.
-   Do **not** copy `wasapi_sink.c`; it compiles to nothing off Windows.
-2. Add the AAudio library to the link. `korra_guest` is an OBJECT library, so
-   the flag belongs on the final target:
+Done 2026-11-23, as written except where noted:
 
-   ```cmake
-   target_link_libraries(korra PRIVATE aaudio)
-   ```
-
-3. `minSdkVersion` must be 26 or higher (AAudio). Check
-   `android/app/build.gradle` before enabling.
-4. Add `xaudio2_android.c` (section 3) to `src/host_android/` and register its
-   shim(s) where `main_android.c` registers the other HLE tables - the only
-   entry that matters is `CoCreateInstance`, and it must intercept
-   `CLSID_XAudio2` before falling through to the real thing.
-5. Call `korra_audio_sink_start(xa2_render_audio)` from the first submit, and
-   `korra_audio_sink_stop()` from the Activity/teardown path (`aaudio_sink.c`
-   does not register an `atexit` handler; the Windows sink does).
-6. Nothing else in the Android target changes. D3D9, the spine and the
-   interrupt/timer work are untouched by this hand-off.
+1. `src/host/audio_sink.h` and `src/host/aaudio_sink.c` are **not** copied into
+   `src/host_android/`: the CMake target lists them from `src/host` directly
+   (one copy, no drift) and adds `src/host` to the include path.
+2. `target_link_libraries(korra PRIVATE aaudio)` on the final target - done.
+3. `minSdkVersion` is 29 (AAudio needs 26) - done.
+4. `src/host_android/xaudio2_android.c` is picked up by the existing
+   `file(GLOB ...)`; `CoCreateInstance` in `misc_android.c` hands the XAudio2
+   CLSIDs to `ka_xaudio2_create_instance()` before falling through.
+5. The sink starts from the first `SubmitSourceBuffer` (`ka_xa2_render` is the
+   render function) and `korra_guest_stop()` calls `korra_audio_sink_stop()`.
+6. Nothing else in the Android target changed.
 
 ## 5. Knobs
 
@@ -135,12 +130,21 @@ Shared with Windows:
 
 | variable | meaning |
 |---|---|
-| `KORRA_AUDIO_DUMP=<path>` | write 16-bit 48 kHz stereo WAV. On device: `/data/local/tmp/korra.wav`, then `adb pull`. Header is patched every second, so a killed run is still readable |
+| `KORRA_AUDIO_DUMP=<path>` | write 16-bit stereo WAV at the device rate. On device: `/data/local/tmp/korra.wav`, then `adb pull`. Header is patched every second, so a killed run is still readable |
 | `KORRA_AUDIO_LOG=1` | (Windows) per-second sink line; AAudio logs per second unconditionally via logcat |
 
+Android properties (`adb shell setprop ...`, read once at start):
+
+| property | meaning |
+|---|---|
+| `debug.korra.audio.dump=1` | dump to `KORRA_AUDIO_DIR/korra_audio.wav` (the shell sets that to the app's own external files dir, which `adb pull` can read) |
+| `debug.korra.audio.dump=<path>` | dump to that literal path |
+| `debug.korra.audio.buffer=<frames>` | device buffer request, default 512 (the S24 rounds it to 576, 12.0 ms); `1024` gives 1056 frames, 22.0 ms |
+| `debug.korra.audio.backend=null` | open no device; the XAudio2 shim then retires buffers on its clock and CRI still feeds |
+| `debug.korra.xa2=0..3` | shim log level: 1 voice create/destroy/submit-first, 2 every state poll and the sound-table probe, 3 every queue-length change |
+
 Windows-only today: `KORRA_AUDIO_BACKEND=wasapi|waveout|null|none`,
-`KORRA_AUDIO_LATENCY_MS`, `KORRA_AUDIO_CENSUS`. If M3 wants a backend switch on
-Android, add `KORRA_AUDIO_BACKEND=aaudio|null` to `korra_audio_sink_start()`.
+`KORRA_AUDIO_LATENCY_MS`, `KORRA_AUDIO_CENSUS`.
 
 ## 6. Acceptance on the device (same list as `docs/audio.md` 9.4)
 
@@ -160,6 +164,16 @@ Silence is not success. In order:
    underruns below 1/minute in steady state (Windows: 0/min between 6 s and
    21 s; the 4 counted underruns are the first feed and the per-movie device
    teardown).
+
+**As measured on the S24 (2026-11-23).** Test 1 passes on the device:
+`opened: 2 ch, 48000 Hz, buffer 576 frames (12.0 ms, capacity 3072), burst 96`,
+first audible block at 1.0 s (peak -15.7 dBFS), 3-26 s peak **-9.8 dBFS** /
+RMS **-27.7 .. -28.8 dBFS**, dump 207 s of 16-bit 48 kHz stereo, AAudio xruns 3
+(at 7 s) then 0 new. Format clause of test 7 passes (every voice format logged,
+0 `OnVoiceError`); its underrun clause does **not**: 96 mixer-dry blocks in the
+first 26 s, because the guest's ~30 fps feed cannot keep a 22 ms buffer fed
+(the 1056-frame setting was measured too and did not remove them). Tests 2-6
+remain blocked by the Wwise feed, whose break is now named (see below).
 
 Tests 2-6 need a posted Wwise event. On Windows those are **not reachable
 today**: the game never posts one on any screen it can reach, and the
@@ -183,6 +197,23 @@ an audio defect: the sink has nothing to play, which is why the title is quiet.
   `convert_block()` in `wasapi_sink.c`, carried position across blocks).
 * **Buffer 2x256 frames** is the starting point from `docs/audio.md` 9.3; raise
   it if logcat shows underruns, but every doubling adds latency the engine
-  does not need.
+  does not need. Measured 2026-11-23: 576 frames (12 ms) and 1056 frames (22 ms)
+  both leave ~4 mixer-dry blocks per second during the movies; the limit is the
+  guest's feed cadence, not this buffer.
 * **The WAV dump is the evidence**, not "I heard it". It is the only artifact
   that survives `adb pull` after a crash.
+* **Patch the WAV header, then seek back to the end.** `dump_patch()` that
+  writes 44 bytes at offset 0 and leaves the stream there makes every later
+  block overwrite the file's start; a 138 s run then pulled as 192 KB whose
+  header claimed 138 s. This was in the hand-off code and only a pull caught it.
+* **Never move the mix cursor backwards.** The Windows mixer clamps `pos` to
+  `played` when the queue empties; with a live sink that re-reads a slice whose
+  `OnBufferEnd` has already fired, and CRI is free to refill it. Measured as one
+  torn float (`-20071`) at a slice edge. `next_end = pos`, never `pos = played`.
+* **A COM vtable's slot count is the ABI.** Each thunk must pop exactly
+  `1 + params`; `GetState` in 2.7 is one argument. The Android shim's slots are
+  the same 16/19/29 layout as the Windows one for this reason.
+* **A GUID is not a byte string you can copy from the text form.** Data1..Data3
+  are little-endian: `{...-A254-...}` is `54 A2`. Writing `A2 54` made every
+  XAudio2 request answer `REGDB_E_CLASSNOTREG` - indistinguishable from "the
+  engine never asked".

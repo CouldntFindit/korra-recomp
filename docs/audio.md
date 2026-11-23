@@ -567,8 +567,10 @@ Route A is implemented, not proposed: the lifted engine keeps its own Wwise/CRI
 mixer, and the host supplies only the sink. The XAudio2 2.7 device the engine
 asks for is `src/host/xaudio2_stub.c`; the output stage is
 `src/host/wasapi_sink.c`; the contract between them is `src/host/audio_sink.h`.
-The Android twin (`src/host/aaudio_sink.c`) is written but never ran on a
-device - `docs/AUDIO_ANDROID.md` is the hand-off.
+The Android twin is `src/host_android/xaudio2_android.c` (the device and the
+mixer) plus `src/host/aaudio_sink.c` (the output stage); it is integrated,
+running on the device and measured (§10.8), and the Wwise voice is still never
+fed (§10.9 names the break).
 
 ### 10.1 Shape
 
@@ -859,6 +861,82 @@ script gap, not an untracked source file).
 
 For the title/menu screens this recipe is not enough on its own - the game must
 be foreground or it never calls `Present`; see 10.6.
+
+### 10.8 Android: the sink is integrated and measured (2026-11-23)
+
+The hand-off in `docs/AUDIO_ANDROID.md` is now code in the APK. Two files:
+
+* `src/host_android/xaudio2_android.c` - the device. A guest COM object is
+  `[vtable VA][tag]` in guest memory and the vtable is a guest array of shim
+  VAs (`XA2dev:N`, `XA2voice:N`, `XA2src:N`), so the lifted `call [eax+0x54]`
+  resolves through `recomp_lookup_import` like any import. It carries the
+  measured Windows behaviour over: both CLSIDs, `GetDeviceCount() == 1`, a
+  2 ch / 48 kHz mastering voice, `SetOutputMatrix` applied as the mix, honest
+  `GetState`, the engine's formats (16-bit/float, mono..5.1, 32/48 kHz), lazy
+  sink start on the first real buffer, and retirement that performs CRI's
+  `OnBufferEnd` body in C (`__atomic_add_fetch(ctx, 1)`).
+* `src/host/aaudio_sink.c` - the output stage. One AAudio callback, exclusive
+  then shared, 2 ch float 48 kHz, cached stream parameters (the callback never
+  calls AAudio), a WAV dump at the device rate, and a carried-position
+  resampler for a device that refuses 48 kHz.
+
+CMake: both files are on the `korra_guest` target (`src/host/audio_sink.h` and
+`src/host/aaudio_sink.c` are listed explicitly next to the `src/host_android`
+glob) and the final target links `aaudio`. `korra_guest_stop()` stops the sink
+before the mixer's voices and graphics.
+
+Measured on the S24 (stock driver), `debug.korra.audio.dump=1`,
+`debug.korra.xa2=1`, runs of 70-210 s:
+
+| metric | value |
+|---|---|
+| stream | `opened: 2 ch, 48000 Hz, buffer 576 frames (12.0 ms, capacity 3072), burst 96, format 2` |
+| first audible block | 1.0 s (peak -15.7 dBFS) |
+| 3-26 s | peak -9.8 dBFS, RMS -27.7 .. -28.8 dBFS |
+| 6 ch movie via the engine's 6x2 matrix | peak -9.77 dBFS, RMS -21.6 dBFS |
+| dump | 207 s, 16-bit 48 kHz stereo, per-second table in `docs/FINDINGS.md` |
+| AAudio xruns | 3 (at 7 s), then 0 new |
+| mixer-dry blocks | 96 in the first 26 s - the guest's ~30 fps feed against a 22 ms buffer, not a level defect |
+
+Two defects in the hand-off code were found by measurement and fixed: the dump's
+header patch left the stream at offset 44 (so a long run kept only its last
+second), and the mixer's cursor was clamped backwards when the queue ran dry,
+re-reading a buffer CRI had already been told it could refill (one torn sample,
+`l=-20071`, at a slice edge). The cursor is monotonic now.
+
+### 10.9 The Wwise break, named (2026-11-23)
+
+The Hw output device (`0x0088B000`, vtable `0x0091EC80`, embedded output
+interface at `+0x28` with vtable `0x0091ECC8`) creates and starts its 2 ch float
+voice correctly, and its feed function `FUN_0088B440` is complete: `GetState`
+(slot `0x64`), then while `[this+0x40] != BuffersQueued` submit
+`[this+0x44] << 10` bytes from an 8-slot ring through slot `0x54`. Nothing ever
+calls it, and the init is why.
+
+After `SetVolume`, `0x0088B0C0` prefills the ring only if the game's sound table
+has an **active** entry:
+
+```
+0x0088B2CD  edi = [0xCA243C]         ; count
+0x0088B2D7  je 0x88B33D              ; 0 -> skip the prefill
+0x0088B2E2  eax = [entry+0x10] | [entry+0x14]   ; 64-bit key
+0x0088B2E7  je  ...next / skip       ; key 0 -> not active
+0x0088B314  [device+0x44] = word[[entry+4]+0x44]  ; frames per buffer
+0x0088B31B  [device+0x68] = [[entry+4]+0x68]      ; queue depth (= feed target)
+0x0088B330  call 0x88B720 x N        ; submit N buffers
+```
+
+With the prefill skipped, `device+0x68` (the feed's `[this+0x40]`) stays 0 and
+the feed's condition is `0 != 0` forever. Measured: the table has **count 1,
+entry 0 key 0, cfg 0** at device creation and for the whole run, on Windows (the
+probe reads `0xCA2438`/`0xCA243C` from the shim) and on the device
+(`debug.korra.watchlog CA2438`: `+04 = 1` written by `0x00829000`, key never
+set). The entry is allocated but never activated by the game's own sound
+manager, so this is not a host refusal and not a sink defect.
+
+No host fix is legitimate: the prefill needs the entry's own frame size and
+queue depth. The next lead is the layer that activates the entry (the feed's
+caller lives there too), not the device.
 
 ---
 

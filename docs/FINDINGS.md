@@ -3646,3 +3646,145 @@ crash stands); slot saves / erase / `SystemData.dat` (unchanged from the save
 entry); and the Windows oracle for anything here (no shared code changed).
 
 
+
+## 2026-11-23 - M4 audio on the S24: the AAudio sink is fed, and the Wwise voice never prefills
+
+The Android host now answers `CoCreateInstance(CLSID_XAudio2)` with a real
+IXAudio2 2.7 device, mixes what the engine submits, and hands it to AAudio. The
+CRI movie audio that was silent on the phone is audible and measured. The Wwise
+2 ch float voice is still never fed, and this time the break has a name and a
+call path, not a guess.
+
+**What was actually wrong on Android: the CLSID never matched.** The device
+request is `{5A508685-A254-4FBA-9B82-9A24B00306AF}`, and the constant in
+`misc_android.c` had Data2 written as `A2 54` instead of `54 A2` (a GUID's
+Data1..Data3 are little-endian). Every XAudio2 request therefore fell through to
+`REGDB_E_CLASSNOTREG`, which looks exactly like "the engine never asked for a
+device". With the bytes fixed the log says
+`CoCreateInstance -> IXAudio2 2.7`, `CreateMasteringVoice(in=0 ch, 48000 Hz)`,
+`CreateSourceVoice(2 ch ... mask 0x3)` for the Hw device and, per movie,
+`CreateSourceVoice(6 ch, 48000 Hz, float, mask 0x0)` + `SetOutputMatrix 6 x 2`
+for CRI, followed by real submits.
+
+**The sink, as built.** `src/host_android/xaudio2_android.c` is the Android twin
+of the measured Windows shim: guest COM objects whose vtables are arrays of
+shim VAs (`XA2dev:N` / `XA2voice:N` / `XA2src:N`), the same slice queue,
+resampling of 32 kHz sources, the engine's own `SetOutputMatrix`, and retirement
+that performs CRI's `OnBufferEnd` body (`*(u32*)ctx += 1`, atomically).
+`src/host/aaudio_sink.c` gained the two things the hand-off said were missing: a
+device-rate resampler with a carried position (44.1 kHz is now a working path,
+not a warning) and cached stream parameters so the callback never calls AAudio.
+Buffer size is `debug.korra.audio.buffer` (default 512 -> the device rounds to
+576 frames, 12.0 ms); capacity is 3072, burst 96.
+
+**Measured on the S24 (stock driver).** `debug.korra.audio.dump=1` +
+`debug.korra.xa2=1`, 70-210 s runs:
+
+| metric | value |
+|---|---|
+| stream | `opened: 2 ch, 48000 Hz, buffer 576 frames (12.0 ms, capacity 3072), burst 96, format 2` |
+| first audible block | 1.0 s, peak -15.7 dBFS |
+| sink 3-26 s | peak **-9.8 dBFS**, RMS **-27.7 .. -28.8 dBFS** |
+| dump | 207 s, 16-bit 48 kHz stereo; boot movies peak -14.7/-9.8 dBFS |
+| 6 ch movie through the engine's 6x2 matrix | peak -9.77/-10.05 dBFS, RMS -21.6 dBFS |
+| AAudio xruns | 3 (all at 7 s), then 0 new |
+| mixer-dry blocks | 96 in the first 26 s (see below) |
+
+The Windows reference for the same phase is peak -9.77 dBFS / RMS -26.8 dBFS,
+so the level through the device's own 6x2 matrix matches.
+
+**Two more measured defects, both fixed.**
+1. *The dump kept only its last second.* `dump_patch()` seeks to 0, writes the
+   44-byte header and left the stream at offset 44, so every following block
+   overwrote the file's start (a 138 s run produced a 192,044-byte file whose
+   header claimed 138 s). Patched to seek back to the end. This is a
+   hand-off-code defect, not an AAudio one.
+2. *A torn sample at a slice edge.* When the queue ran dry, the mixer clamped
+   `pos` backwards to `played` (the Windows code does this); with a live sink
+   that re-reads a buffer whose `OnBufferEnd` has already fired, and CRI is free
+   to refill it. Measured once: `voice 2 out of range: l=-20071.188` at
+   `pos=58064`, hearing a 3e4-magnitude float in the mix. The cursor is now
+   monotonic (`next_end = pos`, never backwards). A 70 s run that previously
+   hit the 11-13 s window is clean, and the one-shot probe stays in the shim.
+
+**Underruns are real and worse than Windows.** The engine submits 800-frame
+(16.7 ms) buffers with a 4-deep ring; the phone's guest loop runs at ~30 fps
+while its audio thread polls `GetState` ~315 times a second, so a 12-22 ms
+device buffer runs dry in bursts: 96 mixer-dry events in 26 s against 0 in the
+same window on Windows. AAudio's own xrun counter stays at 3. Raising the
+device buffer to 1056 frames (22.0 ms) did not remove them. This is the
+fill-latency half of the perf block the owner deferred, not a mixing defect: the
+samples and levels are right.
+
+**The Wwise break, named.** The Hw output device is a C++ object whose
+constructor is `0x0088B000`; it installs the vtable at `0x0091EC80` and an
+embedded output interface at `object+0x28` with vptr `0x0091ECC8`. Its IXAudio2
+init is vtable slot `0x34` = `0x0088B0C0` (reached from the device factory
+`0x008793F0`), which creates the 2 ch float source voice at `0x0088B2A8` and
+stores it at `object+0x3C`; `0x0088B6B0` (slot `0x04`) starts it - the log line
+`Start(1) from 0x0088B6B0`. The *feed* is `FUN_0088B440`, the first slot of the
+embedded interface: it reads the voice's `GetState` (slot `0x64`) and, while
+`[this+0x40] != BuffersQueued`, submits `[this+0x44] << 10` bytes from an
+8-slot ring at `[this+0x20 .. 0x3C]` through slot `0x54`.
+
+Nothing ever calls it, and the reason is one branch in the init. After
+`SetVolume` the init reads the game's sound table:
+
+```
+0x0088B2CD  edi = [0xCA243C]              ; entry count
+0x0088B2D7  je 0x88B33D                   ; no entries -> skip the prefill
+0x0088B2D9  ebx = [0xCA2438]              ; array of 0x38-byte entries
+0x0088B2E2  loop: eax = [ecx] | [ecx+4]   ; the 64-bit key at entry+0x10
+0x0088B2E7  je  ...next entry / skip      ; key == 0 -> not active
+0x0088B30A  cmp [[entry+4]+0x20], 1       ; cfg state
+0x0088B314  [esi+0x44] = word[[entry+4]+0x44]   ; frames per buffer
+0x0088B31B  [esi+0x68] = [[entry+4]+0x68]       ; queue depth
+0x0088B330  call 0x88B720                 ; submit one buffer, N times
+```
+
+When it jumps to `0x88B33D`, `object+0x68` (the top-up target, read as
+`[this+0x40]` by the feed) stays 0 and `object+0x6C` (frames per buffer) stays 0.
+The feed's condition is then `0 != 0`: a permanent no-op. That is exactly what
+the logs show - zero `GetState` and zero `SubmitSourceBuffer` on the voice for
+400 s, on both platforms.
+
+Measured on the Windows reference (same guest code, `KORRA_XA2_VERBOSE=2`, the
+probe added to `src/host/xaudio2_stub.c` reads the guest globals directly):
+
+```
+[xa2] 3.8 Hw sound table: ptr=0D73F5D0 count=1
+[xa2] 3.8   entry 0: key=0000000000000000 cfg=00000000
+[xa2] 539.5 sound table: count=1 entry0 key=0000000000000000 (from 0x007B25DC)
+```
+
+and the key never changes through a 100 s run to the title. On the device the
+same table is the same shape: `debug.korra.watchlog CA2438` logs
+`+00 = 2241C670`, `+04 = 00000001` written by `0x00829000` - i.e. one entry,
+allocated, never keyed. So the device is created at 0.0-0.4 s with the table
+inert, and the prefill is skipped by design; the game's own sound manager never
+activates the entry on any screen this build reaches.
+
+**Why no host fix.** The prefill needs `frames per buffer` and `queue depth`
+from the entry's config object; inventing them would be inventing the mix
+(recorded in the ledger, and the same mistake cost +11 dB on Windows). The
+correct next step is the missing *activation* of the sound-table entry - a
+Wwise/`Hw::Sound`-side job, i.e. the layer above this device - which is where
+the feed's caller also lives (no code path calls `FUN_0088B440` in these runs).
+The device itself is correct and now answers everything it is asked.
+
+**Windows re-test after the shared-tree change.** `scripts/run_selftest.ps1`:
+60 passed, 0 failed. Acceptance re-run (`build/run_m4e.exe`, 70 s, WASAPI
+shared): buffer 1056 frames (22.0 ms), first audible block 0.032 s,
+3-22 s **peak -9.77 dBFS, RMS -26.72 dBFS**, 0 underruns to 10 s, 0
+`OnVoiceError`; the Wwise voice is still created, started and never fed. The
+only shared-tree changes are `aaudio_sink.c` (compiles to nothing on Windows)
+and two diagnostic probes in `xaudio2_stub.c`.
+
+**Not verified.** The intro cutscene on the device: the scripted New Game route
+ran to its cutscene screenshots but the taps did not leave the title (all
+mean ~91, the title's own brightness) and the dump is silent after the boot
+movies, so the 5.1 path is proven on device only by the boot movie's 6 ch
+stream. Audio after the cutscene (no Wwise event is posted). The 44.1 kHz
+resampler path: the S24 hands back 48000 Hz, so the resampler compiled and
+stayed idle. Underruns under load (see above). The feed's caller and the
+sound-table activation are named, not fixed.

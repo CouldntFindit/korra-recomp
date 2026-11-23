@@ -422,3 +422,38 @@ Append only; newest last. Format: date — attempt — outcome — next idea.
   16 ms `ALooper_pollOnce` tick, not guest frames.** It reads ~60/s from boot to
   shutdown whatever the game does, so "frames/s high, presents low" says
   nothing about the guest loop. Use the frame probe's `dt`/`n`.
+- 2026-11-23 - "The engine never asks for XAudio2 on Android" - **the CLSID bytes
+  were swapped.** `CLSID_XAudio2` `{5A508685-A254-...}` needs Data2 as `54 A2`
+  (GUID fields are little-endian); the constant had `A2 54`, so every
+  `CoCreateInstance` fell through to `REGDB_E_CLASSNOTREG` and the log looked
+  exactly like "no device was requested". Prove a CLSID match by printing the
+  16 bytes (the shim now does, once) - never by the absence of a later call.
+- 2026-11-23 - "The dump is empty because AAudio failed" - **the WAV header
+  patch rewound the file.** `dump_patch()` seeks to 0, writes 44 bytes and left
+  the stream there, so every subsequent block overwrote the file's start; a
+  138 s run pulled as 192 KB while its header claimed 138 s. Patch the header,
+  then `fseek(..., SEEK_END)`. A dump whose header and file size disagree is
+  the tell.
+- 2026-11-23 - "One huge sample in the mix is the engine's decoder" - **it was
+  the mixer re-reading a refilled buffer.** When the queue ran dry the mixer
+  clamped `pos` back to `played` (the Windows code does this). With a live sink
+  that rewinds into a slice whose `OnBufferEnd` has already fired, and CRI is
+  free to refill it; the measured torn float was `l=-20071` at a slice edge.
+  Keep the cursor monotonic. One out-of-range line per voice, logged from the
+  mixer, is what named it.
+- 2026-11-23 - "Wwise is silent because no event is posted" - **the device is
+  silent because its prefill is skipped; the feed never runs.** The Hw output
+  device is `0x0088B000` (vtable `0x0091EC80`, embedded output interface at
+  `+0x28` with vtable `0x0091ECC8`) - locate it through its code, not RTTI. Its
+  init (`0x0088B0C0`, vtable slot `0x34`, from the factory `0x008793F0`) only
+  prefills the 8-slot ring if the game's sound table (`[0xCA243C]` count,
+  `[0xCA2438]` 0x38-byte entries) has an entry whose 64-bit key at `+0x10` is
+  non-zero; the entry exists (count 1) and stays key 0 on both hosts, so
+  `device+0x68` (the feed's `[this+0x40]`) is 0 and `FUN_0088B440`'s top-up is
+  `0 != 0` forever. Do not "fix" this in the host: the prefill needs the
+  entry's frame size and depth. Next lead is what activates that entry.
+- 2026-11-23 - Calling `AAudioStream_requestStart` twice (a bad edit left the
+  call in the block it had just been moved into) - **`-895
+  AAUDIO_ERROR_INVALID_STATE`**, the sink closed itself and the run went silent
+  with the mixer's clock fallback working fine. Read the `requestStart failed`
+  line before blaming the device; the failure is loud and exact.
