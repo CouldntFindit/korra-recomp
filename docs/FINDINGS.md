@@ -3922,3 +3922,10 @@ Next: identify the 4-word burst in the engine's mixer - a ring-slot header, a
 limiter sentinel, or a partially filled `AudioBytes` tail. Until then, the sink
 meter and the dump remain the evidence, and the `|x| > 2` one-shot is replaced
 by first-three-plus-non-finite with the slice bounds (this probe).
+
+A deterministic manual menu walk (8 held A taps through the notices/menus) then
+reached the tutorial HUD in about 100 s; the log still shows no 6 ch
+`CreateSourceVoice` after the boot movies (last at 24.3 s), so the intro path on
+this build is not a CRI 6 ch movie. The 5.1 stream therefore remains proven on
+device only by the boot movie, and the intro cutscene's own audio is the 2 ch
+Wwise mix (measured through the loading transition above).

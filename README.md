@@ -26,7 +26,7 @@ side (Win32, D3D9 surface, XInput, XAudio2, CRI/Wwise audio, Steam stubs).
 
 ## Status
 
-*Last updated 2026-11-22. Current focus: M4 audio, then the deferred performance block (all M3 rungs are recorded closed; the 30 fps gate line awaits the owner's rescope).*
+*Last updated 2026-11-23. Current focus: the Wwise mix's integer/Nan burst, then the 5.1 cutscene and the deferred performance block (all M3 rungs are recorded closed; the 30 fps gate line awaits the owner's rescope).*
 
 | Milestone | What it means | State |
 |---|---|---|
