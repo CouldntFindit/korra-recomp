@@ -537,16 +537,28 @@ static void xv_mix_voice(xv_voice *v, float *out, int frames) {
         xv_read_at(v, v->pos, &l, &r);
         out[2 * i] += l * v->volume;
         out[2 * i + 1] += r * v->volume;
-        /* One line per voice if a sample leaves [-1, 1] far enough that it can
-         * only be a read of the wrong memory, not the engine's own level: that
-         * is how a bad slice/data field shows itself without a debugger. */
-        if (!v->oor_warned && (fabsf(l) > 2.0f || fabsf(r) > 2.0f)) {
-            v->oor_warned = 1;
-            xv_log("voice %d out of range: l=%.3f r=%.3f (pos %.1f, ch %u, bits %u, "
-                   "float %u, matrix %u, q=%u, data %08X)",
-                   (int)(v - g_v), (double)l, (double)r, v->pos, v->channels,
-                   v->bits, v->is_float, v->matrix_ch, v->qcount,
-                   v->q[v->qhead].data);
+        /* First three per voice out of range: a sample that leaves [-1,1] far
+         * enough can only be a read of the wrong memory, not the engine's own
+         * level. NaN/Inf are included - fabsf(NaN) > 2 is false, which is why
+         * the old probe missed the sink's nan/186 dBFS reading. The slice
+         * bounds and the raw word name the source. */
+        if (v->oor_warned < 3 &&
+            (!isfinite(l) || !isfinite(r) || fabsf(l) > 2.0f || fabsf(r) > 2.0f)) {
+            const xv_slice *s = &v->q[v->qhead];
+            uint64_t i0 = (uint64_t)v->pos;
+            uint32_t raw = 0;
+            v->oor_warned++;
+            if (s->data && i0 >= s->start) {
+                uint64_t rel = i0 - s->start;
+                uint32_t va = s->data + (uint32_t)(rel * v->channels * (v->bits / 8));
+                if (xv_readable(va, 4)) raw = MEM32(va);
+            }
+            xv_log("voice %d bad sample l=%g r=%g (pos %.1f, slice [%llu,%llu), "
+                   "i0=%llu, raw=%08X, ch %u, bits %u, float %u, matrix %u, q=%u, data %08X)",
+                   (int)(v - g_v), (double)l, (double)r, v->pos,
+                   (unsigned long long)s->start, (unsigned long long)s->end,
+                   (unsigned long long)i0, raw, v->channels, v->bits, v->is_float,
+                   v->matrix_ch, v->qcount, s->data);
         }
         v->pos += step;
     }

@@ -188,8 +188,10 @@ device (the route had 10 s left when it reached the New Game, and no new CRI
 6 ch voice is created on that path). The Windows oracle is still unfed: its
 shim has the same missing invocation. The sink's float meter also reports
 `peak=186.6 dBFS rms=nan` in one run once the Wwise mix plays (the boot movies
-are clean), and the dump clips 0.2-0.3 % of samples - a new, open break in the
-mix data (NaN/Inf is invisible to the `|x| > 2` probe).
+are clean), and the dump clips 0.2-0.3 % of samples. The probe now catches
+non-finite samples and logs the slice bounds: the first hit is `raw=4F000000`
+(2^31 as float, 1325400064 as int) at `i0=2120029` in a 1024-frame slice with
+valid floats either side - an integer in the engine's float ring, open.
 
 ## 7. Pitfalls, all learned the hard way
 

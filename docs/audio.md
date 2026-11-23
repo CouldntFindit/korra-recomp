@@ -960,16 +960,18 @@ Game at 322 s (peak -7.5..0 dBFS, RMS -30..-35 dBFS) and through the
 loading/cutscene transition (322-359 s, RMS -17..-25 dBFS). AAudio xruns 13
 (all early), mixer-dry 259/359 s.
 
-**New, open: NaNs/huge floats in the Wwise mix.** The sink's float meter
-reports `peak=47.3 dBFS` in one run and `peak=186.6 dBFS rms=nan` in another as
-soon as the Hw voice plays (the boot movies before it are clean at -14.7/-11.9
-dBFS). The dump clips 0.23 % of samples in the menu and 0.34 % during the
-loading transition. The one-shot mixer probe (`|x| > 2`) logs only two modest
-values because NaN comparisons are false. Next step: log the slice
-`[start,end)` and `i0` with the value and classify NaN/Inf, then decide whether
-it is a torn guest refill or an `AudioBytes` region that is not decoded PCM.
-The Windows shim still lacks the callback invocation, so the oracle remains
-unfed; that divergence is recorded.
+**New, open: integer bit patterns in the Wwise float ring.** The sink's float
+meter reports `peak=47.3 dBFS` in one run and `peak=186.6 dBFS rms=nan` in
+another as soon as the Hw voice plays (the boot movies before it are clean at
+-14.7/-11.9 dBFS). A first-three-per-voice probe with the slice bounds shows the
+cause: `raw=4F000000` (= 2^31 as float, 1325400064 as int) at `i0=2120029`
+inside slice `[2119850,2120874)`, with valid floats either side and a 4-word
+burst (`C35F2F1A` = -223.184) next to it. That is an integer written into the
+engine's float PCM, not a decoder level; the host reads exactly the guest word.
+The dump clips 0.23 % (menu) / 0.34 % (loading) of samples as a result. Next:
+identify the burst in the engine's mixer (ring-slot header, limiter sentinel or
+an `AudioBytes` tail that is not decoded PCM). The Windows shim still lacks the
+callback invocation, so the oracle remains unfed; that divergence is recorded.
 
 ---
 

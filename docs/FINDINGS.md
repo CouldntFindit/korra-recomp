@@ -3892,3 +3892,33 @@ classify NaN/Inf in the probe. The Windows shim has the same missing callback
 only for the boot movies). The 44.1 kHz resampler is still idle. The NaN source
 is named only by the sink meter; no slice-level evidence yet. Windows acceptance
 was not re-run: no `src/host/` file changed.
+
+## 2026-11-23 - M4 activation follow-up: the huge Wwise sample is an integer (2^31) in the guest ring
+
+The new mixer probe (first three per voice, NaN/Inf included, with the slice
+bounds and the raw word) names the source of the sink's `peak=186.6 dBFS
+rms=nan`:
+
+```
+voice 1 bad sample l=2.14748e+09 r=-2.14748e+09 (pos 2120029.0,
+  slice [2119850,2120874), i0=2120029, raw=4F000000, ch 2, bits 32,
+  float 1, matrix 0, q=3, data 2242A770)
+voice 1 bad sample l=-223.184 r=267.632 (pos 2120031.0, ... raw=C35F2F1A)
+voice 1 bad sample l=2.14748e+09 r=-2.14748e+09 (pos 2120032.0, ... raw=4F000000)
+```
+
+`0x4F000000` is exactly 2^31 as a float and 1325400064 as a signed integer;
+the negative channel is `0xCF000000`. These are *integer bit patterns inside
+the guest's float PCM ring*, at a slice-relative offset of 179 frames, with
+valid floats on either side - not a level and not a NaN from the decoder. The
+6 ch CRI voice shows the same shape earlier (`l=-2.13552`, raw `C0BFD0C4`).
+The slice-relative position and the 4-word burst point at the engine's mixer
+(or a buffer region it does not fill) rather than at the host read: `i0` is
+inside `[start,end)`, the format is the engine's own float32 (the GUID at
+`0x9090FC` is `0300...` = IEEE_FLOAT), and the host reads exactly the word the
+game wrote.
+
+Next: identify the 4-word burst in the engine's mixer - a ring-slot header, a
+limiter sentinel, or a partially filled `AudioBytes` tail. Until then, the sink
+meter and the dump remain the evidence, and the `|x| > 2` one-shot is replaced
+by first-three-plus-non-finite with the slice bounds (this probe).
