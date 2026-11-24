@@ -1028,11 +1028,24 @@ and clip events 212 -> 5, with 0 xruns. The sink meter is still not clean
 (`peak 377.6 dBFS`) because the 6 ch CRI movie voice carries finite ~1e18
 samples - a separate, already-recorded item that the guard must not touch.
 
-**Still not measured on the device: the intro cutscene's own audio.** Both route
-attempts this session stalled before gameplay (the OCR driver walked into the
-Exit dialog; the fixed-timeline walk delivered 170 touch events but no
-`CreateSourceVoice` follows the boot movies' 24.6 s one). The boot movie's 6 ch
-stream remains the device's only measured 5.1 path.
+**The device intro cutscene, measured.** A later OCR route read the Story
+submenu correctly and reached the tutorial HUD at 163 s (attract -> notices ->
+menu -> Story -> New Game -> confirm NO->YES -> difficulty -> loading). The log
+creates voices only at 1.0 s (the 2 ch Hw voice) and at 11.2 s / 23.3 s (6 ch
+CRI, the boot movies): **no 6 ch voice after 24.2 s**, so the in-engine intro is
+fed by the **2 ch Wwise mix**. Levels in the cutscene/loading window (109-163 s
+of a 199 s dump): continuous, RMS -13 .. -35 dBFS, peaks at 0.00 dBFS where the
+stale-tail artifact clips; 0 AAudio xruns. The boot movie's 6 ch stream remains
+the device's only measured 5.1 path.
+
+**The tail is a fill boundary.** A second profile with no NaN: `1024 frames -
+zero 0, non-finite 0, |x|>2 688, finite 336`, and the words are
+`409E91BC` (4.9553) repeated 688 times to the slice end - the slot's *previous*
+content, unchanged. Two buffers, two stale contents (NaN, then a constant), the
+same geometry: the feed declares 1024 frames per submit and the mixer commits
+fewer, so the host mixes a tail that is not this buffer's audio. The engine's
+committed frame count is not exposed (credits are per buffer), so a host "skip
+the tail" would be inventing a boundary - recorded, not done.
 
 ---
 

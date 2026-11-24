@@ -4115,3 +4115,45 @@ honest statement is: no finite sample changed, and the artifact's energy is gone
 movie voice's finite ~1e18 samples. Both need the engine's own fill bookkeeping
 (what it wrote, how many frames, into which slot) - the host sees only the
 declared `AudioBytes`. The guard is a *format* rule, not a fix for either.
+
+## 2026-11-24 - M4 close-out: the device intro cutscene is the 2 ch Wwise mix, and the tail is a *fill boundary*
+
+Two measurements finished the acceptance items.
+
+**The device intro cutscene, measured.** The OCR route (this time it read the
+Story submenu correctly) walked attract -> notices -> menu -> Story -> New Game
+-> confirm NO->YES -> difficulty -> loading and reached the tutorial HUD at
+163 s; the log shows `CreateSourceVoice` only at 1.0 s (2 ch float, mask 0x3,
+the Hw voice) and at 11.2 s / 23.3 s (6 ch CRI, the boot movies). **No 6 ch voice
+is created after 24.2 s**, so the in-engine intro is fed by the Hw voice's 2 ch
+Wwise mix - the corrected fact stands, and the 5.1 proof remains the boot
+movie's 6 ch stream. Levels in the cutscene/loading window (109-163 s of a 199 s
+dump): continuous, RMS -13 .. -35 dBFS with peaks at 0.00 dBFS where the
+stale-tail artifact below clips. AAudio xruns 0 in that window.
+
+**The tail is a *fill boundary*, and the numbers say so.** A second slice profile
+from a later buffer, this time with no NaN at all:
+
+```
+slice profile: 1024 frames - zero 0 [-1..0], non-finite 0 [-1..0], |x|>2 688, finite 336
+ring words rel 328..: 3D08F1FF 3CC6B1D6 3C883F9B 3C2C88BB 3B8A8D5B BB82C079 BC414BAA
+  BC8793B2 409E91BC 409E91BC 409E91BC ... (688 x 409E91BC, to the slice end)
+```
+
+`0x409E91BC` is the constant 4.9553 repeated 688 times, i.e. the *previous*
+content of the slot, unchanged to the end of the declared slice - exactly the
+shape of the NaN case (491 zeros, then 533 NaN). Two different buffers, two
+different stale contents, the same geometry: the feed declares 1024 frames per
+submit (its sound-table cfg gives `8 << 10` bytes) and the mixer commits fewer,
+so the host mixes a tail that is not this buffer's audio.
+
+That also explains why the meter climbs after the NaN guard: the stale tail is
+sometimes NaN (now zeroed) and sometimes a finite leftover like 4.955, which the
+guard must not touch. The audible effect is the same clipping, 0.029 % of frames.
+
+**What this leaves open, precisely.** The engine's *committed* frame count per
+buffer is not exposed to the host (credits are per buffer); the mixer's own fill
+cursor lives inside its object. Until that is readable, a host-side "skip the
+tail" would be inventing a boundary. The two candidate boundaries - `ring=4`
+slots against the feed's 8-slot cursor, and a credit delivered while the host
+reads the slot - are the next thing to measure, not to guess.
