@@ -970,8 +970,69 @@ burst (`C35F2F1A` = -223.184) next to it. That is an integer written into the
 engine's float PCM, not a decoder level; the host reads exactly the guest word.
 The dump clips 0.23 % (menu) / 0.34 % (loading) of samples as a result. Next:
 identify the burst in the engine's mixer (ring-slot header, limiter sentinel or
-an `AudioBytes` tail that is not decoded PCM). The Windows shim still lacks the
-callback invocation, so the oracle remains unfed; that divergence is recorded.
+an `AudioBytes` tail that is not decoded PCM). **Answered in 10.10**: the words
+are NaN in the uncommitted tail of a slot the engine rewrites while it is queued,
+and the Windows shim now invokes the callback too, so the oracle is fed.
+
+---
+
+### 10.10 Windows parity and the burst, identified (2026-11-24)
+
+The callback the Android shim gained in 10.9 was missing on Windows for the same
+reason, so the oracle's Hw voice was created, started and never queued. It is
+ported: `src/host/xaudio2_stub.c` recognises the callback at `CreateSourceVoice`
+(slot 4 == `0x0088B3F0`), counts retirements on the sink thread, and runs a
+worker thread that calls slot 4 once per retired buffer with the machine held
+and slot 0 (`0x0088B440`, the feed) only when `credits > BuffersQueued` by at
+most the ring depth - the same guard, for the same reason (the guest's
+`while (credits - queued)` loop wraps the counter without it).
+
+**Measured on the dGPU** (WASAPI shared, `KORRA_AUDIO_DUMP`, `KORRA_AUDIO_LOG=1`,
+`KORRA_XA2_VERBOSE=2`, fixed pad taps, 97 s and 174 s runs):
+
+| metric | value |
+|---|---|
+| voice | `CreateSourceVoice(2 ch, 48000 Hz, float, mask 0x3) -> #1 ... Hw feed (slot 4 credits, slot 0 submits)` at 1.0 s; worker started 1.2 s |
+| first submit | 655 ms, 8192 B = 1024 stereo float frames, `ctx=0` |
+| feed state | `credits=4`, `qcount` 2..4, 0 queue-full, 0 dry on the Hw voice |
+| title/menu music | continuous from 66 s; peak -6.8 .. -27.6 dBFS, RMS -24.9 .. -45.5 dBFS |
+| clipped frames | **0** of 8.35 M (device: 0.22 %) |
+| underruns | 0 from 30-100 s (Hw only); 460 in a 74 s CRI-movie window (6/s, all on the CRI voice) |
+| `OnVoiceError` | 0 |
+
+`scripts\run_selftest.ps1` (the harness gained a `native32_call_guest` recorder):
+**60 passed, 0 failed**. The movie-window underruns are the CRI feed's known
+deadline defect; an A/B against the binary without the callback gives 21 dry
+events in the boot-movie window against 19 here, so the worker does not regress
+the window both binaries reach (the later window is unreachable there - that
+binary's Wwise voice is never fed and 30-159 s is exact silence).
+
+**Acceptance tests 9.4, re-measured.** 2 is no longer blocked: menu/title music
+plays from 66 s at the level above (the host cannot see Wwise event ids, so
+*which* cue is not proven). 3's format clause is re-measured - 6 ch float through
+the engine's own 6x2 matrix, peak -7.13 dBFS - but its own terms (the 94.9 s
+`bgm_cs41_skip` stream) are unmet. 4 and 5 are Wwise-internal and not observable
+at the XAudio2 boundary; 6 stays unproven (no 32 kHz voice in 174 s). 7 passes on
+formats and errors, fails its underrun clause inside a movie minute.
+
+**The burst is identified (see `docs/FINDINGS.md`, 2026-11-24).** It is not an
+integer: the ring carries quiet NaN (`0x7FC00000`) in the *uncommitted tail* of a
+ring slot (491 frames of zeros, then 533 non-finite frames to the slice end) and
+the engine rewrites that slot while the host still mixes it (the slice's FNV
+changes between `SubmitSourceBuffer` and the probe). The `0x4F000000` /
+`0xCF000000` the first probe saw is the engine's own limiter saturating that NaN
+(`cvtps2dq` -> `INT_MIN` -> `cvtdq2ps`). The host now zeros exactly the
+non-finite words (they are not PCM in the engine's own IEEE float format), logs
+them, and leaves every finite value alone: clipped frames fell 0.2223 % -> 0.0290 %
+and clip events 212 -> 5, with 0 xruns. The sink meter is still not clean
+(`peak 377.6 dBFS`) because the 6 ch CRI movie voice carries finite ~1e18
+samples - a separate, already-recorded item that the guard must not touch.
+
+**Still not measured on the device: the intro cutscene's own audio.** Both route
+attempts this session stalled before gameplay (the OCR driver walked into the
+Exit dialog; the fixed-timeline walk delivered 170 touch events but no
+`CreateSourceVoice` follows the boot movies' 24.6 s one). The boot movie's 6 ch
+stream remains the device's only measured 5.1 path.
 
 ---
 

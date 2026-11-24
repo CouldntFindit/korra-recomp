@@ -7,7 +7,9 @@ sink runs, and the CRI movie audio is audible with the numbers in §6. The Wwise
 voice is now fed as well: the missing piece was the **voice callback** the shim
 never invoked (the engine's `OnVoiceProcessingPassStart` is the feed and
 `OnBufferEnd` credits the mixer), fixed with an XAudio2-style worker thread and
-measured as continuous menu music - see `docs/audio.md` §10.9. Sections 1-7 are
+measured as continuous menu music - see `docs/audio.md` §10.9. The Windows shim
+gained the same invocation (and the oracle's voice is fed too): §10.10, which also
+identifies the mix's `2^31` burst as a NaN tail the engine has not committed. Sections 1-7 are
 kept as written: the contract did not change, and each pitfall below cost
 exactly what it says.
 
