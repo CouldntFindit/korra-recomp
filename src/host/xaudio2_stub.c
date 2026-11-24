@@ -32,10 +32,13 @@
  * The source voice keeps a virtual playback clock (QPC * sample rate *
  * frequency ratio). Buffers retire as their frames elapse, so
  * GetState().BuffersQueued drains and CRI's 4-deep submit ring keeps moving
- * instead of stalling on a voice that never consumes anything. No guest
- * callback is invoked: CRI's OnBufferEnd (FUN_007b2a24) only increments a
- * counter and its feed loop is driven by GetState. M4 hangs a real sink and a
- * device clock here.
+ * instead of stalling on a voice that never consumes anything. CRI's
+ * completion callback (OnBufferEnd, FUN_007b2a24) is a single counter
+ * increment and is performed in C. The Hw output device's callback is real
+ * guest code on both slots and is invoked from a worker thread, exactly as
+ * XAudio2's own worker thread would: slot 4 (0x0088B3F0) once per retired
+ * buffer, slot 0 (0x0088B440, the feed) with a credit guard. Without it the
+ * Hw voice is never queued and the game's music never plays.
  */
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -47,6 +50,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <wchar.h>
 #include "native32.h"
 #include "audio_sink.h"
@@ -136,6 +140,10 @@ typedef struct xa2_voice {
     const void *cb;        /* guest IXAudio2VoiceCallback, or NULL */
     UINT32 cb_kind;        /* XA2_CB_* - what retirement dispatches to */
     UINT32 cb_warned;
+    volatile LONG cb_retired;  /* buffers the sink retired, owed to the callback thread */
+    UINT32 cb_ticks;           /* diagnostics: callback ticks that had work */
+    UINT32 cb_feeds;           /* diagnostics: slot 0 (feed) invocations */
+    UINT32 oor_warned;         /* diagnostics: bad samples printed for this voice */
     xa2_slice q[XA2_QUEUE_MAX];
     /* The engine's own downmix, installed through SetOutputMatrix. CRI computes
      * this once per voice (FUN_007b27e2) and it is the level the shipping game
@@ -153,10 +161,18 @@ typedef struct xa2_voice {
 #define XA2_CB_NONE        0u
 #define XA2_CB_CRI_COUNTER 1u
 #define XA2_CB_OTHER       2u
+/* The Hw output device's own IXAudio2VoiceCallback (object device+0x28, vtable
+ * 0x0091ECC8). Slot 4 is not a counter body we may perform in C: it is the
+ * engine's mixer wake-up, and slot 0 is the feed that tops the voice up. Both
+ * have to run as guest code, on a host thread, exactly as XAudio2's own worker
+ * would - see the callback thread below. */
+#define XA2_CB_HW_FEED     3u
 
 /* Guest VAs this stub recognises, from docs/xaudio2_callsites.md. The image is
  * mapped at its own base (Fixed, no ASLR), so these are stable identities. */
 #define XA2_CB_ONBUFFEREND_VA 0x7B2A24u   /* CriNcvXAudio2VoiceCallback slot 4 */
+#define XA2_CB_HW_ONBUFFEREND_VA 0x88B3F0u /* Hw device callback slot 4 */
+#define XA2_CB_HW_FEED_VA        0x88B440u /* Hw device callback slot 0 */
 
 typedef struct {
     const xa2_fn *vtbl;
@@ -299,6 +315,15 @@ static UINT64 xa2_voice_cursor(xa2_voice *v) {
  * the output thread - never the guest's). Only retire a buffer once its PCM is
  * no longer needed: early free is a dropout, late is a stall. */
 static void xa2_dispatch_buffer_end(xa2_voice *v, const void *ctx) {
+    if (v->cb_kind == XA2_CB_HW_FEED) {
+        /* The Hw output device's callback object: slot 4 is 0x0088B3F0, which
+         * credits one more buffer and wakes the engine's mixer. It runs on the
+         * callback thread, never here (the sink callback must not take the
+         * machine lock), and the feed submits these buffers with pContext = 0,
+         * so the credit cannot be conditioned on ctx. */
+        InterlockedIncrement(&v->cb_retired);
+        return;
+    }
     if (!ctx) {
         g_stats.callbacks_no_context++;
         return;
@@ -321,6 +346,107 @@ static void xa2_dispatch_buffer_end(xa2_voice *v, const void *ctx) {
                 (void *)v, v->cb,
                 (v->cb && xa2_readable(v->cb, 4)) ? *(const UINT32 *)*(const void *const *)v->cb : 0u);
     }
+}
+
+/* --------------------------------------------- the XAudio2 callback thread
+ * XAudio2 2.7 invokes IXAudio2VoiceCallback on its own worker thread, and the
+ * engine depends on it. The Hw output device registers the object at device+0x28
+ * as its voice callback:
+ *   slot 4 (OnBufferEnd)              0x0088B3F0  decrements the credit counter
+ *                                                at device+0x68 (read here as
+ *                                                cb+0x40) and wakes the mixer
+ *   slot 0 (OnVoiceProcessingPassStart) 0x0088B440  GetState, then submit
+ *                                                credits - BuffersQueued buffers
+ *                                                from the engine's 8-slot ring
+ * Before this thread existed the shim performed CRI's counter in C, logged the
+ * Hw callback as "other" and never invoked it: the mixer produced its four
+ * buffers and the voice was never queued (the Android twin measured exactly
+ * that). The thread is the host twin of XAudio2's worker: on the sink thread we
+ * only count retirements, and no guest code is entered from there.
+ *
+ * The guard is load-bearing. The guest's loop is
+ * `while (credits - BuffersQueued != 0) submit` and re-reads `credits` on every
+ * iteration, so a tick with credits < queued can never converge and runs until
+ * the 32-bit counter wraps (measured on Android without it: 8,669,699 submitted
+ * buffers in 90 s, 843 MB of log, 1.76 s frames). So the feed is called only
+ * when credits is ahead of the voice's queue and by no more than the ring depth,
+ * and the decision is taken with the machine held, so no other guest thread can
+ * move the counter between the read and the call.
+ *
+ * The shipped bodies are plain __stdcall with `this` as the first stack argument
+ * (slots 0 and 4 both end in `ret 8`), which native32_call_guest reproduces. */
+#define XA2_CB_PERIOD_MS 10
+
+static HANDLE g_cb_thread;
+static volatile LONG g_cb_started, g_cb_stop;
+
+static void xa2_call_slot(UINT32 cb, UINT32 slot) {
+    UINT32 vt, fn, args[2];
+    if (!xa2_readable((const void *)(uintptr_t)cb, 4)) return;
+    vt = *(const UINT32 *)(uintptr_t)cb;
+    if (!vt || !xa2_readable((const void *)(uintptr_t)(vt + slot * 4), 4)) return;
+    fn = *(const UINT32 *)(uintptr_t)(vt + slot * 4);
+    if (!fn) return;
+    args[0] = cb;
+    args[1] = 0;
+    native32_call_guest(fn, 2, args);
+}
+
+static DWORD WINAPI xa2_cb_thread_main(LPVOID arg) {
+    (void)arg;
+    while (!g_cb_stop) {
+        int i;
+        for (i = 0; i < XA2_MAX_VOICES; i++) {
+            xa2_voice *v;
+            UINT32 cb = 0, n = 0, credits = 0, qc = 0;
+            int log;
+            xa2_lock();
+            v = &g_voices[i];
+            if (v->magic != XA2_MAGIC || v->cb_kind != XA2_CB_HW_FEED || !v->cb) {
+                xa2_unlock();
+                continue;
+            }
+            cb = (UINT32)(uintptr_t)v->cb;
+            n = (UINT32)InterlockedExchange(&v->cb_retired, 0);
+            if (n > XA2_QUEUE_MAX) n = XA2_QUEUE_MAX;   /* ring depth; a tick cannot owe more */
+            qc = v->qcount;
+            if (xa2_readable((const void *)(uintptr_t)(cb + 0x40), 4))
+                credits = *(volatile UINT32 *)(uintptr_t)(cb + 0x40);
+            log = v->cb_ticks < 12;
+            xa2_unlock();
+
+            mach_enter();
+            if (log && n) {
+                v->cb_ticks++;
+                xa2_log("cb tick(#%d): credits=%u qcount=%u end=%u",
+                        (int)(v - g_voices), credits, qc, n);
+            }
+            while (n--) xa2_call_slot(cb, 4);       /* OnBufferEnd */
+            xa2_lock();
+            qc = v->qcount;
+            credits = xa2_readable((const void *)(uintptr_t)(cb + 0x40), 4)
+                          ? *(volatile UINT32 *)(uintptr_t)(cb + 0x40) : 0;
+            xa2_unlock();
+            if (credits > qc && credits - qc <= XA2_QUEUE_MAX) {
+                v->cb_feeds++;
+                xa2_call_slot(cb, 0);               /* OnVoiceProcessingPassStart */
+            }
+            mach_leave();
+        }
+        Sleep(XA2_CB_PERIOD_MS);
+    }
+    return 0;
+}
+
+static void xa2_cb_ensure_thread(void) {
+    if (InterlockedCompareExchange(&g_cb_started, 1, 0) != 0) return;
+    g_cb_thread = CreateThread(NULL, 0, xa2_cb_thread_main, NULL, 0, NULL);
+    if (!g_cb_thread) {
+        InterlockedExchange(&g_cb_started, 0);
+        xa2_log("callback thread: CreateThread failed; the Hw voice stays unfed");
+        return;
+    }
+    if (g_verbose) xa2_log("callback thread started (the Hw voice's feed)");
 }
 
 static void xa2_slice_complete(xa2_voice *v, const xa2_slice *s) {
@@ -468,6 +594,53 @@ static void xa2_mix_voice(xa2_voice *v, float *out, int frames) {
         xa2_read_at(v, v->pos, &l, &r);
         out[2 * i] += l * v->volume;
         out[2 * i + 1] += r * v->volume;
+        /* First three per voice out of range: a sample that leaves [-1,1] far
+         * enough can only be a read of the wrong memory, not the engine's own
+         * level. NaN/Inf are included - fabsf(NaN) > 2 is false, which is why
+         * the old probe missed the sink's nan/186 dBFS reading. The slice
+         * bounds, the raw word and a window of the ring around it name the
+         * source: 0x4F000000 / 0xCF000000 is +/-2^31 as float. */
+        if (v->oor_warned < 3 &&
+            (!isfinite(l) || !isfinite(r) || fabsf(l) > 2.0f || fabsf(r) > 2.0f)) {
+            const xa2_slice *s = &v->q[v->qhead];
+            UINT64 i0 = (UINT64)v->pos;
+            UINT32 raw = 0;
+            v->oor_warned++;
+            if (s->data && i0 >= s->start) {
+                UINT64 rel = i0 - s->start;
+                const BYTE *p = s->data + (size_t)rel * v->block_align;
+                if (xa2_readable(p, 4)) raw = *(const UINT32 *)p;
+            }
+            xa2_log("voice %d bad sample l=%g r=%g (pos %.1f, slice [%llu,%llu), "
+                    "i0=%llu, rel=%llu, raw=%08X, ch %u, bits %u, float %u, matrix %u, "
+                    "q=%u, rate %u, ratio %.3f, data %p)",
+                    (int)(v - g_voices), (double)l, (double)r, v->pos,
+                    (unsigned long long)s->start, (unsigned long long)s->end,
+                    (unsigned long long)i0,
+                    (unsigned long long)(i0 >= s->start ? i0 - s->start : 0), raw,
+                    v->channels, v->bits, v->is_float, v->matrix_ch, v->qcount,
+                    v->rate, (double)v->ratio, (const void *)s->data);
+            if (s->data) {
+                char buf[640];
+                int n = 0, w;
+                UINT64 len = s->end - s->start;
+                UINT64 base = (i0 > 8 && i0 - 8 >= s->start) ? i0 - s->start - 8 : 0;
+                for (w = 0; w < 32 && n < (int)sizeof buf - 12; w++) {
+                    UINT64 rel = base + (UINT64)w;
+                    const BYTE *p;
+                    UINT32 val;
+                    if (rel >= len) break;
+                    p = s->data + (size_t)rel * v->block_align;
+                    if (!xa2_readable(p, 4)) break;
+                    val = *(const UINT32 *)p;
+                    n += snprintf(buf + n, sizeof buf - (size_t)n, "%s%08X",
+                                  w ? " " : "", val);
+                }
+                xa2_log("  ring words rel %llu.. (%llu frames in slice, data%%4096=0x%llX): %s",
+                        (unsigned long long)base, (unsigned long long)len,
+                        (unsigned long long)((uintptr_t)s->data & 0xFFF), buf);
+            }
+        }
         v->pos += step;
     }
     if (v->qcount) v->dry = 0;
@@ -854,13 +1027,18 @@ static HRESULT __stdcall dev_CreateSourceVoice(xa2_device *self, void **pp, cons
     v->block_align = fmt->nBlockAlign ? fmt->nBlockAlign
                                       : v->channels * (v->bits / 8);
     /* Identify the completion callback now, not per retired buffer: the guest
-     * keeps the object alive for the voice's lifetime. */
+     * keeps the object alive for the voice's lifetime. Three kinds are known:
+     * CRI's counter body (performed in C), the Hw output device's callback
+     * (whose slot 4 and slot 0 are real guest bodies, called from the callback
+     * thread), and everything else (left alone). */
     v->cb = cb;
     v->cb_kind = XA2_CB_NONE;
     if (cb && xa2_readable(cb, sizeof(void *))) {
         const UINT32 *vtbl = *(const UINT32 *const *)cb;
         if (vtbl && xa2_readable(vtbl, 5 * sizeof(UINT32))) {
-            v->cb_kind = (vtbl[4] == XA2_CB_ONBUFFEREND_VA) ? XA2_CB_CRI_COUNTER : XA2_CB_OTHER;
+            if (vtbl[4] == XA2_CB_ONBUFFEREND_VA) v->cb_kind = XA2_CB_CRI_COUNTER;
+            else if (vtbl[4] == XA2_CB_HW_ONBUFFEREND_VA) v->cb_kind = XA2_CB_HW_FEED;
+            else v->cb_kind = XA2_CB_OTHER;
         }
     }
     *pp = v;
@@ -871,7 +1049,9 @@ static HRESULT __stdcall dev_CreateSourceVoice(xa2_device *self, void **pp, cons
                 v->is_float ? "float" : "pcm",
                 fmt->wFormatTag, v->channel_mask, max_ratio, (int)(v - g_voices), cb,
                 v->cb_kind == XA2_CB_CRI_COUNTER ? "CRI counter" :
+                v->cb_kind == XA2_CB_HW_FEED ? "Hw feed (slot 4 credits, slot 0 submits)" :
                 v->cb_kind == XA2_CB_OTHER ? "other" : "none");
+    if (v->cb_kind == XA2_CB_HW_FEED) xa2_cb_ensure_thread();
     /* The Hw output device copies its prefill parameters out of the game's
      * sound table at creation (0x0088B2CD reads [0xCA243C], walks 0x38-byte
      * entries comparing the 64-bit key at +0x10; 0x0088B2FF/0x0088B30E skip

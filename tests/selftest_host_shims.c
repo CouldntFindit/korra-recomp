@@ -30,6 +30,19 @@ uint32_t g_cur_func;
 void mach_enter(void) {}
 void mach_leave(void) {}
 
+/* The Hw voice's callback slots are guest code (native32_call_guest in the real
+ * host). This harness has no guest, so record the request instead; no test here
+ * registers the Hw callback, so it is only a link target. */
+uint32_t g_guest_calls;
+uint32_t g_guest_last_va, g_guest_last_nargs, g_guest_last_arg0, g_guest_last_arg1;
+void native32_call_guest(uint32_t va, int nargs, const uint32_t *args) {
+    g_guest_calls++;
+    g_guest_last_va = va;
+    g_guest_last_nargs = (uint32_t)nargs;
+    g_guest_last_arg0 = nargs > 0 ? args[0] : 0;
+    g_guest_last_arg1 = nargs > 1 ? args[1] : 0;
+}
+
 static int g_fail, g_pass;
 
 #define CHECK(cond, what)                                                      \

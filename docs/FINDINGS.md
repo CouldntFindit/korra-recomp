@@ -3929,3 +3929,87 @@ reached the tutorial HUD in about 100 s; the log still shows no 6 ch
 this build is not a CRI 6 ch movie. The 5.1 stream therefore remains proven on
 device only by the boot movie, and the intro cutscene's own audio is the 2 ch
 Wwise mix (measured through the loading transition above).
+
+## 2026-11-24 - M4 parity: the Windows shim feeds the Hw voice too, and its mix is clean
+
+The activation fix was host-side, so the Windows shim had exactly the same hole it
+had on Android: it performed CRI's completion counter in C, classified the Hw
+device's callback as "other" and never invoked either slot. The Hw voice was
+created and started on the dGPU as well and never queued. It is now fed by the
+same model as the Android shim - a host worker thread that is the twin of
+XAudio2's own callback thread - and the Windows mix measures clean where the
+device's does not (next entry).
+
+**The port (`src/host/xaudio2_stub.c`).** A third callback kind,
+`XA2_CB_HW_FEED`, is recognised at `CreateSourceVoice` by vtable slot 4 ==
+`0x0088B3F0` (the object the device registers is `device+0x28`, so `cb+0x40` is
+the credit counter at `device+0x68`). Retirement on the sink thread only does
+`InterlockedIncrement(cb_retired)`; nothing enters guest code from there. A
+worker thread (`xa2_cb_ensure_thread`, started when such a voice is created)
+runs every 10 ms and, with the machine held:
+
+* calls slot 4 (`OnBufferEnd`) once per retired buffer (capped at the 8-deep
+  ring), so the engine's mixer is credited and woken;
+* re-reads `credits` and `BuffersQueued` **after** those calls and calls slot 0
+  (`OnVoiceProcessingPassStart`, the feed `0x0088B440`) only when
+  `credits > queued` and by no more than the ring depth.
+
+The guard matters for the reason recorded on Android: the guest loop re-reads
+the counter every iteration, and a tick with `credits < queued` runs until the
+32-bit counter wraps (8,669,699 submits in 90 s). Calls go through
+`native32_call_guest`, which the runtime already supports from a foreign thread
+(`mach_enter` gives it a guest stack and TIB on first entry); the ledger's
+"do not re-enter the guest from inside a COM method" warning is about the
+lifted caller's registers, not about a host thread with its own machine state.
+`tests/selftest_host_shims.c` gained a `native32_call_guest` recorder so the
+harness links; `scripts\run_selftest.ps1`: **60 passed, 0 failed**.
+
+**Measured on the dGPU (RTX 5050, WASAPI shared, `KORRA_AUDIO_DUMP`,
+`KORRA_AUDIO_LOG=1`, `KORRA_XA2_VERBOSE=2`, fixed pad taps).**
+
+| metric | run A (97 s) | run B (174 s) |
+|---|---|---|
+| `CreateSourceVoice` 2 ch float mask 0x3 | 1.0 s, `cb=0D723648 Hw feed (slot 4 credits, slot 0 submits)` | 1.0 s, same |
+| callback thread | started 1.2 s | started 1.2 s |
+| first Hw submit | 655 ms, 8192 B = 1024 frames, ctx=00000000 | 799 ms, same |
+| feed state | `cb tick(#1): credits=4 qcount=2..4` | same, 0 queue-full, 0 dry on voice #1 |
+| title/menu music | **66-97 s continuous**, peak -17.8 .. -27.4, RMS -30.1 .. -38.4 dBFS | **66-174 s continuous**, peak -6.8 .. -27.6, RMS -24.9 .. -45.5 dBFS |
+| 6 ch CRI voices | boot movies only (4.2 s on) | boot movies + 105.8 s and 136.4 s (Stop/Flush/Destroy at `0x7B2D0E`, 800-frame buffers) |
+| clipped frames in the dump | 0 of 4.66 M | **0 of 8.35 M** |
+| underruns | 16 by 20 s (boot movies), 0 from 30 s to the end | 19 by 30 s (boot movies), **0 from 30-100 s** (Hw voice only), 460 in the 74 s CRI-movie window (100-174 s, 6/s) |
+| `OnVoiceError` | 0 | 0 |
+
+The menu music level matches the device's post-fix band (peak -7.5..0, RMS
+-30..-35), so the shared matrix/level contract holds on both hosts. Run B's
+under-run cluster is the **CRI movie feed**, not the Hw voice: every `ran dry`
+line names voice `684CB7D0` (a CRI 6 ch movie device, 800-frame buffers, sink
+blocks of 480 frames), and none names voice #1. The same defect is in the
+recorded gameplay run (89 underruns in a movie minute); this machine-day puts it
+at 6/s. An A/B against `build\run_m4e.exe` (the binary without the callback) was
+run on the same tap timeline: its boot-movie window gives **21** dry events
+against **19** here, so the callback thread does not regress the movie feed in
+the window both binaries reach; the later window is unreachable there (its
+Wwise voice is never fed, so 30-159 s is exact silence).
+
+**`docs/audio.md` 9.4, re-measured.** Test 2 is no longer blocked: menu/title
+music plays from 66 s on both runs at the level above (the host cannot see Wwise
+event ids, so *which* cue it is is not proven). Test 3's format clause is
+measured again - the 6 ch CRI voices go through the engine's own 6x2 matrix
+(peak -7.13 dBFS at 126 s) - but its own terms (the 94.9 s `bgm_cs41_skip`
+stream) are still unmet, and this run had no file tracing, so "the stream was
+never opened" is not re-asserted. Tests 4, 5 and 6 remain unproven for engine
+reasons, not host reasons: 4 and 5 are Wwise-internal (a one-shot over a running
+cue, and pause/resume, are not observable at the XAudio2 boundary), and no
+32 kHz mono voice was created in 174 s. Test 7 passes on formats and errors; its
+underrun clause fails inside a movie minute, as above.
+
+**Also in this session (diagnostics).** The Windows mixer gained the Android
+one-shot bad-sample probe (first three per voice, NaN/Inf included, with the
+slice bounds, the raw word and a 32-word hex window of the ring), and the
+Android probe gained the same window plus an FNV hash of the slice taken at
+`SubmitSourceBuffer` and re-taken at the probe (`REWRITTEN since submit`).
+
+**Not verified.** The device-side numbers in the next entry are the S24's; this
+entry's are Windows only. Whether the CRI movie feed's 6/s is the worker
+thread's contention or the pre-existing deadline defect is not separated in the
+window only the new binary reaches.
