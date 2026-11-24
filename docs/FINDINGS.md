@@ -4013,3 +4013,63 @@ Android probe gained the same window plus an FNV hash of the slice taken at
 entry's are Windows only. Whether the CRI movie feed's 6/s is the worker
 thread's contention or the pre-existing deadline defect is not separated in the
 window only the new binary reaches.
+
+## 2026-11-24 - M4 burst: it is a NaN tail the engine has not committed, not an integer
+
+The `2^31` the sink meter reported is a **symptom**. The slice-level probe (the
+32-word ring window plus a whole-slice class profile, both added this session)
+caught the words themselves on the S24:
+
+```
+voice 1 bad sample l=nan r=nan (pos 1941381.0, slice [1940891,1941915), i0=1941381,
+  rel=490, raw=00000000, ch 2, bits 32, float 1, matrix 0, q=3, rate 48000,
+  ratio 1.000, data 2242C770, hash 38516DC5 (at submit A5275264 - REWRITTEN since submit))
+  slice profile: 1024 frames - zero 491 [0..490], non-finite 533 [491..1023], |x|>2 0,
+  finite 0, q=3 pos=1941381
+```
+
+Four facts, in order of how much they settle:
+
+1. **The words are NaN, not integers.** `0x7FC00000` is the quiet NaN; the
+   `0x4F000000`/`0xCF000000` pair the earlier probe saw is what the *engine's
+   own* limiter makes of it - a float-to-int saturating convert (`cvtps2dq`,
+   present at `0x88A999`-`0x88A9BB` inside a `mulps/cvtps2dq/packssdw`
+   conversion loop) clamps NaN to `INT_MIN`, and `cvtdq2ps` turns that back into
+   exactly `-2^31` (`0xCF000000`) or `+2^31` (`0x4F000000`). The ring holds NaN;
+   the full-scale clipping in the dump is the engine's own saturation of it,
+   downstream of the ring.
+2. **It is not inside committed frames: it is the tail of a ring slot.** The
+   1024-frame slice is 491 frames of exact zeros followed by 533 non-finite
+   frames that run to the slice end (`491 + 533 = 1024`). No finite sample is in
+   that buffer at the moment of the probe.
+3. **The engine rewrote the buffer while it was still queued and being mixed.**
+   The FNV taken at `SubmitSourceBuffer` (`A5275264`) differs from the one taken
+   at the probe (`38516DC5`), and the probe reads the map's head slice (`q=3`,
+   `pos` 490 frames inside it). So this is not a decoder level and not a torn
+   *sample*: the host is reading memory the engine has not finished committing.
+4. **The audible effect is a burst, not a level.** The 679 s dump from the same
+   build clips 0.2223 % of frames in 212 events (0.31/s); the first is at
+   51.449 s, where the probe fires, and the seconds around it read peak
+   0.00 dBFS against -11..-15 dBFS of music either side. The 6 ch CRI voice also
+   produced one finite out-of-range sample (-6.9, hash unchanged) - that is the
+   old, already-recorded single-sample case, a different thing.
+
+**Decision table, applied.** This is the "partially filled `AudioBytes` tail the
+engine never commits" row. What the host can prove about the words is narrow and
+exact: in the engine's own format (IEEE float32, the GUID at `0x9090FC`), NaN is
+not a PCM value at all. So the host may zero exactly the non-finite words - no
+finite value is touched, no level is invented - and the engine's frame count
+stays the authority for everything else. It may **not** clamp, attenuate or skip
+the range: the tail is the engine's buffer, and the dropouts it causes are its
+business. The next entry is that guard, measured.
+
+**Still open (named, not solved).** *Why* the tail holds NaN: the mixer writes
+into the slot while the host reads it, and the region it has not written yet
+holds whatever was there before - this run, NaN. Where those NaN bits enter (a
+ring slot poisoned once by a decoder, or an uninitialised fill in the engine) is
+not established, and with credits counted per buffer (1024 frames, from the sound
+table's cfg) the host cannot know how many frames the mixer has committed. The
+`ring=4 depth=4` the table reports against the feed's 8-slot cursor (`cmp ax,8`)
+is the shape to check next: with 4 slots in flight and a refill 4 ahead, a credit
+delivered while the host still reads a slot rewrites exactly the buffer being
+mixed.

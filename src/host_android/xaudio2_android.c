@@ -72,6 +72,9 @@ typedef struct {
     uint64_t start, end;   /* absolute source frames */
     uint32_t data;         /* guest VA of the PCM slice (owned by the guest) */
     uint32_t ctx;          /* guest VA of pBufferContext */
+    uint32_t hash;         /* FNV of the payload at submit: a mismatch at probe
+                            * time means the engine rewrote a buffer we still
+                            * read (torn read), not that it wrote an integer. */
 } xv_slice;
 
 typedef struct {
@@ -94,6 +97,7 @@ typedef struct {
     uint32_t overflow_logged, cb_logs;
     uint32_t submits, gs_calls, last_logged_q;
     int had_data, dry, oor_warned;
+    uint32_t bad_slices;   /* diagnostics: whole-slice profiles printed */
     uint32_t matrix_ch;
     float matrix[8 * 2];
     xv_slice q[XV_QUEUE_MAX];
@@ -519,6 +523,23 @@ static void xv_read_at(xv_voice *v, double p, float *l, float *r) {
     *r = r0 + (r1 - r0) * f;
 }
 
+/* FNV-1a over every second word of a slice. Cheap enough to run per submit
+ * (1024 reads for a 8192-byte buffer) and it answers one question the probe
+ * cannot otherwise: was the payload the host mixes the same bytes the engine
+ * handed over at SubmitSourceBuffer, or did the engine rewrite the buffer while
+ * it was still queued? */
+static uint32_t xv_slice_hash(uint32_t data, uint32_t frames, uint32_t align) {
+    uint32_t h = 2166136261u, i, words;
+    if (!data || !align || align < 4) return 0;
+    words = frames * (align / 4);
+    for (i = 0; i < words; i += 2) {
+        uint32_t va = data + i * 4;
+        if (!xv_readable(va, 4)) return 0;
+        h = (h ^ MEM32(va)) * 16777619u;
+    }
+    return h;
+}
+
 static void xv_mix_voice(xv_voice *v, float *out, int frames) {
     double step = (double)v->rate * (double)(v->ratio > 0.0f ? v->ratio : 1.0f) /
                   (double)KORRA_AUDIO_RATE;
@@ -547,18 +568,79 @@ static void xv_mix_voice(xv_voice *v, float *out, int frames) {
             const xv_slice *s = &v->q[v->qhead];
             uint64_t i0 = (uint64_t)v->pos;
             uint32_t raw = 0;
+            uint32_t rel = 0;
+            uint32_t now_hash = 0;
             v->oor_warned++;
             if (s->data && i0 >= s->start) {
-                uint64_t rel = i0 - s->start;
-                uint32_t va = s->data + (uint32_t)(rel * v->channels * (v->bits / 8));
+                rel = (uint32_t)(i0 - s->start);
+                uint32_t va = s->data + rel * v->block_align;
                 if (xv_readable(va, 4)) raw = MEM32(va);
             }
+            if (s->data)
+                now_hash = xv_slice_hash(s->data, (uint32_t)(s->end - s->start),
+                                         v->block_align);
             xv_log("voice %d bad sample l=%g r=%g (pos %.1f, slice [%llu,%llu), "
-                   "i0=%llu, raw=%08X, ch %u, bits %u, float %u, matrix %u, q=%u, data %08X)",
+                   "i0=%llu, rel=%u, raw=%08X, ch %u, bits %u, float %u, matrix %u, "
+                   "q=%u, rate %u, ratio %.3f, data %08X, hash %08X (at submit %08X%s))",
                    (int)(v - g_v), (double)l, (double)r, v->pos,
                    (unsigned long long)s->start, (unsigned long long)s->end,
-                   (unsigned long long)i0, raw, v->channels, v->bits, v->is_float,
-                   v->matrix_ch, v->qcount, s->data);
+                   (unsigned long long)i0, rel, raw, v->channels, v->bits, v->is_float,
+                   v->matrix_ch, v->qcount, v->rate, (double)v->ratio, s->data,
+                   now_hash, s->hash,
+                   now_hash && s->hash && now_hash != s->hash
+                       ? " - REWRITTEN since submit" : "");
+            /* The words around the sample, so the burst's shape can be read off
+             * one line: contiguous (a header/tail) or periodic (a stride bug). */
+            if (s->data) {
+                char buf[640];
+                int n = 0, w;
+                uint64_t len = s->end - s->start;
+                uint64_t base = (rel > 8) ? rel - 8 : 0;
+                for (w = 0; w < 32 && n < (int)sizeof buf - 12; w++) {
+                    uint64_t r2 = base + (uint64_t)w;
+                    uint32_t va, val;
+                    if (r2 >= len) break;
+                    va = s->data + (uint32_t)(r2 * v->block_align);
+                    if (!xv_readable(va, 4)) break;
+                    val = MEM32(va);
+                    n += snprintf(buf + n, sizeof buf - (size_t)n, "%s%08X",
+                                  w ? " " : "", val);
+                }
+                xv_log("  ring words rel %llu.. (%llu frames in slice, data%%4096=0x%X): %s",
+                       (unsigned long long)base, (unsigned long long)len,
+                       (unsigned)(s->data & 0xFFF), buf);
+            }
+            /* Whole-slice profile: the first bad sample does not say whether the
+             * bad words are a tail the engine never filled, a contiguous block,
+             * or scattered. Count the classes and the span of each. */
+            if (s->data && v->bad_slices < 12) {
+                uint32_t zero_n = 0, nan_n = 0, huge_n = 0, fin_n = 0;
+                uint32_t zero_a = 0xFFFFFFFFu, zero_b = 0, nan_a = 0xFFFFFFFFu, nan_b = 0;
+                uint64_t len = s->end - s->start, k;
+                v->bad_slices++;
+                for (k = 0; k < len; k++) {
+                    float x;
+                    uint32_t va = s->data + (uint32_t)(k * v->block_align);
+                    if (!xv_readable(va, 4)) break;
+                    memcpy(&x, ka_host(va), 4);
+                    if (x == 0.0f) {
+                        zero_n++;
+                        if (k < zero_a) zero_a = (uint32_t)k;
+                        zero_b = (uint32_t)k;
+                    } else if (!isfinite(x)) {
+                        nan_n++;
+                        if (k < nan_a) nan_a = (uint32_t)k;
+                        nan_b = (uint32_t)k;
+                    } else if (fabsf(x) > 2.0f) huge_n++;
+                    else fin_n++;
+                }
+                xv_log("  slice profile: %llu frames - zero %u [%d..%u], non-finite %u [%d..%u], "
+                       "|x|>2 %u, finite %u, q=%u pos=%.0f",
+                       (unsigned long long)len, zero_n,
+                       zero_n ? (int)zero_a : -1, zero_n ? zero_b : 0,
+                       nan_n, nan_n ? (int)nan_a : -1, nan_n ? nan_b : 0,
+                       huge_n, fin_n, v->qcount, v->pos);
+            }
         }
         v->pos += step;
     }
@@ -1065,6 +1147,7 @@ static uint32_t src_call(int slot) {
         slot_p->end = end;
         slot_p->data = data + (uint32_t)((size_t)play_begin * v->block_align);
         slot_p->ctx = ctx;
+        slot_p->hash = xv_slice_hash(slot_p->data, (uint32_t)frames, v->block_align);
         v->qcount++;
         v->next_end = end;
         v->had_data = 1;
