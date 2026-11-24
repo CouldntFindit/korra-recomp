@@ -98,6 +98,8 @@ typedef struct {
     uint32_t submits, gs_calls, last_logged_q;
     int had_data, dry, oor_warned;
     uint32_t bad_slices;   /* diagnostics: whole-slice profiles printed */
+    uint32_t nan_words;    /* float words that were not PCM and were zeroed */
+    uint32_t nan_logged;   /* diagnostics: the first three named */
     uint32_t matrix_ch;
     float matrix[8 * 2];
     xv_slice q[XV_QUEUE_MAX];
@@ -449,6 +451,23 @@ static float xv_sample_ch(const xv_voice *v, const xv_slice *s, uint32_t idx, ui
     if (v->is_float && v->bits == 32) {
         float f;
         memcpy(&f, p, 4);
+        /* NaN/Inf are not PCM in the engine's own IEEE float format, and the
+         * slice probe named where they come from: the uncommitted tail of a
+         * ring slot the engine is still writing (hash changed since submit).
+         * Output silence for exactly those words - every finite value is left
+         * untouched, so this invents no level - and count them. Not silent:
+         * the probe still logs the slice, and this logs the first three. */
+        if (!isfinite(f)) {
+            xv_voice *w = (xv_voice *)v;
+            w->nan_words++;
+            if (w->nan_logged < 3) {
+                w->nan_logged++;
+                xv_log("voice %d: non-finite word in the mix (%08X at rel %u ch %u), "
+                       "zeroed - %u so far", (int)(v - g_v),
+                       *((const uint32_t *)p), idx, ch, w->nan_words);
+            }
+            return 0.0f;
+        }
         return f;
     }
     if (v->bits == 16) return (float)(*(const int16_t *)p) * (1.0f / 32768.0f);

@@ -4073,3 +4073,45 @@ table's cfg) the host cannot know how many frames the mixer has committed. The
 is the shape to check next: with 4 slots in flight and a refill 4 ahead, a credit
 delivered while the host still reads a slot rewrites exactly the buffer being
 mixed.
+
+## 2026-11-24 - M4 burst follow-up: the NaN guard, measured (and what it does not fix)
+
+The decision table's row 2 licenses exactly one host action: zero the words that
+the engine's own float32 format says are not PCM, touch nothing else, and
+re-measure. That is now in `xv_sample_ch` (Android): a non-finite float is
+returned as silence, counted per voice, and the first three per voice are logged
+with the word, the slice-relative index and the running count. No finite value is
+clamped, attenuated or skipped.
+
+**Measured, same APK lineage, 114 s run with the dump and `debug.korra.xa2=1`:**
+
+| metric | before the guard | after the guard |
+|---|---|---|
+| clipped frames in the dump | 72468 of 32.6 M over 679 s (**0.2223 %**) | 1586 of 5.47 M over 114 s (**0.0290 %**) |
+| clip events | 212 (0.31/s) | **5** |
+| first event | 51.449 s (the probe's first NaN) | 19.427 s (2 frames) |
+| clamp bursts in the music window | every ~0.3 s | none |
+| sink meter | `peak=186.6 dBFS rms=nan` (earlier run), `47.3 dBFS` (another) | `peak=377.6 dBFS rms=307.4` - **not clean** |
+| xruns | 13 early | **0** in 114 s |
+
+So the NaN bursts are gone: 212 events become 5, and the music window no longer
+clips. The meter is nevertheless **not** clean, and the reason is a *different*
+source that the guard must not touch: the 6 ch CRI movie voice carries a few
+**finite** values around 1e18 (`l=7.55e18 r=0.00033` at 19.6 s, `l=104.8` at
+26.4 s, hash unchanged since submit), which is ~377 dBFS and clips 0.014 % of
+frames. Those are finite words inside a committed buffer, so under the same rule
+they stay in the mix; the item was already recorded as the 6 ch voice's
+out-of-range samples and it is still open.
+
+**RMS honesty.** Zeroing the clamped frames *lowers* a dump's RMS by construction
+(they were full-scale): in the 679 s before-dump, RMS as written is -25.91 dBFS
+and -32.51 dBFS with the clamped frames zeroed. The music's level is the second
+number; the first was inflated by the artifact. Per-second music RMS in the guard
+run sits in the same -25 .. -38 dBFS band as before, i.e. no audible level moved
+- but "RMS unchanged" cannot be asserted across two different routes, so the
+honest statement is: no finite sample changed, and the artifact's energy is gone.
+
+**Not fixed, named.** Why the slot's uncommitted tail holds NaN, and the 6 ch
+movie voice's finite ~1e18 samples. Both need the engine's own fill bookkeeping
+(what it wrote, how many frames, into which slot) - the host sees only the
+declared `AudioBytes`. The guard is a *format* rule, not a fix for either.
