@@ -982,8 +982,10 @@ are in `docs/FINDINGS.md` (2026-11-25).
 `FindFirstFileExA(<root>/Korra/*.*) -> <handle> last=0 first="GameData.dat"`,
 no `CreateDirectoryA` follows, and a settings change in Options writes
 `GameData.dat` 7,856 B and `SystemData.dat` 16 B; the next boot opens
-`SystemData.dat` with `last=0`. On the host the same request prints a valid
-search handle and `WriteFile 7856`. The Windows **SystemData** line cannot be
+`SystemData.dat` with `last=0`. On the host the same request printed a valid
+search handle and `WriteFile 7856` (the `first=` field was empty before the
+`71e09ce` probe fix and is unproven on Windows until the next Options run). The
+Windows **SystemData** line cannot be
 reached with the current Windows input path: the engine's menus navigate on the
 left stick, and `src/host/xinput_stub.c` exposes buttons only (`wButtons`; both
 sticks stay centred) - 16 dpad presses moved the cursor nowhere.

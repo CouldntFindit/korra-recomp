@@ -1020,8 +1020,9 @@ integer: the ring carries quiet NaN (`0x7FC00000`) in the *uncommitted tail* of 
 ring slot (491 frames of zeros, then 533 non-finite frames to the slice end) and
 the engine rewrites that slot while the host still mixes it (the slice's FNV
 changes between `SubmitSourceBuffer` and the probe). The `0x4F000000` /
-`0xCF000000` the first probe saw is the engine's own limiter saturating that NaN
-(`cvtps2dq` -> `INT_MIN` -> `cvtdq2ps`). The host now zeros exactly the
+`0xCF000000` the first probe saw matches the engine's own limiter saturating that
+NaN (`cvtps2dq` -> `INT_MIN` -> `cvtdq2ps`; an inference from the instruction
+sequence and the exact numeric pair, not a traced data flow). The host now zeros exactly the
 non-finite words (they are not PCM in the engine's own IEEE float format), logs
 them, and leaves every finite value alone: clipped frames fell 0.2223 % -> 0.0290 %
 and clip events 212 -> 5, with 0 xruns. The sink meter is still not clean
@@ -1042,8 +1043,9 @@ the device's only measured 5.1 path.
 zero 0, non-finite 0, |x|>2 688, finite 336`, and the words are
 `409E91BC` (4.9553) repeated 688 times to the slice end - the slot's *previous*
 content, unchanged. Two buffers, two stale contents (NaN, then a constant), the
-same geometry: the feed declares 1024 frames per submit and the mixer commits
-fewer, so the host mixes a tail that is not this buffer's audio. The engine's
+same geometry: the feed declares 1024 frames per submit and the engine leaves a
+tail it did not rewrite in that cycle, so the host mixes a tail that is not this
+buffer's audio. The engine's
 committed frame count is not exposed (credits are per buffer), so a host "skip
 the tail" would be inventing a boundary - recorded, not done.
 

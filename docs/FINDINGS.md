@@ -4317,3 +4317,48 @@ Still not reached: an autosave driven by **gameplay progress** (the twelve
 `[0xCA6C28]=3` sites) - the write above is the load's own request, and a 250 s
 Continue run that never left the menu produced none - and the Windows
 `SystemData.dat` line.
+
+
+## 2026-11-25 - coordinator verification: the save set is accepted; two items stay open
+
+Independently re-checked against the tree and the device, not the report:
+
+- **Tip and commits.** `main == origin/main` at `a11cf8a` ("docs(save): Continue
+  re-measured at the same call site after the matcher fix"), tree clean;
+  `bd43a0e` (matcher), `71e09ce` (probe), `720c86e` and `a11cf8a` (docs)
+  present; no file outside the save scope.
+- **Matcher, against a real Windows oracle.** A fresh `FindFirstFileA` oracle
+  over the same seven names (`a.jpg`, `data000.cpk`, `GameData.dat`, `nofile`,
+  `README`, `SlotData_0.dat`, `SystemData.dat`) agrees with the new matcher on
+  every row: `*`, `*.*`, `*.dat`, `*.jpg`, `?`, literal, `*Data*`,
+  `SlotData_?.dat`, `*.`, `*.*dat`, `GF?e*`; case-insensitive. The one table
+  caveat is `GameData.*`: the measured set has no dotless `GameData`, so
+  Windows returns only `GameData.dat`; the DOS rule matches a dotless `GameData`
+  only when such a file exists. No code change.
+- **Slot/erase, statically.** A capstone scan of the original exe finds writes
+  to `[0xE4F46C]` of 2, 2, 3, 3, 0 - no 1 (slot scan) or 4 (erase); exactly the
+  twelve `[0xCA6C28]=3` sites the entry lists. The `UILoad` string hit is
+  `UILoadIcon` (a loading/saving indicator), so the "no Load/Delete menu"
+  conclusion stands.
+- **Device files.** `logs/opt_live6.txt` writes `SystemData.dat` 16 B after the
+  Options change; `logs/cont_live2.txt` boots with `SystemData.dat` `last=0`,
+  `FindFirstFileExA ... first="GameData.dat"`, no `CreateDirectoryA`, and
+  `WriteFile 7856`. Live `run-as` listing: `GameData.dat` 7,856 B (mtime
+  21:04), `SystemData.dat` 16 B (19:57). The owner's original
+  `<Documents>/Korra` holds exactly the same two sizes; the hashes differ, as
+  expected for a different save state.
+- **Selftest/guard.** `scripts\run_selftest.ps1` 60/60; `tools\check_content.py`
+  exit 0.
+
+Corrections recorded, not silently patched: the `GameData.*` row above; the
+`71e09ce` probe fix has not been exercised on Windows (the post-fix
+`korra_host-20261125-204926.log` reaches only the asset `FindFirstFileA`
+lines), so it stays unproven until an Options run prints `first=`; and the
+2026-11-24 "the mixer commits fewer" wording is an inference - the committed
+frame count is not exposed - now worded as "leaves a tail it did not rewrite in
+that cycle" in `docs/audio.md`, README and MASTER_STATE.
+
+Open: the Windows SystemData oracle (left-stick injection in
+`src/host/xinput_stub.c`; the stub zeroes both sticks) and an autosave driven
+by gameplay progress (the twelve `[0xCA6C28]=3` sites are named, none
+exercised). The shipping save set itself is closed.
