@@ -4300,3 +4300,20 @@ before it started - `adb devices` empty mid-session); autosave after gameplay
 progress (the twelve gameplay `[0xCA6C28]=3` sites and the six `req_save` call
 sites other than the Options one); the Windows `SystemData.dat` line; and a slot
 or erase flow, which the code says does not exist.
+
+**Addendum (same session, after the USB link came back).** The Continue path was
+re-run on the device with the fix in place and `SystemData.dat` present: the
+route title -> A -> A -> main menu -> Story -> Resume loaded the checkpoint and
+requested its save at the **same call site** that answered
+`0xFFFFFFFF first=""` at t=223 s on 2026-11-22 - now
+`FindFirstFileExA(<root>/Korra/*.*) -> 0x02000001 last=0 first="GameData.dat"`,
+no `CreateDirectoryA`, then `CreateFileA(.../GameData.dat) disp=2` and
+`WriteFile 7856`. Files afterwards: `GameData.dat` 7,856 B (mtime 21:04),
+`SystemData.dat` untouched at 16 B, zero `[msgbox]`; scene words
+`flow=00000009 inst=00000001 step=FFFFFFFF mode=00000000` and the frame is not
+black (mean 79/255 over a 58x27 grid, no OCR text) - the same post-load state
+the earlier Continue runs reported, so Continue survives the new save type.
+Still not reached: an autosave driven by **gameplay progress** (the twelve
+`[0xCA6C28]=3` sites) - the write above is the load's own request, and a 250 s
+Continue run that never left the menu produced none - and the Windows
+`SystemData.dat` line.
