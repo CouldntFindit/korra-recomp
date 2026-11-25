@@ -828,16 +828,51 @@ typedef struct {
 static ka_find g_finds[FIND_MAX];
 static pthread_mutex_t g_find_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static int wild_match(const char *mask, const char *name) {
+/* Windows wildcard semantics for one path component, measured against
+ * FindFirstFileA (see the mask table in docs/FINDINGS.md):
+ *   - '*' matches any run including none, '?' exactly one, comparison is
+ *     case-insensitive (the FAT/NTFS rule; asset dirs hold BGM.bnk etc.);
+ *   - DOS legacy, still live in FindFirstFileA today: "NAME.*" also matches
+ *     "NAME" with no extension, which is why "*.*" sees dotless names;
+ *   - a mask ending in '.' (no star) matches only extensionless names.
+ * The old matcher answered 0 for every "*.*" (its `!star` guard made a second
+ * '*' unmatchable) and 0 for masks with two stars such as "*Data*", so the
+ * save device's "<dir>/*.*" existence test saw an empty directory on every
+ * run and re-created the directory and rewrote GameData.dat. */
+static int wild_eq(char a, char b) {
+    if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+    if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+    return a == b;
+}
+static int wild_glob(const char *mask, const char *name) {
     const char *m = mask, *n = name, *star = NULL, *retry = NULL;
     while (*n) {
-        if (*m == '*' && !star) { star = ++m; retry = n; }
-        else if (*m == '?' || *m == *n) { if (*m) m++, n++; else break; }
-        else if (star) { m = star; n = ++retry; }
+        if (*m == '*') { star = m++; retry = n; }
+        else if (*m == '?' || wild_eq(*m, *n)) { m++; n++; }
+        else if (star) { m = star + 1; n = ++retry; }
         else return 0;
     }
     while (*m == '*') m++;
     return *m == 0;
+}
+static int wild_match(const char *mask, const char *name) {
+    size_t len = strlen(mask);
+    char trimmed[260];
+    if (len >= 2 && mask[len - 2] == '.' && mask[len - 1] == '*') {
+        if (wild_glob(mask, name)) return 1;
+        if (len - 2 >= sizeof trimmed) return 0;
+        memcpy(trimmed, mask, len - 2);
+        trimmed[len - 2] = 0;
+        return wild_glob(trimmed, name);   /* "NAME.*" -> "NAME" */
+    }
+    if (len >= 1 && mask[len - 1] == '.') {
+        if (strchr(name, '.')) return 0;   /* extensionless names only */
+        if (len - 1 >= sizeof trimmed) return 0;
+        memcpy(trimmed, mask, len - 1);
+        trimmed[len - 1] = 0;
+        return trimmed[0] ? wild_glob(trimmed, name) : 1;
+    }
+    return wild_glob(mask, name);
 }
 
 static void fill_find_data(uint32_t out, const char *dir, const char *name) {
@@ -887,8 +922,14 @@ static uint32_t find_first_impl(const char *call, const char *pat, uint32_t out)
     snprintf(g_finds[FIND_MAX - 1].dir, sizeof g_finds[0].dir, "%s", path);
     g_finds[FIND_MAX - 1].d = opendir(path);
     if (!g_finds[FIND_MAX - 1].d) {
+        /* Windows answers a missing directory with ERROR_PATH_NOT_FOUND (3)
+         * and a denied one with ERROR_ACCESS_DENIED (5); ENOENT/ENOTDIR are the
+         * 3 case. The guest's last error is set, not just printed. */
+        int w32 = (errno == ENOENT || errno == ENOTDIR) ? 3
+                : (errno == EACCES) ? 5 : 2;
+        ka_last_error_set((uint32_t)w32);
         ka_log("fs: FindFirstFileA(%s) -> opendir(%s) failed: %s", pat, path, strerror(errno));
-        ka_save_find(call, pat, path, INVALID_HANDLE, errno, "");
+        ka_save_find(call, pat, path, INVALID_HANDLE, w32, "");
         return INVALID_HANDLE;
     }
     ka_log("fs: FindFirstFileA(%s) -> %s mask=%s", pat, path, g_finds[FIND_MAX - 1].mask);
@@ -912,6 +953,7 @@ static uint32_t find_first_impl(const char *call, const char *pat, uint32_t out)
         /* Windows answers an empty (or unmatched) wildcard with
          * INVALID_HANDLE_VALUE and ERROR_FILE_NOT_FOUND; that pair, not just
          * the handle, is what the caller distinguishes. */
+        ka_last_error_set(2);
         ka_save_find(call, pat, path, INVALID_HANDLE, 2, "");
         return INVALID_HANDLE;
     }
