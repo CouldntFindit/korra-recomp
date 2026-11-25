@@ -85,10 +85,14 @@ static void save_post_hook(uint32_t target, const uint32_t *args, uint32_t ret) 
         const char *p = safe_str(args[0]);
         sv("GetFileAttributesA path=\"%s\" -> 0x%08X last=%lu", p ? p : "?", ret, err);
     } else if (strstr(name, "FindFirstFile")) {   /* A and ExA: the engine uses both */
+        /* FindFirstFileExA puts lpFindFileData in args[2], FindFirstFileA in
+         * args[1]; reading args[1] for ExA printed first="" on every Windows
+         * run and hid the name that the device log showed. */
+        int exa = strstr(name, "ExA") != NULL;
         const char *p = safe_str(args[0]);
-        const char *hit = (ret != 0xFFFFFFFFu) ? safe_str(args[1] + 44) : "";
+        const char *hit = (ret != 0xFFFFFFFFu) ? safe_str(args[exa ? 2 : 1] + 44) : "";
         sv("%s pat=\"%s\" -> 0x%08X last=%lu first=\"%s\"",
-           strstr(name, "ExA") ? "FindFirstFileExA" : "FindFirstFileA",
+           exa ? "FindFirstFileExA" : "FindFirstFileA",
            p ? p : "?", ret, err, hit ? hit : "");
     } else if (strstr(name, "FindNextFileA")) {
         const char *hit = ret ? safe_str(args[1] + 44) : "";
