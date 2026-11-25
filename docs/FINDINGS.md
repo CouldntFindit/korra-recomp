@@ -4157,3 +4157,146 @@ cursor lives inside its object. Until that is readable, a host-side "skip the
 tail" would be inventing a boundary. The two candidate boundaries - `ring=4`
 slots against the feed's 8-slot cursor, and a credit delivered while the host
 reads the slot - are the next thing to measure, not to guess.
+
+## 2026-11-25 - save completeness: FindFirstFile's wildcards, the first `SystemData.dat` write, and the slot/erase paths the shipping build never asks for
+
+Device: Galaxy S24 (Exynos 2400, Xclipse 940, stock Vulkan), APK built from this
+tree with `-PkorraLinkGuest=ON -PkorraWithDxvk=ON`. Windows oracle: the dGPU
+host. Base HEAD `3031a6d`; commits `bd43a0e` (matcher), `71e09ce` (probe).
+
+**The defect, replayed without a run.** The save device tests its directory with
+`"%s*.*"` (`0x76CC40`) before every write, and the shim's `wild_match`
+(`src/host_android/kernel32_android.c`) answered **false for every `*.*`**: its
+`if (*m == '*' && !star)` guard made a second `*` unmatchable, so the mask
+advanced to `.` and never matched a name. A second, independent wrong answer:
+any mask with two stars (`*Data*`, `*a*`) also answered false. Replaying the old
+algorithm over a Korra-like directory (a.jpg, data000.cpk, GameData.dat, nofile,
+README, SlotData_0.dat, SystemData.dat):
+
+| mask | Windows `FindFirstFileA` (measured) | old matcher | new matcher |
+|---|---|---|---|
+| `*` | all 7 names | correct | correct |
+| `*.*` | all 7, dotless names included | **none** | all 7 |
+| `*.dat` | GameData, SlotData_0, SystemData | correct | correct |
+| `*.jpg` | a.jpg | correct | correct |
+| `?` | 1-character names only | correct | correct |
+| `GameData.dat` (literal) | exact name | correct | correct |
+| `*Data*` | the four names containing "data", case-insensitive | **none** | the four |
+| `SlotData_?.dat` | SlotData_0.dat | correct | correct |
+| `*.` | extensionless names only (nofile, README) | **none** | extensionless |
+| `*.*dat` | the three .dat files | **none** | the three |
+| `GameData.*` | GameData and GameData.dat | **none** | both |
+| `GF?e*` | no match | correct | correct |
+
+The Windows column is a real `FindFirstFileA` oracle (a small MSVC program over
+the same names), not an assumption; it also returned "." and ".." for the
+wildcard masks, which the shim filters by design and the engine's rofs mount
+skips (directories), so the answers agree on files.
+
+**The fix (`bd43a0e`, `src/host_android/kernel32_android.c`).** Measured Windows
+semantics for one path component: `*` any run, `?` one character, comparison
+case-insensitive (the FAT/NTFS rule - the asset tree holds `BGM.bnk` and
+`data000.cpk` under masks with mixed case), plus the DOS legacy that
+`FindFirstFileA` still implements: `NAME.*` also matches `NAME` with no
+extension (which is why `*.*` matches everything), and a mask ending in a bare
+`.` matches only extensionless names. The FindFirstFile contract is completed
+too: a failed search now *sets* the guest's last error (`ERROR_FILE_NOT_FOUND` 2
+for no match, `ERROR_PATH_NOT_FOUND` 3 for a missing directory, 5 for denied)
+instead of only printing one, and `FindNextFileA` already set
+`ERROR_NO_MORE_FILES` 18 after the last entry.
+
+**Device, before and after at the same call site.** Before (`logs/saf_save_log.txt`,
+t=223 s; `GameData.dat` had been written 148 s earlier):
+
+```
+fs: FindFirstFileA(<root>/Korra/*.*) -> <root>/Korra mask=*.*
+[save] FindFirstFileExA pat="<root>/Korra/*.*" -> 0xFFFFFFFF last=2 first="" (host="<root>/Korra")
+[save] CreateDirectoryA path="<root>/Korra/" -> 0x00000001
+[save] CreateFileA path="<root>/Korra/GameData.dat" ... disp=2 -> 0x01000002
+```
+
+After (this session's run, an Options-menu save with `GameData.dat` already
+present; log kept as `logs/opt_live6.txt`):
+
+```
+fs: FindFirstFileA(<root>/Korra/*.*) -> <root>/Korra mask=*.*
+[save] FindFirstFileExA pat="<root>/Korra/*.*" -> 0x02000001 last=0 first="GameData.dat" (host="<root>/Korra")
+[save] CreateFileA path="<root>/Korra/GameData.dat" access=0x40000000 share=0x00000000 disp=2 -> 0x01000002
+[save] WriteFile h=0x01000002 n=7856 -> ret=1 count=7856 last=0
+[save] FindFirstFileExA pat="<root>/Korra/*.*" -> 0x02000001 last=0 first="GameData.dat"
+[save] CreateFileA path="<root>/Korra/SystemData.dat" access=0x40000000 share=0x00000000 disp=2 -> 0x01000002
+[save] WriteFile h=0x01000002 n=16 -> ret=1 count=16 last=0
+```
+
+No `CreateDirectoryA` at either step now: the existence test answers with the
+file that is there. The directory afterwards (`run-as ls -la`, sizes and hashes
+pulled from the device): `GameData.dat` 7,856 B `fb030a2a6e44f19c...`,
+`SystemData.dat` 16 B `36a7601077d59cd2...`. Zero `[msgbox]` in the run and in
+the next boot.
+
+**`SystemData.dat` measured for the first time, and the shipping set named.**
+The trigger is the **Options menu**, derived from the original exe: the class is
+`UIOptionMenu` (`0x5D7F40`, RTTI method name) and its state 7 (`0x5D837B`) is
+the only caller of `req_save(5)` (`0x632F20`). `req_save` sets
+`[0xCA6C28]=3` and `[0xCA6C20]=1` (reason 5 is the only value that sets the
+latter), and the save manager's full-save tick (`0x632330`) writes `GameData.dat`
+and then `SystemData.dat`. The value-change test is `0x5D96C0`: it compares the
+live settings (`this+0xe4..0x118`) with the snapshot taken on entry
+(`this+0xac..0xe0`) and returns non-zero when any of them moved, so a settings
+change plus leaving the menu is the trigger. On the device: main menu ->
+Options -> Camera -> Vibration ON -> OFF -> B -> B, and the two writes above are
+the result. The next boot opens `SystemData.dat` with `last=0`
+(`0x01000002` where it used to be `last=2`). The owner's own `<Documents>/Korra`
+from the original game holds exactly `GameData.dat` 7,856 B and
+`SystemData.dat` 16 B, so the shipping save set is those two files, and the
+device's 16-byte file matches the original's size.
+
+**What asks for a save (original exe, not the analysis copy).** `[0xE4F474]` is
+the selector: -2 = `SystemData.dat`, -1 = `GameData.dat`, otherwise
+`SlotData_%d.dat` (`0x76CB50`), and `[0xE4F46C]` is the operation: 2 = load
+(`0x76CEA0`), 3 = write (`0x76D0E0`), 1 = slot scan (`0x76CCD0`), 4 = erase
+(`0x76D2F0`). The request functions `0x76B8A0`/`0x76B8F0`/`0x76B940`/`0x76B990`
+are the four (System/Game x load/save) entry points; `req_save(reason)`
+(`0x632F20`) is called from `0x4D16D4`, `0x5D8380` (reason 5),
+`0x5E4DF8`, `0x5E5335`, `0x5FA289`, `0x64F37E`, and twelve gameplay sites write
+`[0xCA6C28]=3` directly (`0x53F1D1` is the boot's SystemData load with 1;
+`0x57DD27`, `0x5CA688`, `0x5CA77B`, `0x5D3644`, `0x5D37AB`, `0x5D3A05`,
+`0x5DD9FC`, `0x5EA4D4`, `0x5F1D1F`, `0x5F7A63`, `0x5F9236`, `0x64EB9C`).
+There is **no manual Save/Load/Delete UI**: `UIPauseMenu`'s four methods
+(`0x5D5F80`, `0x5D6150`, `0x5D6330`, `0x5D66B0`) call nothing in the save
+device, the only UI caller of `req_save` is `UIOptionMenu.run`, and the strings
+are `Save Data` (`0x96479C`), `UIConfirmSaveIconDialog` / `UISaveIcon` (the
+saving indicator), with no Load/Delete menu string anywhere in the image.
+
+**`SlotData_%d.dat` and the erase path are not in the shipping flow.** The slot
+scan op 1 (`0x76CCD0`) is the only code that walks `SlotData_%d.dat` (it opens
+each, reads a 4-byte header and `inc [0xE4F474]`), and the erase op 4
+(`0x76D2F0`, whose `DeleteFileA` at `0x76D398` is the save device's only delete)
+is the only code that removes one. Both are dispatched from `[0xE4F46C]`, and
+every write to that global in the whole image is 0, 2 or 3 (`0x76B8CF`,
+`0x76B91F` = 2; `0x76B96F`, `0x76B9CA` = 3; `0x76CB36`, `0x8F5368` = 0) - so ops
+1 and 4 are unreachable and the selector is only ever -2 or -1. The other
+`DeleteFileA` site (`0x797FBE`) and the only `MoveFileA` (`0x7981CD`) are
+outside the save device. Recording this instead of inventing a UI: there is no
+slot save and no erase to exercise in this build, which is also why the
+owner's original save directory has no `SlotData_*.dat`.
+
+**Windows oracle.** A save request with `GameData.dat` present was measured on
+the Windows host (`korra_host-20251125-200043.log`, blind pad timeline): the
+same `FindFirstFileExA(<Documents>/Korra/*.*)` answered a **valid search
+handle**, then `CreateFileA(.../GameData.dat, GENERIC_WRITE, CREATE_ALWAYS)` and
+`WriteFile 7856`. The probe's `first=` field was empty on every Windows line
+because `src/host/save_probe.c` read `args[1]` for `FindFirstFileExA`, whose
+`lpFindFileData` is `args[2]`; fixed in `71e09ce`, so the two hosts' lines are
+now comparable field for field. The Windows **SystemData** line does not exist
+this session: the engine's menus navigate on the left stick (the device's route
+is a stick swipe; the same screens), while the Windows pad stub exposes
+`wButtons` only and centres both sticks - sixteen dpad presses (`0x0001`) moved
+the cursor nowhere. That is an input-injection gap on the oracle, not a save
+defect, and it is recorded as not reached rather than worked around.
+
+**Not verified.** A device Continue run after the fix (the phone dropped off USB
+before it started - `adb devices` empty mid-session); autosave after gameplay
+progress (the twelve gameplay `[0xCA6C28]=3` sites and the six `req_save` call
+sites other than the Options one); the Windows `SystemData.dat` line; and a slot
+or erase flow, which the code says does not exist.

@@ -940,3 +940,50 @@ swap chain` (`88760870`) -> SIGSEGV at guest `0x7524C0`, exit
 The in-game pause menu is unreachable until that is fixed.
 
 
+
+### 10.9 The save files, and the FindFirstFile wildcard contract (2026-11-25)
+
+**The device (original exe, not the analysis copy).** `0x76CB50` builds the save
+path: `SHGetSpecialFolderPathA(NULL, buf, CSIDL_PERSONAL=5, FALSE)` then
+`"%s/%s/"` with `"Korra"`, and appends `SystemData.dat` / `GameData.dat` /
+`SlotData_%d.dat` according to `[0xE4F474]` (-2 / -1 / slot).
+`[0xE4F46C]` is the operation: 1 = slot scan (`0x76CCD0`), 2 = load
+(`0x76CEA0`), 3 = write (`0x76D0E0`), 4 = erase (`0x76D2F0`). The writer's
+state 0 checks the directory with `"%s*.*"` (`0x76CC40` -> `_findfirst` ->
+`FindFirstFileExA`), makes the directory only if that check fails, then
+`CreateFileA(GENERIC_WRITE, CREATE_ALWAYS)` + `WriteFile`.
+
+**What ships.** `GameData.dat` (7,856 B) and `SystemData.dat` (16 B) - the
+owner's original save directory holds exactly those two and nothing else.
+`SlotData_%d.dat` is reachable only through op 1 and the erase only through
+op 4, and every write to `[0xE4F46C]` in the image is 0, 2 or 3, so neither is
+ever requested by this build. There is no manual Save/Load/Delete UI:
+`UIPauseMenu`'s methods call nothing in the save device, the only UI caller of
+`req_save` (`0x632F20`) is `UIOptionMenu.run` state 7 (`0x5D837B`, reason 5 =
+"settings also"), and the only related strings are `Save Data` (0x96479C) and
+the saving indicator (`UISaveIcon` / `UIConfirmSaveIconDialog`).
+
+**The wildcard contract the shim has to keep.** The save check uses `*.*`, and
+Windows answers it with every name - dotless ones included. `wild_match` in
+`src/host_android/kernel32_android.c` must therefore implement, for one path
+component: `*` any run (several in one mask), `?` one character, comparison
+case-insensitive, `NAME.*` also matching `NAME`, and a bare `NAME.` matching
+only extensionless names. `FindFirstFile` must return a handle plus the first
+`WIN32_FIND_DATAA`, `INVALID_HANDLE_VALUE` + `ERROR_FILE_NOT_FOUND` (2) when
+nothing matches, `ERROR_PATH_NOT_FOUND` (3) when the directory is missing, and
+`FindNextFileA` must end with `ERROR_NO_MORE_FILES` (18) - the engine's
+`Hw::rofs::fst` mount dies if the enumeration is one entry long. A matcher that
+answers `*.*` with nothing makes the save device believe its own directory is
+empty: it re-creates it and rewrites `GameData.dat` on every save request, and
+the save/slot list shows nothing. Measured before/after and the full mask table
+are in `docs/FINDINGS.md` (2026-11-25).
+
+**Device evidence.** With `GameData.dat` present the boot/save probe prints
+`FindFirstFileExA(<root>/Korra/*.*) -> <handle> last=0 first="GameData.dat"`,
+no `CreateDirectoryA` follows, and a settings change in Options writes
+`GameData.dat` 7,856 B and `SystemData.dat` 16 B; the next boot opens
+`SystemData.dat` with `last=0`. On the host the same request prints a valid
+search handle and `WriteFile 7856`. The Windows **SystemData** line cannot be
+reached with the current Windows input path: the engine's menus navigate on the
+left stick, and `src/host/xinput_stub.c` exposes buttons only (`wButtons`; both
+sticks stay centred) - 16 dpad presses moved the cursor nowhere.
