@@ -67,6 +67,7 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 MASTER_STATE.md
+performance_plan.md
 
 # ---------------------------------------------------------------------------
 # Android (M3). Build output, machine-specific paths, signing material.
