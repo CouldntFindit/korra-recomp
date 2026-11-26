@@ -16,10 +16,20 @@
  *                          arbitrary timeline: <ms>:<bits>[:<hold ms>, default
  *                          150]. Lets a run walk into the first area and then
  *                          pause/resume, which fixed A taps cannot express.
- *   KORRA_PAD_CMD=<file>   an external driver writes "<seq> <bits> <hold ms>";
- *                          every new seq starts one hold. For walking a menu
- *                          after looking at the screen, where a fixed timeline
- *                          is a guess about when the menu is ready.
+ *   KORRA_PAD_CMD=<file>   an external driver writes "<seq> <bits> <hold ms>
+ *                          [<lx> <ly>]"; every new seq starts one hold. For
+ *                          walking a menu after looking at the screen, where a
+ *                          fixed timeline is a guess about when the menu is
+ *                          ready. The optional lx/ly are the left stick in raw
+ *                          XInput units (-32768..32767, Y up positive), held for
+ *                          the same window as the buttons.
+ *   KORRA_PAD_STICK=lx,ly  hold the left stick at that value for the whole run
+ *                          (raw XInput units; default 0,0 = centred). The
+ *                          engine's menus navigate on the left stick, not the
+ *                          D-pad, so this is what walks the Options menu on the
+ *                          Windows oracle.
+ *
+ * Sticks default to 0/0, and nothing here has any effect unless KORRA_PAD is set.
  *
  * The state struct is the standard XINPUT_STATE (dwPacketNumber + GAMEPAD);
  * the engine's own remap into its 0x24-byte block happens in guest code, so
@@ -137,28 +147,66 @@ static uint16_t pad_timeline(uint32_t ms) {
 
 /* KORRA_PAD_CMD=<file> - one hold per sequence number, for a driver that looks
  * at the screen before pressing. The file is tiny; it is read every poll so the
- * driver needs no clock agreement with the game. */
-static uint16_t pad_command_file(uint32_t now) {
+ * driver needs no clock agreement with the game. Fields after the hold are the
+ * left stick, in raw XInput units. */
+static int16_t pad_axis(long v) {
+    if (v > 32767) v = 32767;
+    if (v < -32768) v = -32768;
+    return (int16_t)v;
+}
+
+static uint16_t pad_command_file(uint32_t now, int16_t *lx, int16_t *ly) {
     static uint32_t seq_seen, hold_bits, hold_dur, hold_start;
+    static int16_t hold_lx, hold_ly;
     FILE *f;
     unsigned seq = 0;
-    unsigned long bits = 0, dur = 150;
+    long bits = 0, dur = 150, sx = 0, sy = 0;
     const char *p = getenv("KORRA_PAD_CMD");
+    *lx = *ly = 0;
     if (!p) return 0;
     f = fopen(p, "r");
     if (f) {
-        if (fscanf(f, "%u %li %li", &seq, &bits, &dur) >= 2 && seq != 0 &&
-            seq != seq_seen) {
+        if (fscanf(f, "%u %li %li %li %li", &seq, &bits, &dur, &sx, &sy) >= 2 &&
+            seq != 0 && seq != seq_seen) {
             seq_seen = seq;
             hold_bits = (uint32_t)bits;
             hold_dur = dur ? (uint32_t)dur : 150;
+            hold_lx = pad_axis(sx);
+            hold_ly = pad_axis(sy);
             hold_start = now;
         }
         fclose(f);
     }
-    if (seq_seen && now >= hold_start && now < hold_start + hold_dur)
+    if (seq_seen && now >= hold_start && now < hold_start + hold_dur) {
+        *lx = hold_lx;
+        *ly = hold_ly;
         return (uint16_t)hold_bits;
+    }
     return 0;
+}
+
+/* KORRA_PAD_STICK=lx,ly - a constant left-stick deflection in raw XInput units
+ * (Y up positive; the engine negates Y when it builds its own pad block). Off
+ * unless the variable parses, so the default stays centred. */
+static void pad_stick(int16_t *lx, int16_t *ly) {
+    static int loaded;
+    static int16_t cached_lx, cached_ly;
+    if (!loaded) {
+        const char *s = getenv("KORRA_PAD_STICK");
+        loaded = 1;
+        if (s) {
+            char *end;
+            long a = strtol(s, &end, 0);
+            if (end != s) {
+                long b = 0;
+                if (*end == ',') b = strtol(end + 1, NULL, 0);
+                cached_lx = pad_axis(a);
+                cached_ly = pad_axis(b);
+            }
+        }
+    }
+    *lx = cached_lx;
+    *ly = cached_ly;
 }
 
 /* Scripted taps: a fixed timeline, so a run is repeatable. A frame is ~16 ms,
@@ -199,6 +247,8 @@ static void shim_XInputGetState(void) {
     DWORD index = a[0];
     xinput_state *state = (xinput_state *)(uintptr_t)a[1];
     uint16_t bits;
+    int16_t lx, ly, cmd_lx, cmd_ly;
+    uint32_t now;
     MEMORY_BASIC_INFORMATION mbi;
 
     if (!pad_enabled() || index != 0 || !state ||
@@ -207,18 +257,26 @@ static void shim_XInputGetState(void) {
         (size_t)((const char *)mbi.BaseAddress + mbi.RegionSize - (const char *)state) < sizeof *state) {
         g_eax = XINPUT_DEVICE_NOT_CONNECTED;
     } else {
+        now = pad_uptime_ms();
         bits = (uint16_t)pad_held_bits();
-        if (pad_auto()) bits |= pad_scripted_buttons(pad_uptime_ms());
-        bits |= pad_single_taps(pad_uptime_ms());
-        bits |= pad_timeline(pad_uptime_ms());
-        bits |= pad_command_file(pad_uptime_ms());
+        if (pad_auto()) bits |= pad_scripted_buttons(now);
+        bits |= pad_single_taps(now);
+        bits |= pad_timeline(now);
+        bits |= pad_command_file(now, &cmd_lx, &cmd_ly);
+        pad_stick(&lx, &ly);
+        if (cmd_lx || cmd_ly) { lx = cmd_lx; ly = cmd_ly; }
         /* dwPacketNumber changes only when the state changes, as the real
          * XInput does: the engine uses it to detect edges, and incrementing it
-         * on every poll would report a new press on every frame. */
-        if (state->wButtons != bits) state->dwPacketNumber++;
+         * on every poll would report a new press on every frame. A stick
+         * deflection is a state change too, or a menu would never see it. */
+        if (state->wButtons != bits || state->sThumbLX != lx ||
+            state->sThumbLY != ly || state->sThumbRX || state->sThumbRY)
+            state->dwPacketNumber++;
         state->wButtons = bits;
         state->bLeftTrigger = state->bRightTrigger = 0;
-        state->sThumbLX = state->sThumbLY = state->sThumbRX = state->sThumbRY = 0;
+        state->sThumbLX = lx;
+        state->sThumbLY = ly;
+        state->sThumbRX = state->sThumbRY = 0;
         g_eax = 0;   /* ERROR_SUCCESS */
     }
     g_esp += 4 + 2 * 4;

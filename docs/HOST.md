@@ -66,7 +66,8 @@ Everything below is opt-in and off by default.
 |---|---|
 | `KORRA_XA2_VERBOSE=0..3` | XAudio2 stub logging, 3 = queue-length changes |
 | `KORRA_QUIRK_PROBE=1` | once per second: `DAT_00e4d210`, `[frameMgr+0x58]`, flags, HWND, measured frames/s |
-| `KORRA_PAD=1` [`KORRA_PAD_BITS=0x1000`] [`KORRA_PAD_AUTO=1`] | synthetic pad 0 |
+| `KORRA_PAD=1` [`KORRA_PAD_BITS=0x1000`] [`KORRA_PAD_AUTO=1`] [`KORRA_PAD_STICK=lx,ly`] | synthetic pad 0; the stick is centred unless `KORRA_PAD_STICK` says otherwise (raw XInput units, Y up) |
+| `KORRA_PAD_CMD=<file>` | screen-driven holds: `<seq> <bits> <hold ms> [<lx> <ly>]`; a new seq starts one hold, the optional left-stick value is held with it |
 | `KORRA_TRACE_FILE=1` / `KORRA_TRACE_D3D=1` | `CreateFileA` arguments + result; failed d3d9 results and every d3dx call |
 | `KORRA_TRACE=1` | one line per bridged native call |
 | `KORRA_DRAWPATH=1` | D3D9 draw census: per-frame draws/state + one line per distinct draw shape (`_FROM=<frame>` adds a per-frame texture histogram, `_FRAME=<frame>` dumps one frame's draws, `_TEX=1` adds a pixel survey that is known to kill a run) |
