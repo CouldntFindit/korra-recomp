@@ -54,6 +54,8 @@ struct ANativeWindow;
 IDirect3D9 *__stdcall Direct3DCreate9(UINT SDKVersion);
 void dxvkAndroidSetWindow(ANativeWindow *window);
 HWND dxvkAndroidGetWindowHandle(void);
+/* 0 while the shell has no window; +1 per window bind (android_wsi.cpp). */
+unsigned dxvkAndroidWindowGeneration(void);
 }
 
 /* Registered as a single named shim (ka_shim_register only takes arrays). */
@@ -110,9 +112,9 @@ unsigned g_presents;
  * the shell has none. Off by default; the first 20 calls of each kind are
  * printed, after that only when the token or the answer changes. */
 struct LifeProbe {
-    int    calls;
-    HWND   win;
-    int32_t hr;
+    int      calls;
+    unsigned gen;
+    int32_t  hr;
 };
 
 LifeProbe g_life_tcl, g_life_present, g_life_reset;
@@ -126,14 +128,68 @@ bool life_probe_on() {
     return g_life_on != 0;
 }
 
-void life_probe(const char *what, LifeProbe *p, HWND win, int32_t hr) {
+void life_probe(const char *what, LifeProbe *p, unsigned gen, int32_t hr) {
     if (!life_probe_on()) return;
-    if (p->calls >= 20 && p->win == win && p->hr == hr) return;
+    if (p->calls >= 20 && p->gen == gen && p->hr == hr) return;
     p->calls++;
-    p->win = win;
+    p->gen = gen;
     p->hr = hr;
-    ka_log("[life] %s win=%llx hr=%08X n=%d", what,
-           (unsigned long long)(uintptr_t)win, (unsigned)hr, p->calls);
+    ka_log("[life] %s gen=%u hr=%08X n=%d", what, gen, (unsigned)hr, p->calls);
+}
+
+/* ---------------------------------------------------- D3D9 device-loss state
+ *
+ * D3D9's contract for a device whose window/surface went away is: Present
+ * answers D3DERR_DEVICELOST, TestCooperativeLevel answers
+ * D3DERR_DEVICENOTRESET until a Reset against a live window succeeds. The
+ * shipped engine implements exactly that contract - sub_00759C90 (its
+ * TestCooperativeLevel, vtable slot 3) branches on 0x88760868/0x88760869,
+ * sub_00759E70 (Present) recognises only success and 0x88760868, and
+ * sub_00759D40 (Reset) retries on DEVICELOST and clears the skip flag
+ * ([mgr+0x6C], read by the frame-setup gate) on success.
+ *
+ * On Android the shell destroys the ANativeWindow on APP_CMD_TERM_WINDOW and
+ * binds a new one on APP_CMD_INIT_WINDOW. The WSI keeps one stable HWND for
+ * the app (Win32 has one window for the app's life) and reports the bind as a
+ * generation number, so "no window" and "a window was re-bound since the
+ * device was reset" are both visible here without asking DXVK to rebuild its
+ * presenter: Present must never reach DXVK while its surface has no window (it
+ * throws and reports D3DERR_DEVICEREMOVED, which the engine cannot handle).
+ *
+ * Before this, the bridge forwarded that 0x88760870. The engine's Present
+ * wrapper has no branch for it, returned 0, and the caller tore down a render
+ * object that was still referenced - SIGSEGV in the release at 0x7524C0,
+ * exit-info reason=2 (SIGNALED) status=11, measured 2026-11-22 and 2026-11-26.
+ */
+unsigned g_device_generation;   /* window generation the device was reset against */
+bool g_device_lost = true;      /* until CreateDevice or a successful Reset */
+
+/* True when a Present must not reach DXVK: no window, or the window the device
+ * was built for is gone (the shell re-bound a window since the last Reset). */
+bool d9_window_lost() {
+    unsigned gen = dxvkAndroidWindowGeneration();
+    if (!gen || gen != g_device_generation) {
+        g_device_lost = true;
+        return true;
+    }
+    return g_device_lost;
+}
+
+/* DXVK is C++ and throws dxvk::DxvkError when it cannot rebuild a swap chain;
+ * D3D9DeviceEx::Reset lets that escape. A throw that unwinds through the lifted
+ * guest frames reaches std::terminate - measured 2026-11-26: "libc++abi:
+ * terminating due to uncaught exception of type dxvk::DxvkError", exit-info
+ * reason=5 (APP CRASH(NATIVE)) status=6. No D3D9 method may abort the process:
+ * catch every exception at this boundary and answer the D3D9 device-lost
+ * contract instead, which the engine handles. */
+template <typename Fn>
+HRESULT d9_call(Fn fn) {
+    try {
+        return fn();
+    } catch (...) {
+        g_device_lost = true;
+        return D3DERR_DEVICELOST;
+    }
 }
 
 /* ---------------------------------------------------------------- helpers */
@@ -408,6 +464,12 @@ void i9_CreateDevice() {
     hr = SELF_AS(IDirect3D9, K_D3D9)->CreateDevice(
         A32(0), (D3DDEVTYPE)A32(1), dxvkAndroidGetWindowHandle(), A32(3), ppp, &dev);
     ka_log("d3d9: CreateDevice -> 0x%08X device=%p", (unsigned)hr, (void *)dev);
+    if (hr == D3D_OK && dev) {
+        /* The window generation this device (and its presenter) is built for.
+         * A later re-bind is a new generation = device lost. */
+        g_device_generation = dxvkAndroidWindowGeneration();
+        g_device_lost = false;
+    }
     if (out) MEM32(out) = (hr == D3D_OK && dev) ? new_token(K_DEVICE, dev, 0) : 0;
     RET((uint32_t)hr, 6);
 }
@@ -417,8 +479,22 @@ void i9_CreateDevice() {
 #define RET_HR(call, argc) do { HRESULT _hr = (call); RET((uint32_t)_hr, argc); } while (0)
 
 void d_TestCooperativeLevel() {
-    life_probe("tcl", &g_life_tcl, life_probe_on() ? dxvkAndroidGetWindowHandle() : nullptr, 0);
-    RET(0, 0);
+    /* The engine's device manager calls this once per frame and decides from
+     * the answer whether the device can draw (docs/gate_probe notes on
+     * sub_00759C90). Answer what Win32 answers. */
+    unsigned gen = dxvkAndroidWindowGeneration();
+    int32_t hr;
+    if (!gen) {
+        g_device_lost = true;
+        hr = D3DERR_DEVICELOST;
+    } else if (g_device_lost || gen != g_device_generation) {
+        g_device_lost = true;
+        hr = D3DERR_DEVICENOTRESET;
+    } else {
+        hr = D3D_OK;
+    }
+    life_probe("tcl", &g_life_tcl, gen, hr);
+    RET((uint32_t)hr, 0);
 }
 void d_GetAvailableTextureMem() { RET(512u << 20, 0); }
 void d_EvictManagedResources() { RET(0, 0); }
@@ -459,27 +535,49 @@ void d_Reset() {
     const KaPP *gpp = (const KaPP *)P(A32(0));
     D3DPRESENT_PARAMETERS pp;
     HRESULT hr;
+    unsigned gen = dxvkAndroidWindowGeneration();
+
+    /* No window: D3D9 cannot reset a device into nothing. Stay lost; the
+     * engine's Reset wrapper treats DEVICELOST as "retry". */
+    if (!gen) {
+        g_device_lost = true;
+        life_probe("reset", &g_life_reset, gen, D3DERR_DEVICELOST);
+        RET((uint32_t)D3DERR_DEVICELOST, 1);
+    }
     if (gpp) {
-        pp_from_guest(gpp, &pp);
+        pp_from_guest(gpp, &pp);   /* hDeviceWindow := the app's window token */
         ka_log("d3d9: Reset %ux%u fmt=%u windowed=%u depthfmt=%u", gpp->width,
                gpp->height, gpp->format, gpp->windowed, gpp->depth_format);
     }
-    hr = DEV->Reset(gpp ? &pp : nullptr);
-    ka_log("d3d9: Reset -> 0x%08X", (unsigned)hr);
-    life_probe("reset", &g_life_reset, life_probe_on() ? dxvkAndroidGetWindowHandle() : nullptr,
-               (int32_t)hr);
+    hr = d9_call([&] { return DEV->Reset(gpp ? &pp : nullptr); });
+    if (SUCCEEDED(hr)) {
+        /* DXVK's Reset rebuilt the swap chain against the window the WSI has
+         * bound now (the presenter's surface-loss path binds the app's current
+         * ANativeWindow), so the device is usable again. */
+        g_device_generation = gen;
+        g_device_lost = false;
+    }    ka_log("d3d9: Reset -> 0x%08X", (unsigned)hr);
+    life_probe("reset", &g_life_reset, gen, (int32_t)hr);
     RET((uint32_t)hr, 1);
 }
 void d_Present() {
+    /* A present must not reach DXVK while its surface has no window. */
+    if (d9_window_lost()) {
+        life_probe("present", &g_life_present, dxvkAndroidWindowGeneration(),
+                   D3DERR_DEVICELOST);
+        RET((uint32_t)D3DERR_DEVICELOST, 4);
+    }
     uint64_t fp_t0 = ka_fp_begin();
-    HRESULT hr = DEV->Present((const RECT *)P(A32(0)), (const RECT *)P(A32(1)),
-                              (HWND)(uintptr_t)A32(2), (const RGNDATA *)P(A32(3)));
+    HRESULT hr = d9_call([&] {
+        return DEV->Present((const RECT *)P(A32(0)), (const RECT *)P(A32(1)),
+                            (HWND)(uintptr_t)A32(2), (const RGNDATA *)P(A32(3)));
+    });
     /* Times the frame, reports it to the platform hint session and runs the
      * frame cap's watchdog (frame_probe_android.c / fps_cap_android.c). */
     ka_fp_end_present(fp_t0);
     g_presents++;
     life_probe("present", &g_life_present,
-               life_probe_on() ? dxvkAndroidGetWindowHandle() : nullptr, (int32_t)hr);
+               life_probe_on() ? dxvkAndroidWindowGeneration() : 0, (int32_t)hr);
     RET((uint32_t)hr, 4);
 }
 void d_GetBackBuffer() {
@@ -875,6 +973,7 @@ void d_CreateQuery() {
 
 /* ------------------------------------------------------------- swapchain */
 void s_Present() {
+    if (d9_window_lost()) { RET((uint32_t)D3DERR_DEVICELOST, 4); }
     RET_HR(SELF_AS(IDirect3DSwapChain9, K_SWAPCHAIN)->Present(
             (const RECT *)P(A32(0)), (const RECT *)P(A32(1)), (HWND)(uintptr_t)A32(2), (const RGNDATA *)P(A32(3)), 0), 4);
 }
@@ -1660,8 +1759,26 @@ int ka_d3d9_init(void) {
 }
 
 void ka_d3d9_window_changed(void) {
-    /* Called by the shell each frame. The window itself is pushed by
-     * jni_bridge through dxvkAndroidSetWindow when it changes. */
+    /* Called by the shell each frame (only while a window is bound). With
+     * debug.korra.lifecycle=1 it prints the engine's own device-state manager
+     * once a second: flag/need/ok/fail are [mgr+0x6C], [+0x74], [+0x78] and
+     * [+0x7C] - the frame-setup skip flag, "needs reset", "device ok" and the
+     * reset-failure counter (docs/gate_probe notes on sub_00759C90 /
+     * sub_00759D40). presents is the bridge's Present count, so a stuck frame
+     * loop is visible as a flat count with a live shell. */
+    if (!life_probe_on()) return;
+    static uint32_t last_ms;
+    uint32_t now = ka_mono_ms();
+    if (last_ms && now - last_ms < 1000u) return;
+    last_ms = now ? now : 1u;
+    uint32_t m = MEM32(0xE4D060u);
+    uint32_t mgr = (m >= 0x00400000u && m < 0x40000000u) ? MEM32(m + 0x28u) : 0;
+    bool ok = mgr >= 0x00400000u && mgr < 0x40000000u;
+    ka_log("[life] census gen=%u/%u flag=%08X need=%08X ok=%08X fail=%08X dev=%08X presents=%u",
+           dxvkAndroidWindowGeneration(), g_device_generation,
+           ok ? MEM32(mgr + 0x6Cu) : 0, ok ? MEM32(mgr + 0x74u) : 0,
+           ok ? MEM32(mgr + 0x78u) : 0, ok ? MEM32(mgr + 0x7Cu) : 0,
+           ok ? MEM32(mgr + 0x24u) : 0, g_presents);
 }
 
 int ka_d3d9_frame_presented(void) { return (int)g_presents; }

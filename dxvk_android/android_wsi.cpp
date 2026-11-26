@@ -30,8 +30,15 @@ namespace {
 
 std::mutex g_lock;
 ANativeWindow *g_window = nullptr;
+/* The app's one window token (DXVK's HWND). Win32 keeps a single HWND for the
+ * whole life of the app; the Android shell destroys and re-creates the
+ * ANativeWindow behind it, and DXVK must not see that as a different window -
+ * it would build a second presenter (and a second VkSurface on the same
+ * ANativeWindow) while the first still exists, which the Xclipse driver
+ * refuses with VK_ERROR_OUT_OF_HOST_MEMORY. The bind count is reported
+ * separately, for the D3D9 bridge's lost/reset state. */
 HWND g_handle = nullptr;
-uintptr_t g_generation = 0x1000;
+uintptr_t g_generation = 0;   /* number of window binds; 0 while no window */
 uint32_t g_screen_w = 1280, g_screen_h = 720;
 uint32_t g_buffer_w = 1280, g_buffer_h = 720;
 
@@ -60,6 +67,11 @@ void wsi_log(const char *fmt, ...) {
     __android_log_write(ANDROID_LOG_INFO, "Korra", line);
 }
 
+/* Is this the app's window token? */
+bool is_app_token(HWND window) {
+    return window && window == g_handle;
+}
+
 }  // namespace
 
 extern "C" void dxvkAndroidSetWindow(ANativeWindow *window) {
@@ -77,22 +89,34 @@ extern "C" void dxvkAndroidSetWindow(ANativeWindow *window) {
         }
     }
     if (g_window) {
-        wsi_log("[wsi] unbind win=%p token=%llx surfaces=%zu", (void *)g_window,
-                (unsigned long long)(uintptr_t)g_handle, g_surfaces.size());
+        wsi_log("[wsi] unbind win=%p token=%llx gen=%llu surfaces=%zu", (void *)g_window,
+                (unsigned long long)(uintptr_t)g_handle,
+                (unsigned long long)g_generation, g_surfaces.size());
         ANativeWindow_release(g_window);
     }
     g_window = window;
-    g_handle = window ? reinterpret_cast<HWND>(++g_generation) : nullptr;
     if (window) {
-        wsi_log("[wsi] bind win=%p %ux%u buf=%ux%u token=%llx surfaces=%zu",
+        if (!g_handle) g_handle = reinterpret_cast<HWND>(uintptr_t{0x1001});
+        g_generation++;
+        wsi_log("[wsi] bind win=%p %ux%u buf=%ux%u token=%llx gen=%llu surfaces=%zu",
                 (void *)window, g_screen_w, g_screen_h, g_buffer_w, g_buffer_h,
-                (unsigned long long)(uintptr_t)g_handle, g_surfaces.size());
+                (unsigned long long)(uintptr_t)g_handle,
+                (unsigned long long)g_generation, g_surfaces.size());
     }
 }
 
 extern "C" HWND dxvkAndroidGetWindowHandle() {
     std::lock_guard<std::mutex> guard(g_lock);
-    return g_handle;
+    /* Same token for the app's life; null only while there is no window. */
+    return g_window ? g_handle : nullptr;
+}
+
+/* Bind counter: 0 while the shell has no window, +1 per window bind. The D3D9
+ * bridge compares it with the generation its device was reset against to
+ * decide DEVICELOST / DEVICENOTRESET (d3d9_android.cpp). */
+extern "C" unsigned dxvkAndroidWindowGeneration() {
+    std::lock_guard<std::mutex> guard(g_lock);
+    return g_window ? (unsigned)g_generation : 0u;
 }
 
 /* The D3D9 bridge asks this before it lets a Present reach DXVK: while the
@@ -140,7 +164,7 @@ namespace dxvk::wsi {
 
 VkResult createSurface(HWND window, const Rc<vk::InstanceFn> &vki, VkSurfaceKHR *surface) {
     std::lock_guard<std::mutex> guard(g_lock);
-    if (!g_window || window != g_handle) {
+    if (!g_window || !is_app_token(window)) {
         wsi_log("[wsi] surface create req=%llx cur=%llx win=%p -> SURFACE_LOST",
                 (unsigned long long)(uintptr_t)window,
                 (unsigned long long)(uintptr_t)g_handle, (void *)g_window);
@@ -209,14 +233,14 @@ bool getDisplayMode(HMONITOR handle, uint32_t index, WsiMode *mode) {
 
 void getWindowSize(HWND window, uint32_t *width, uint32_t *height) {
     std::lock_guard<std::mutex> guard(g_lock);
-    const bool valid = g_window && window == g_handle;
+    const bool valid = g_window && is_app_token(window);
     if (width) *width = valid ? g_buffer_w : 0;
     if (height) *height = valid ? g_buffer_h : 0;
 }
 
 void resizeWindow(HWND window, DxvkWindowState *, uint32_t width, uint32_t height) {
     std::lock_guard<std::mutex> guard(g_lock);
-    if (g_window && window == g_handle && width && height &&
+    if (g_window && is_app_token(window) && width && height &&
         ANativeWindow_setBuffersGeometry(g_window, (int32_t)width, (int32_t)height, 0) == 0) {
         g_buffer_w = width;
         g_buffer_h = height;
@@ -225,7 +249,7 @@ void resizeWindow(HWND window, DxvkWindowState *, uint32_t width, uint32_t heigh
 
 bool isWindow(HWND window) {
     std::lock_guard<std::mutex> guard(g_lock);
-    return g_window && window == g_handle;
+    return g_window && is_app_token(window);
 }
 
 HMONITOR getWindowMonitor(HWND window) { return isWindow(window) ? the_monitor() : nullptr; }
