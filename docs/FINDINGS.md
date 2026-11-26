@@ -4967,3 +4967,23 @@ measurement.
 - Stage 1 (wake queue), any 30 fps claim, a 330 s campaign on this build, other
   devices, and the Windows long-run. The Windows oracle was not re-run: no
   `src/host` file changed in this stage.
+
+## 2026-11-27 - coordinator verification: Stage 0 accepted after the record was corrected
+
+Independently re-checked before acceptance: `3b69c12`, `8da2caf` and
+`d92a4c0` are pushed, `main == origin/main`, tree clean. The base log fails
+exactly S3/S5/X2 (`15/18`); two distinct post-fix logs pass `18/18` with zero
+normalised differences, and `stage0_fix3_log.txt` is a byte-identical copy of
+`fix2` (SHA-256 `C10D477B8CBDEE90` against `101105AE58A669EF`), so the earlier
+"three runs" was rejected and corrected in `d92a4c0`. The frame window
+recomputes to 566 frames over the t=237-319 span (83 s carried by 75 one-second
+samples) = 6.8 fps, not 7.5. Live device: `GameData.dat` 7,856 B (rewritten
+2026-11-27 01:26), `SystemData.dat` 16 B (2026-11-25 Options run), the crash
+buffer empty. `run_selftest.ps1` 60/60; content guard 128 files clean and its
+selftest 6/6. The code was read: a semaphore wait consumes one count under
+`g_obj_lock`, `ReleaseSemaphore` clamps at `maxcount` with 298, auto-reset is
+one bit, manual-reset stays signaled, wait-all checks then consumes one per
+object, the handle is re-resolved after every poll, and there is no wake list,
+condvar or broadcast. Stage 0 is closed. Stage 1 (one-signal-one-waiter) is
+next; its before/after must use a matched window, because the Stage 0 sample is
+61.7 % of frames over 100 ms against the reference's 37.7 %.

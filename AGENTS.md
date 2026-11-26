@@ -563,3 +563,9 @@ Append only; newest last. Format: date — attempt — outcome — next idea.
   Reset/Present goes through a catch that answers `D3DERR_DEVICELOST`;
   `korra_guest` needs `-fexceptions` because the module's `cppFlags` disable
   them.
+- 2026-11-27 — "three device runs of the same APK, the third after a force-stop"
+  — **only two distinct runs existed.** `stage0_fix3_log.txt` was a byte copy of
+  `fix2` (identical SHA-256), so the repeatability claim rested on a duplicated
+  file. Hash the pulled logs before counting runs; identical size and timestamp
+  are the tell. The same report's "7.5 fps" was 566 frames divided by 75 sample
+  lines, not by the 83 s span (6.8 fps).
