@@ -98,6 +98,7 @@ typedef struct {
     uint32_t submits, gs_calls, last_logged_q;
     int had_data, dry, oor_warned;
     uint32_t bad_slices;   /* diagnostics: whole-slice profiles printed */
+    uint32_t hw_short;     /* diagnostics: Hw blocks whose count < declared frames */
     uint32_t nan_words;    /* float words that were not PCM and were zeroed */
     uint32_t nan_logged;   /* diagnostics: the first three named */
     uint32_t matrix_ch;
@@ -559,6 +560,81 @@ static uint32_t xv_slice_hash(uint32_t data, uint32_t frames, uint32_t align) {
     return h;
 }
 
+/* ------------------------------------- the Hw block boundary, measured
+ * The Hw output device (guest 0x0088B000; its IXAudio2VoiceCallback object is
+ * device+0x28, vtable 0x0091ECC8) renders exactly one block per mixer tick:
+ *
+ *   0x008872D0  zeroes the count at device+0x1E, calls 0x00887200, and then
+ *               jumps to vtable slot 7 (0x0088B510) when the count is > 0,
+ *               or to slot 8 (0x0088B5F0) when the mix produced nothing;
+ *   0x00887200  mixes into the buffer at device+0x10 and writes the block's
+ *               frame count to device+0x1E from [mixer+0x424] (configured
+ *               0x400 = 1024 by 0x00887320/0x0088663F);
+ *   0x0088B510  copies exactly that many frames from device+0x10 into the
+ *               ring slot at the fill cursor (device+0x44), clamped, and
+ *               advances the fill cursor;
+ *   0x0088B440  the feed: submits ring slots through the submit cursor
+ *               (device+0x46) with AudioBytes = block_align << 10 always.
+ *
+ * So the engine does expose, per block, how many frames it filled - the same
+ * number the fill used - and this probe reports it next to the declared
+ * buffer, so a stale tail is a measurement instead of an inference. */
+static int xv_hw_fields(const xv_voice *v, uint32_t *count, uint32_t *fill,
+                        uint32_t *cur, uint32_t *credits, uint32_t *mix,
+                        uint32_t *ba) {
+    uint32_t dev;
+    if (v->cb_kind != 2 || !v->cb) return 0;
+    dev = v->cb - 0x28;
+    if (!xv_readable(dev, 0x70)) return 0;
+    *count = MEM32(dev + 0x1E) & 0xFFFFu;
+    *fill = MEM32(dev + 0x44) & 0xFFFFu;
+    *cur = MEM32(dev + 0x46) & 0xFFFFu;
+    *credits = MEM32(dev + 0x68);
+    *mix = MEM32(dev + 0x10);
+    *ba = MEM32(dev + 0x6C) & 0xFFFFu;
+    return 1;
+}
+
+/* Class profile of one range of a slot, channel 0. Used for the tail the
+ * engine's count says it did not fill in this block. */
+static void xv_profile_range(const char *tag, uint32_t data, uint32_t align,
+                             uint32_t from, uint32_t to) {
+    uint32_t zero_n = 0, nan_n = 0, huge_n = 0, fin_n = 0, k;
+    if (!data || !align || from >= to) return;
+    for (k = from; k < to; k++) {
+        float x;
+        uint32_t va = data + k * align;
+        if (!xv_readable(va, 4)) break;
+        memcpy(&x, ka_host(va), 4);
+        if (x == 0.0f) zero_n++;
+        else if (!isfinite(x)) nan_n++;
+        else if (fabsf(x) > 2.0f) huge_n++;
+        else fin_n++;
+    }
+    xv_log("  %s [%u..%u): zero %u, non-finite %u, |x|>2 %u, finite %u",
+           tag, from, to, zero_n, nan_n, huge_n, fin_n);
+}
+
+/* The engine's declared fill next to the host's declared buffer. Logged once
+ * per submit at verbose >= 2; a short block is logged once per voice with the
+ * committed/stale split, which is the whole question this probe exists for. */
+static void xv_log_hw_block(xv_voice *v, uint32_t frames, uint32_t data) {
+    uint32_t count, fill, cur, credits, mix, ba;
+    if (!xv_hw_fields(v, &count, &fill, &cur, &credits, &mix, &ba)) return;
+    if (g_verbose >= 2)
+        xv_log("hw block(%d): frames=%u count=%u fill=%u cur=%u credits=%u "
+               "mix=%08X ba=%u slot=%08X",
+               (int)(v - g_v), frames, count, fill, cur, credits, mix, ba, data);
+    if (count && count < frames && v->hw_short < 4) {
+        v->hw_short++;
+        xv_log("hw boundary(%d): slot %08X declares %u frames, engine count %u "
+               "- committed [0..%u) from the mix, uncommitted tail [%u..%u)",
+               (int)(v - g_v), data, frames, count, count, count, frames);
+        xv_profile_range("tail", data, ba, count, frames);
+        xv_profile_range("head", data, ba, 0, count < 256 ? count : 256);
+    }
+}
+
 static void xv_mix_voice(xv_voice *v, float *out, int frames) {
     double step = (double)v->rate * (double)(v->ratio > 0.0f ? v->ratio : 1.0f) /
                   (double)KORRA_AUDIO_RATE;
@@ -629,6 +705,23 @@ static void xv_mix_voice(xv_voice *v, float *out, int frames) {
                        (unsigned long long)base, (unsigned long long)len,
                        (unsigned)(s->data & 0xFFF), buf);
             }
+            /* Every channel of the offending frame. The slice profile below
+             * only scans channel 0, but l/r are the engine's whole matrix mix,
+             * so a huge value in channel 1..5 shows up in l/r while channel 0
+             * looks clean - this line says which channel carried it. */
+            if (s->data && v->is_float && v->bits == 32 && v->channels > 1) {
+                char fbuf[256];
+                int fn = 0;
+                uint32_t cw, nch = v->channels > 8 ? 8 : v->channels;
+                uint32_t fva = s->data + rel * v->block_align;
+                for (cw = 0; cw < nch && fn < (int)sizeof fbuf - 16; cw++) {
+                    uint32_t va2 = fva + cw * 4, val = 0;
+                    if (xv_readable(va2, 4)) val = MEM32(va2);
+                    fn += snprintf(fbuf + fn, sizeof fbuf - (size_t)fn, "%s%08X",
+                                   cw ? " " : "", val);
+                }
+                xv_log("  frame words (rel %u, %u ch): %s", rel, nch, fbuf);
+            }
             /* Whole-slice profile: the first bad sample does not say whether the
              * bad words are a tail the engine never filled, a contiguous block,
              * or scattered. Count the classes and the span of each. */
@@ -659,6 +752,42 @@ static void xv_mix_voice(xv_voice *v, float *out, int frames) {
                        zero_n ? (int)zero_a : -1, zero_n ? zero_b : 0,
                        nan_n, nan_n ? (int)nan_a : -1, nan_n ? nan_b : 0,
                        huge_n, fin_n, v->qcount, v->pos);
+                /* The class above is channel 0 only. A multi-channel voice can
+                 * carry the out-of-range word in another channel (l/r are the
+                 * matrix mix), so name the channel and the span: a tail is one
+                 * contiguous span at the end, a decoder poison is a block. */
+                if (v->is_float && v->bits == 32 && v->channels > 2) {
+                    char cbuf[512];
+                    int cn = 0;
+                    uint32_t cw, nch = v->channels > 8 ? 8 : v->channels;
+                    for (cw = 0; cw < nch && cn < (int)sizeof cbuf - 40; cw++) {
+                        uint32_t hn = 0, ha = 0xFFFFFFFFu, hb = 0, nn = 0;
+                        uint64_t kk;
+                        float mx = 0.0f;
+                        for (kk = 0; kk < len; kk++) {
+                            float x;
+                            uint32_t va2 = s->data + (uint32_t)kk * v->block_align + cw * 4;
+                            if (!xv_readable(va2, 4)) break;
+                            memcpy(&x, ka_host(va2), 4);
+                            if (!isfinite(x)) nn++;
+                            else {
+                                if (fabsf(x) > mx) mx = fabsf(x);
+                                if (fabsf(x) > 2.0f) {
+                                    hn++;
+                                    if (kk < ha) ha = (uint32_t)kk;
+                                    hb = (uint32_t)kk;
+                                }
+                            }
+                        }
+                        cn += snprintf(cbuf + cn, sizeof cbuf - (size_t)cn,
+                                       "%sc%u >2 %u", cw ? " " : "", cw, hn);
+                        if (hn) cn += snprintf(cbuf + cn, sizeof cbuf - (size_t)cn,
+                                               " [%u..%u]", ha, hb);
+                        cn += snprintf(cbuf + cn, sizeof cbuf - (size_t)cn,
+                                       " nan %u max %g", nn, (double)mx);
+                    }
+                    xv_log("  channels: %s", cbuf);
+                }
             }
         }
         v->pos += step;
@@ -1124,6 +1253,7 @@ static uint32_t src_call(int slot) {
     case 21: {  /* SubmitSourceBuffer(this, buf, wma) */
         uint32_t buf = A32(1);
         uint32_t flags, bytes, data, ctx, play_begin, play_len, loop_count, total;
+        uint32_t slot_data = 0;
         uint64_t frames, start, end, cursor;
         xv_slice *slot_p;
         if (!buf || !xv_readable(buf, 36)) return XV_HR_INVALID;
@@ -1172,7 +1302,10 @@ static uint32_t src_call(int slot) {
         v->had_data = 1;
         v->dry = 0;
         v->submits++;
+        slot_data = slot_p->data;
         xv_unlock();
+
+        xv_log_hw_block(v, (uint32_t)frames, slot_data);
 
         xv_ensure_sink();
 

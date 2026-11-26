@@ -144,6 +144,7 @@ typedef struct xa2_voice {
     UINT32 cb_ticks;           /* diagnostics: callback ticks that had work */
     UINT32 cb_feeds;           /* diagnostics: slot 0 (feed) invocations */
     UINT32 oor_warned;         /* diagnostics: bad samples printed for this voice */
+    UINT32 hw_short;           /* diagnostics: Hw blocks whose count < declared */
     xa2_slice q[XA2_QUEUE_MAX];
     /* The engine's own downmix, installed through SetOutputMatrix. CRI computes
      * this once per voice (FUN_007b27e2) and it is the level the shipping game
@@ -573,6 +574,67 @@ static void xa2_read_at(xa2_voice *v, double p, float *l, float *r) {
     *r = r0 + (r1 - r0) * f;
 }
 
+/* ------------------------------------- the Hw block boundary, measured
+ * The Hw output device (guest 0x0088B000; its IXAudio2VoiceCallback object is
+ * device+0x28, vtable 0x0091ECC8) renders exactly one block per mixer tick:
+ * 0x008872D0 zeroes the count at device+0x1E and calls 0x00887200, which
+ * writes the block's frame count there from [mixer+0x424] (configured 0x400 =
+ * 1024); 0x0088B510 copies exactly that many frames from the mix buffer
+ * (device+0x10) into the ring slot at the fill cursor (device+0x44); the feed
+ * 0x0088B440 submits slots through the submit cursor (device+0x46) with a
+ * fixed AudioBytes = block_align << 10. The count is the engine's own fill
+ * bookkeeping, so this reports it next to the declared buffer on both hosts. */
+static int xa2_hw_fields(const xa2_voice *v, UINT32 *count, UINT32 *fill,
+                         UINT32 *cur, UINT32 *credits, UINT32 *mix, UINT32 *ba) {
+    const BYTE *dev;
+    if (v->cb_kind != XA2_CB_HW_FEED || !v->cb) return 0;
+    dev = (const BYTE *)v->cb - 0x28;
+    if (!xa2_readable(dev, 0x70)) return 0;
+    *count = *(const UINT16 *)(dev + 0x1E);
+    *fill = *(const UINT16 *)(dev + 0x44);
+    *cur = *(const UINT16 *)(dev + 0x46);
+    *credits = *(const UINT32 *)(dev + 0x68);
+    *mix = *(const UINT32 *)(dev + 0x10);
+    *ba = *(const UINT16 *)(dev + 0x6C);
+    return 1;
+}
+
+static void xa2_profile_range(const char *tag, const BYTE *data, UINT32 align,
+                              UINT32 from, UINT32 to) {
+    UINT32 zero_n = 0, nan_n = 0, huge_n = 0, fin_n = 0, k;
+    if (!data || !align || from >= to) return;
+    for (k = from; k < to; k++) {
+        const BYTE *p = data + (size_t)k * align;
+        float x;
+        if (!xa2_readable(p, 4)) break;
+        memcpy(&x, p, 4);
+        if (x == 0.0f) zero_n++;
+        else if (!isfinite(x)) nan_n++;
+        else if (fabsf(x) > 2.0f) huge_n++;
+        else fin_n++;
+    }
+    xa2_log("  %s [%u..%u): zero %u, non-finite %u, |x|>2 %u, finite %u",
+            tag, from, to, zero_n, nan_n, huge_n, fin_n);
+}
+
+static void xa2_log_hw_block(xa2_voice *v, UINT32 frames, const BYTE *data) {
+    UINT32 count, fill, cur, credits, mix, ba;
+    if (!xa2_hw_fields(v, &count, &fill, &cur, &credits, &mix, &ba)) return;
+    if (g_verbose >= 2)
+        xa2_log("hw block(%p): frames=%u count=%u fill=%u cur=%u credits=%u "
+                "mix=%08X ba=%u slot=%p",
+                (void *)v, frames, count, fill, cur, credits, mix, ba,
+                (const void *)data);
+    if (count && count < frames && v->hw_short < 4) {
+        v->hw_short++;
+        xa2_log("hw boundary(%p): slot %p declares %u frames, engine count %u "
+                "- committed [0..%u) from the mix, uncommitted tail [%u..%u)",
+                (void *)v, (const void *)data, frames, count, count, count, frames);
+        xa2_profile_range("tail", data, ba, count, frames);
+        xa2_profile_range("head", data, ba, 0, count < 256 ? count : 256);
+    }
+}
+
 static void xa2_mix_voice(xa2_voice *v, float *out, int frames) {
     double step = (double)v->rate * (double)(v->ratio > 0.0f ? v->ratio : 1.0f) /
                   (double)KORRA_AUDIO_RATE;
@@ -639,6 +701,26 @@ static void xa2_mix_voice(xa2_voice *v, float *out, int frames) {
                 xa2_log("  ring words rel %llu.. (%llu frames in slice, data%%4096=0x%llX): %s",
                         (unsigned long long)base, (unsigned long long)len,
                         (unsigned long long)((uintptr_t)s->data & 0xFFF), buf);
+                /* Every channel of the offending frame: l/r are the engine's
+                 * whole matrix mix, so the huge word can sit in a channel the
+                 * channel-0 ring window above never shows. */
+                if (v->is_float && v->bits == 32 && v->channels > 1) {
+                    char fbuf[256];
+                    int fn = 0;
+                    UINT32 cw, nch = v->channels > 8 ? 8 : v->channels;
+                    const BYTE *fp = s->data +
+                                     (size_t)(i0 >= s->start ? i0 - s->start : 0) *
+                                         v->block_align;
+                    for (cw = 0; cw < nch && fn < (int)sizeof fbuf - 16; cw++) {
+                        const BYTE *p2 = fp + (size_t)cw * 4;
+                        UINT32 val2 = xa2_readable(p2, 4) ? *(const UINT32 *)p2 : 0;
+                        fn += snprintf(fbuf + fn, sizeof fbuf - (size_t)fn, "%s%08X",
+                                       cw ? " " : "", val2);
+                    }
+                    xa2_log("  frame words (rel %llu, %u ch): %s",
+                            (unsigned long long)(i0 >= s->start ? i0 - s->start : 0),
+                            nch, fbuf);
+                }
             }
         }
         v->pos += step;
@@ -1284,6 +1366,7 @@ static HRESULT __stdcall src_Stop(xa2_voice *self, UINT32 flags, UINT32 opset) {
 static HRESULT __stdcall src_SubmitSourceBuffer(xa2_voice *self, const xa2_buffer *buf, const void *wma) {
     UINT64 frames, start, end, cursor;
     UINT32 total, play_begin, play_len;
+    const BYTE *slot_data;
     xa2_slice *slot;
     (void)wma;
     if (!xa2_voice_valid(self) || !buf) return XA2_HR_INVALID;
@@ -1324,7 +1407,10 @@ static HRESULT __stdcall src_SubmitSourceBuffer(xa2_voice *self, const xa2_buffe
     self->had_data = 1;
     self->dry = 0;
     g_stats.buffers_submitted++;
+    slot_data = slot->data;
     xa2_unlock();
+
+    xa2_log_hw_block(self, (UINT32)frames, slot_data);
 
     /* Open the device outside the lock: it creates COM objects and loads DLLs. */
     xa2_ensure_sink();
