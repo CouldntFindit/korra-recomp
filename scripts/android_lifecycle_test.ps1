@@ -287,8 +287,14 @@ if ($resumeState -eq "gameplay") {
     $kept = Keep-Shot "pause-after"
     Note ("pause-after state={0} shot={1} text={2}" -f (Classify $t), (Split-Path -Leaf $kept),
           ($t.Substring(0, [Math]::Min(200, $t.Length))))
-    Adb-Run @('shell', 'input', 'keyevent', 'KEYCODE_BACK') | Out-Null
-    Start-Sleep -Seconds 2
+    Note "act: START (leave the pause menu)"
+    Press-Start
+    Start-Sleep -Seconds 3
+    $script:shot = Scan-Shot
+    $t = Get-ScreenText $script:shot
+    $kept = Keep-Shot "after-pause"
+    Note ("after-pause state={0} shot={1} text={2}" -f (Classify $t), (Split-Path -Leaf $kept),
+          ($t.Substring(0, [Math]::Min(200, $t.Length))))
 }
 
 # ---- evidence ------------------------------------------------------------
@@ -297,10 +303,15 @@ Note "final pid=$pidEnd (alive=$([bool]$pidEnd))"
 Get-Logcat "$Prefix`_logcat.txt" | Out-Null
 Adb-Run @('logcat', '-b', 'crash', '-d') | Out-File -FilePath (Join-Path $logs "$Prefix`_crash.txt") -Encoding utf8
 Adb-Run @('shell', 'dumpsys', 'activity', 'exit-info', $Package) |
+    Out-File -FilePath (Join-Path $logs "$Prefix`_exit_before_stop.txt") -Encoding utf8
+# The ladder's exit-code check: a deliberate force-stop must show reason=10 and
+# no reason=2 (SIGNALED) / 5 (APP CRASH) for this run.
+Adb-Run @('shell', 'am', 'force-stop', $Package) | Out-Null
+Start-Sleep -Seconds 3
+Adb-Run @('shell', 'dumpsys', 'activity', 'exit-info', $Package) |
     Out-File -FilePath (Join-Path $logs "$Prefix`_exit.txt") -Encoding utf8
-Adb-Run @('shell', 'run-as', $Package, 'cat', 'files/game/../log.txt') | Out-Null
-# The in-app log lives in the app's external files dir.
+# The in-app log lives in the app's external files dir (read-only pull).
 Adb-Run @('pull', "/sdcard/Android/data/$Package/files/log.txt", (Join-Path $logs "$Prefix`_log.txt")) | Out-Null
 $exit = Select-String -Path (Join-Path $logs "$Prefix`_exit.txt") -Pattern 'reason=|status=' |
-        ForEach-Object { $_.Line.Trim() }
-Note ("exit-info: {0}" -f ($exit -join " / "))
+        Select-Object -First 4 | ForEach-Object { $_.Line.Trim() }
+Note ("exit-info (newest first): {0}" -f ($exit -join " / "))

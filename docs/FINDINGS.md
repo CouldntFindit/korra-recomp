@@ -4640,3 +4640,145 @@ that int32 clustering; leftover integer PCM in a slot that was not cleared
 does. So the next check is whether the 6 ch ring slots are zeroed between
 movies (the 2 ch Hw path is: `0x0088B5F0` zero-fills a whole slot on a zero
 count), not to filter anything.
+
+## 2026-11-26 (backgrounding/lifecycle session) - HOME no longer kills the process: the bridge now answers D3D9's device-lost contract and the WSI keeps one app window
+
+Base HEAD `f0f0a29` (the expected `64f1522` is in its history, one docs-wording
+commit above it; tree clean, `main == origin/main`). Phone `RFCYA0VVJKH`,
+`adb devices` at the start and before each run. Commits `38011aa` (probes +
+driver), `1f732ed` (exception support in the guest build), `06ea6d0` (the fix),
+then this docs commit.
+
+**The defect, reproduced twice on the pre-fix build (`base1`, `base2`).** HOME
+during gameplay, ~15 s, `am start`; both runs are identical:
+
+```
+lifecycle: pause
+lifecycle: focus lost
+window: destroyed
+[wsi] unbind win=0xb4000074755f2c80 token=1001 gen=1 surfaces=1
+warn:  swapchain: recreate n=3 vsync=0
+[wsi] surface create req=1001 cur=0 win=0x0 -> SURFACE_LOST
+err:   D3D9SwapChainEx: Failed to recreate swap chain
+[life] present win=0 hr=88760870 n=21
+[hr] dev:17 -> 88760870 at 00759E70
+[life] tcl win=0 hr=00000000 n=21
+lifecycle: low memory
+[crash] signal 11 code=2 addr=0x71d3420008 guest_func=0x007524C0 ... eax=0
+```
+
+Exit-info `reason=2 (SIGNALED) status=11`, a new pid after `am start` (the old
+process was gone), `adb logcat -b crash` empty of anything else. The destroyed
+object is the shell's `ANativeWindow` (`APP_CMD_TERM_WINDOW`): the presenter
+still held the `VkSurfaceKHR` and HWND token built from it, and `[wsi]` shows
+the surface request carrying that old token while the WSI has no window at all
+(`cur=0 win=0x0`), so `wsi::createSurface` answers `VK_ERROR_SURFACE_LOST_KHR`,
+`D3D9SwapChainEx::RecreateSwapChain` throws, and `D3D9SwapChainEx::Present`
+converts it to **`D3DERR_DEVICEREMOVED` (0x88760870)**.
+
+**Why 0x88760870 kills it (guest code read, not patched).** `sub_00759E70` -
+the engine's Present wrapper, the caller of `dev:17` - branches on success and
+exactly `0x88760868` (`D3DERR_DEVICELOST`) at `0x759E94..0x759E9F`; anything
+else returns 0, and the caller's teardown releases a render object that is
+still referenced: the SIGSEGV at `0x7524C0` is `mov ecx,[esi]; mov eax,[ecx];
+call [eax+8]` with a freed `ecx` (`0x3464B0E0` in run 1, `0x3464A160` in the
+later run). The engine *does* implement the lost/reset contract: `sub_00759C90`
+(its `TestCooperativeLevel`, manages `[mgr+0x6C]`, the skip flag the frame
+setup gate reads, and `[mgr+0x74]`) maps `0x88760868`/`0x88760869` onto it, and
+`sub_00759D40` calls `IDirect3DDevice9::Reset(pp)` and clears the flag at
+`0x759E35` on success. The bridge answered `D3D_OK` from TestCooperativeLevel
+unconditionally, so that path was never entered.
+
+**Fix (one behaviour change, three parts; commits below).**
+- `dxvk_android/android_wsi.cpp`: **one stable HWND token for the app's life**
+  (Win32 keeps one window per app) plus a **bind generation** (`0` while no
+  window) for the bridge. DXVK must not see a window *change*: with one token
+  per bind, the presenter created a second `vk::Presenter` while the first
+  `VkSurfaceKHR` was still alive, and `vkCreateAndroidSurfaceKHR` answered
+  `VK_ERROR_OUT_OF_HOST_MEMORY` on the Xclipse driver (measured: that
+  intermediate build aborted with `reason=5 status=6`). `createSurface` still
+  refuses when no window is bound.
+- `src/host_android/d3d9_android.cpp`: `TestCooperativeLevel` = DEVICELOST with
+  no window, DEVICENOTRESET until a Reset against a live window succeeds, else
+  D3D_OK. `Present` (device and swapchain slots) = DEVICELOST **without
+  reaching DXVK** while lost. `Reset` = DEVICELOST with no window; otherwise
+  DXVK Reset with the app's token, and the generation is adopted on success. On
+  resume DXVK's own surface-loss path rebuilds the swap chain against the new
+  `ANativeWindow`.
+- `d3d9_android.cpp` + `android/app/src/main/cpp/CMakeLists.txt`:
+  `D3D9DeviceEx::Reset` does not catch `dxvk::DxvkError`; the escaping throw
+  reached `std::terminate` (`libc++abi: terminating due to uncaught exception
+  of type dxvk::DxvkError`, `reason=5 status=6`). Reset/Present now go through
+  `d9_call`, which answers DEVICELOST instead of aborting; `korra_guest` gets
+  `-fexceptions` (the module's `cppFlags` disable them).
+
+**Proof (device, final build).** `fix4`, `fix5`, `fix6`, `fix9`, `fix10` and
+`fix11` - six runs with the fix (three of them with a pause-menu walk before
+HOME; `fix11` is the final artifact with a 20 s HOME) and the final artifact.
+The sequence is the same every time:
+
+```
+lifecycle: pause
+lifecycle: focus lost
+window: destroyed
+[life] present gen=0 hr=88760868       <- DEVICELOST, DXVK never called
+[life] tcl     gen=0 hr=88760868
+-- 15-22 s on the launcher --
+lifecycle: resume
+window: created 2340x1080 format=4
+[life] census gen=2/1 flag=00000001 need=00000000 ok=00000000  <- engine's skip flag up
+[life] tcl gen=2 hr=88760869           <- DEVICENOTRESET
+d3d9: Reset 1280x720 fmt=22 windowed=1 depthfmt=75
+warn: swapchain: recreate n=3 / n=4    <- DXVK rebuilds on the new ANativeWindow
+d3d9: Reset -> 0x00000000
+[life] tcl gen=2 hr=00000000
+[life] census gen=2/2 flag=00000000 need=00000001 ok=00000001 presents=3040 -> 3450
+```
+
+Same pid before and after; screenshots `fix9_19_resume-gameplay.png` (HUD,
+"Light Attack / Heavy Attack / Jump"), `fix9_20_pause-after.png` (pause menu:
+"Resume / Close the Pause Menu and return to the game / Options / Quit Game /
+Back"), `fix9_21_after-pause.png` (HUD again after START), and `fix5`/`fix6`/
+`fix9` also open and close the pause menu *before* HOME. An explicit force-stop
+after the round trip gives `reason=10 (USER REQUESTED) subreason=21 (FORCE
+STOP)` with no new `reason=2`/`5`; `adb logcat -b crash` is empty in every run
+(`fix5`, `fix6`, `fix9`, `fix10` crash files are 0 bytes). Audio keeps streaming
+through the pause (`[xa2] hw block` every ~25 ms) and the route uses the
+Continue checkpoint, so boot/save/audio are exercised, not assumed.
+
+**Windows oracle: real D3D9 behaves the same way.** `scripts\win_focus_oracle.ps1`
+runs the current Windows build (`build\korra_recomp.exe`) with `KORRA_GATE=1`,
+minimizes the game's device window for 20 s, then restores it. Two runs agree:
+`flag=0` before and **during** the absence (Present is not called while the
+window is minimized), then **`flag=00000001`** every second for 45 s after the
+restore, with the technique slot `ctx30=00000000` - i.e. the engine itself
+enters the device-lost/skip state on Win32 focus loss and survives it (the
+restore did not take foreground in either run: `foreground` != the game hwnd,
+so the exclusive-fullscreen device stays lost). That is the contract the
+Android bridge now answers; the device's recovery (flag back to 0 within ~1 s
+of the window returning) is the same path with a window that does come back.
+
+**One residual, not hidden.** The first run of the fix (`fix3`; same code as
+`fix4`-`fix6`, before the one-second census was added) survived the round trip
+but presented nothing for the 50 s the test watched: its first post-resume
+Present arrived **77 s** after the window bind, and after a successful Reset
+the main thread went back to a steady `sound\stream\*.wem` load pass with
+`presents=3273` frozen. Five later runs did not reproduce it (recovery in
+1-3 s). Whether that run would have recovered after its load pass is **not
+verified**; the parallel on Windows is that flag=1 can persist as long as the
+window is not really foreground. `fix9`/`fix10` crash buffers are empty; the
+same is true for `fix5`/`fix6`.
+
+**Also measured / no regression.** `scripts\run_selftest.ps1` **60/60** with
+the final source; `tests\check_content_selftest.ps1` 6/6; the content guard ran
+on every commit. The only Android build change is `-fexceptions` on
+`korra_guest` and the two host files; no DXVK patch, no lifted-guest change, no
+audio/save/performance code touched.
+
+**Not verified.** A second HOME cycle in one process, a HOME during a loading
+screen or a movie, `APP_CMD_TERM_WINDOW` without `APP_CMD_PAUSE`, a long
+(>2 min) background with the app's process cached (LMK), the presenter case
+where the driver reports a dead window's surface as healthy (then DXVK's
+A005 staleness check would keep a dead swap chain), the `fix3` stall's
+recovery, and the Windows focus oracle *with* the game really foregrounded
+(the restore in both runs left another window in front).
