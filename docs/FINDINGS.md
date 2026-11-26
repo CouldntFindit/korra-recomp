@@ -4886,18 +4886,25 @@ a broadcast, and Stage 0 only proves observability through the existing poll.
    `S3 PASS release over max: ret 0, last error 298, count 1`,
    `S5 PASS each wait consumes one: counts 1 then 0, third wait 258`,
    `X2 PASS wait-all: partial 258 kept 1, complete 0 consumed 0/0`.
-2. **Repeatability.** Three runs of the same APK (`stage0_fix1/2/3_log.txt`),
-   the third after an explicit `am force-stop` and relaunch: `18/18 PASS` each,
-   and the scenario lines are identical after normalising the measured
-   milliseconds (0 differences, no order dependence).
+2. **Repeatability.** Two distinct runs of the same APK (`stage0_fix1_log.txt`,
+   `stage0_fix2_log.txt`): `18/18 PASS` each, and the scenario lines are
+   identical after normalising the measured milliseconds (0 differences, no
+   order dependence). `stage0_fix3_log.txt` is a byte-identical copy of fix2
+   (SHA-256 `C10D477B8CBDEE90`; fix1 is `101105AE58A669EF`), so it is not
+   evidence of a third launch. *Corrected 2026-11-27: the earlier text claimed
+   three runs, the third after an explicit `am force-stop`; the two distinct runs
+   differ only in the measured milliseconds (0 normalised differences).*
 3. **Engine.** `scripts\android_route_drive.ps1` reached the tutorial HUD at
    237 s (`stage0drive_25_gameplay.png`, OCR "Light Attack / Heavy Attack /
    Jump") and played a 62 s campaign (33 gestures, 4 shots). The pool started:
    24 `sem:` creates, 56 threads attached, no `[crash]` line, `adb logcat -b
    crash` empty (0 bytes), our own force-stop gives `reason=10 (USER REQUESTED)
    subreason=21 (FORCE STOP)`, and `files/perf.txt` holds 305 frame-probe lines.
-4. **No regression.** Save pair after the checkpoint autosave: `GameData.dat`
-   7,856 B + `SystemData.dat` 16 B. Continue: the Story submenu OCRs "Resume the
+4. **No regression.** Save pair: `GameData.dat` 7,856 B + `SystemData.dat` 16 B.
+   *Corrected 2026-11-27: `GameData.dat` was rewritten by this run's checkpoint
+   (7,856 B, 2026-11-27 01:26); `SystemData.dat` is present from the 2026-11-25
+   Options run (16 B). The earlier text called both files the pair written by the
+   checkpoint autosave.* Continue: the Story submenu OCRs "Resume the
    game from where you stopped playing." with Continue as the default entry, and
    pressing it reaches the HUD at 146 s (`stage0cont_14_gameplay.png`), no New
    Game. Hw voice fed all run (14,913 `hw block` lines) and the NaN guard is
@@ -4911,9 +4918,12 @@ a broadcast, and Stage 0 only proves observability through the existing poll.
    clean on every commit (7 files, then 2).
 5. **Stage 0 frame baseline, no claim.** Same route/driver/device/cap
    (`debug.korra.fps=30`, `int=100` in every sample). Gameplay window t=237-319
-   (75 s, 566 frames, 7.5 fps):
+   (83 s span carried by 75 one-second samples, 566 frames, mean `dt` 146.5 ms,
+   6.8 fps = 566 / 83). *Corrected 2026-11-27: the earlier "75 s, 566 frames,
+   7.5 fps" read the sample count as seconds; 7.5 is 566 / 75 samples, not a
+   rate.*
 
-| bucket | this run (75 s) | 2026-11-22 reference (330 s) |
+| bucket | this run (83 s, 75 samples) | 2026-11-22 reference (330 s) |
 |---|---|---|
 | frame `dt` | 146.5 ms (per-second min 52.8, max 570.0) | 123.9-127.0 ms |
 | inside `Present` | 1.80 ms | 1.8-1.9 ms |
@@ -4926,9 +4936,10 @@ a broadcast, and Stage 0 only proves observability through the existing poll.
 | frames > 50 ms / > 100 ms | 566 / 349 | 3,154 / 1,191 of 3,159 |
 
 The first 22 s after the HUD averaged 96.7 ms (sleep 45.3, lock 44.9); the last
-20 s 132.7 ms; the cutscene before it 73.0 ms. **No 30 fps claim**: this is a
-75 s sample with 33 gestures against the reference's 330 s and 186, so the
-per-second averages move with the scene and the player's position. Both runs
+20 s 132.7 ms; the cutscene before it 73.0 ms. **No 30 fps claim**: this is an
+83 s window (75 one-second samples) with 33 gestures against the reference's
+330 s and 186, so the per-second averages move with the scene and the player's
+position. Both runs
 still show the same shape (Present ~2 ms, waits > 90 % of the frame, one core,
 ~40 polls/frame), and the sleep and lock buckets follow the frame rather than
 one having been exchanged for the other. The Stage 1 session owns the 30 fps
