@@ -104,46 +104,78 @@ int ka_obj_close(uint32_t h) {
 
 int ka_obj_set(uint32_t h) {
     ka_obj *o;
+    int ok = 0;
     pthread_mutex_lock(&g_obj_lock);
     o = obj_at(h);
-    /* Stage 0 baseline: any object's signal bit is set, as the old shim did. */
-    if (o) o->signaled = 1;
+    /* One bit, no accumulation: a second SetEvent while an auto-reset event is
+     * already signaled is a no-op, exactly like ResetEvent before the next
+     * wait. A non-event handle is not settable (Windows answers FALSE). */
+    if (o && o->kind == KA_OBJ_EVENT) {
+        o->signaled = 1;
+        ok = 1;
+    }
     pthread_mutex_unlock(&g_obj_lock);
-    return 1;
+    return ok;
 }
 
 int ka_obj_reset(uint32_t h) {
     ka_obj *o;
+    int ok = 0;
     pthread_mutex_lock(&g_obj_lock);
     o = obj_at(h);
-    if (o) o->signaled = 0;
+    if (o && o->kind == KA_OBJ_EVENT) {
+        o->signaled = 0;
+        ok = 1;
+    }
     pthread_mutex_unlock(&g_obj_lock);
-    return 1;
+    return ok;
 }
 
 int ka_obj_release_sem(uint32_t h, uint32_t count, uint32_t *previous) {
     ka_obj *o;
+    int ok = 0;
     pthread_mutex_lock(&g_obj_lock);
     o = obj_at(h);
-    if (o) {
-        /* Stage 0 baseline: no maxcount clamp, lPreviousCount written before
-         * the add, always success - the old shim's body. */
+    if (!o) {
+        ka_last_error_set(KA_ERROR_INVALID_HANDLE);
+    } else if (o->kind != KA_OBJ_SEM) {
+        ka_last_error_set(KA_ERROR_INVALID_HANDLE);
+    } else if ((int32_t)count < 0) {
+        ka_last_error_set(KA_ERROR_INVALID_PARAMETER);
+    } else if ((int64_t)o->count + (int64_t)(int32_t)count > (int64_t)o->maxcount) {
+        /* Windows: no state change, ERROR_TOO_MANY_POSTS 298, and
+         * lpPreviousCount is untouched because the call failed. */
+        ka_last_error_set(KA_ERROR_TOO_MANY_POSTS);
+    } else {
         if (previous) *previous = (uint32_t)o->count;
         o->count += (int)count;
         o->signaled = o->count > 0;
-    } else if (previous) {
-        *previous = 0;
+        ok = 1;
     }
     pthread_mutex_unlock(&g_obj_lock);
-    return 1;
+    return ok;
 }
 
 /* Caller holds g_obj_lock. Returns 1 and consumes one signal when the object
- * is ready for this wait. (Stage 0 baseline: a semaphore's count is only
- * bookkeeping here - the wait consumes the signal bit and leaves the count
- * alone; the count-consume fix is the next commit.) */
+ * is ready for this wait.
+ *
+ * Semaphores count: every successful wait takes exactly one from `count` and
+ * the signal is derived from the remainder. The old host consumed the signal
+ * bit and left the count, so a release of two with one waiter behaved like an
+ * event and a second wait on a count of two timed out (S5 in the selftest).
+ * The engine's pool pump releases a slot's posted semaphore and waits on its
+ * done semaphore, so this is the hot path, not a corner case. */
 static int consume_ready(ka_obj *o) {
     if (!o->signaled) return 0;
+    if (o->kind == KA_OBJ_SEM) {
+        if (o->count <= 0) {          /* defensively: signal without a count */
+            o->signaled = 0;
+            return 0;
+        }
+        o->count--;
+        o->signaled = o->count > 0;
+        return 1;
+    }
     /* Mutex ownership is unexercised (Step 0: 0 mutex waits) and stays the
      * behaviour it had: a wait consumes the signal, ReleaseMutex does not
      * restore it. Do not build ownership/recursion here without a call site. */
@@ -213,27 +245,28 @@ ka_wait_result ka_obj_wait_multi(const uint32_t *handles, uint32_t count,
     }
     for (;;) {
         uint32_t i;
-        int ready = 0;
+        int ready = 0, first = -1;
         pthread_mutex_lock(&g_obj_lock);
         for (i = 0; i < count; i++) {
             ka_obj *o = obj_at(handles[i]);
             if (o && o->signaled) {
-                if (!wait_all) {
-                    /* Consume only the object that is returned. */
-                    consume_ready(o);
-                    pthread_mutex_unlock(&g_obj_lock);
-                    r.result = KA_WAIT_OBJECT_0 + i;
-                    r.consumed = 1;
-                    r.polls = waited;
-                    return r;
-                }
-                /* Stage 0 baseline: consumed while counting, so a wait-all
-                 * that times out has already eaten the signals it saw. */
-                consume_ready(o);
+                if (!wait_all) { first = (int)i; break; }
                 ready++;
             }
         }
+        if (!wait_all && first >= 0) {
+            /* Consume only the object that is returned. */
+            consume_ready(obj_at(handles[first]));
+            pthread_mutex_unlock(&g_obj_lock);
+            r.result = KA_WAIT_OBJECT_0 + (uint32_t)first;
+            r.consumed = 1;
+            r.polls = waited;
+            return r;
+        }
         if (wait_all && ready == (int)count) {
+            /* Check-then-consume in one critical section: a signaled object
+             * is never consumed by a wait-all that does not return. */
+            for (i = 0; i < count; i++) consume_ready(obj_at(handles[i]));
             pthread_mutex_unlock(&g_obj_lock);
             r.result = KA_WAIT_OBJECT_0;
             r.consumed = 1;

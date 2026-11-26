@@ -64,8 +64,9 @@ int ka_obj_snapshot(uint32_t h, ka_obj *out, int *idx);
 int ka_obj_close(uint32_t h);          /* 1 closed, 0 unknown handle */
 int ka_obj_set(uint32_t h);            /* SetEvent: 1 if an event was set */
 int ka_obj_reset(uint32_t h);          /* ResetEvent: 1 if an event was reset */
-/* ReleaseSemaphore. Stage 0 baseline: always succeeds (the extraction keeps
- * the old shim's body); the maxcount clamp lands with the semantics fix. */
+/* ReleaseSemaphore: 1 released (count + n <= maxcount), 0 failed with the
+ * Windows last error set (298 over max, 6 wrong kind, 87 bad count). The
+ * count is unchanged on failure. */
 int ka_obj_release_sem(uint32_t h, uint32_t count, uint32_t *previous);
 ka_wait_result ka_obj_wait(uint32_t h, uint32_t ms, ka_wait_sleep_fn sleep);
 ka_wait_result ka_obj_wait_ex(uint32_t h, uint32_t ms, ka_wait_sleep_fn sleep,
