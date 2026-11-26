@@ -4782,3 +4782,177 @@ where the driver reports a dead window's surface as healthy (then DXVK's
 A005 staleness check would keep a dead swap chain), the `fix3` stall's
 recovery, and the Windows focus oracle *with* the game really foregrounded
 (the restore in both runs left another window in front).
+
+## 2026-11-27 - Stage 0: the Android wait objects now follow Windows semantics, and a host selftest proves it
+
+Base HEAD `f969207` verified by subject (tree clean, `main == origin/main`); the
+phone was confirmed with `adb devices` at the start and before each run. Every
+device build used the real guest (`gradlew --no-daemon -PkorraLinkGuest=ON
+-PkorraWithDxvk=ON -PkorraDxvkSource=<absolute prepared tree> :app:assembleDebug`)
+and every log shows `guest: entry 0x0077C3B7`, never `guest: STUB`. Commits
+`3b69c12` (harness + state-machine extraction, behaviour unchanged), `8da2caf`
+(the semantics fix) and this docs commit. The pinned pcrecomp tree, DXVK and all
+lifted guest code are untouched.
+
+### Step 0 - what the engine actually uses (from the probes already in the file)
+
+Budgets in the current host: 120 `wait:` records, 60 `setevent:`, 60
+`semrel:`, 40 `close:`, 24 `sem:`. One boot fills the wait/semrel/setevent
+budgets, so a row below is "measured in the boot window", not "the whole run".
+
+| primitive | created | waited | released | max n | evidence |
+|---|---|---|---|---|---|
+| event, auto-reset | not measurable (no create probe; `CreateEventA/W` is silent) | 16 of 120 probed waits (`kind=1 manual=0`) | 60 `SetEvent` records, all `event` | n/a | `wait: h=... kind=1 manual=0 ...`; `setevent: h=... event` |
+| event, manual-reset | not measurable (same) | 13 of 120 (`kind=1 manual=1`) | same 60 records, all `event` | n/a | `wait: h=... kind=1 manual=1 ...` |
+| mutex | 0 measured (no create probe; no `close: ... mutex`) | **0 of 120** (`kind=2` never appears) | 0 measured (`ReleaseMutex` has no probe) | n/a | absence in all 120 `wait:` lines and all `close:` lines |
+| semaphore | **24 per boot**, every one `init=0 max=1` | 91-92 of 120 (`kind=3`), all `ms=4294967295` (INFINITE) | 60 records, every one `n=1` (budget exhausted during boot; `n>1` not observed) | 1 | `sem: h=00000006 init=0 max=1` ... (24 lines); `semrel: h=... n=1`; `wait: h=... kind=3 manual=0 ...` |
+| close | - | - | 40 records: 27 `not an object` + 13 `event` (another run: 14 + 3) | - | `close: h=...` followed by `sem`, `event` or `not an object` |
+| OpenThread | - | - | 0 calls in these runs (the probe exists; older logcat captures hold 12 and 4) | - | `openthread:` absent |
+| WaitForMultipleObjectsEx | - | not measurable (imported per `docs/PE_TRIAGE.md`, but no runtime probe) | - | - | no probe line; call count unknown |
+
+The `sem:` handle map is five pairs plus a second manager: `0x6-0x13`,
+`0x1E-0x25`, `0x2D-0x2E` - the asset/file pools of `sub_00741410` (pump,
+releases every slot's posted semaphore and waits on its done semaphore) and
+`sub_007414E0` (worker, waits `[+8]`, releases `[+c]`), as recorded in the
+kernel32 pool note and the 2026-11-21 deadlock entry. A semaphore wait is
+therefore the hot path (91-92 of 120 probed waits) and it is always INFINITE;
+an event wait is 27-29 of 120.
+
+What no surviving log can answer, and is *not* guessed below: event and mutex
+creation counts (no probe), `ReleaseSemaphore` with `n>1` after the boot window
+(the 60-record budget is spent before the asset pool runs), and the number of
+`WaitForMultipleObjectsEx` call sites (no probe at all).
+
+### The harness (`3b69c12`)
+
+- `src/host_android/wait_objects.{c,h}`: the object table, create/get/close and
+  every state decision, extracted from `kernel32_android.c`. The shims stay in
+  kernel32 and keep their stdcall ABI and every probe line (including
+  `ka_obj_check()`, which remains a lock-free read-only integrity probe). The
+  1 ms sleep is a callback: the shim passes `guest_sleep_ms` (which unwinds and
+  re-enters the machine lock), the test passes plain `nanosleep`; a non-guest
+  pthread never touches the machine-lock unwind. Every state change happens
+  under `g_obj_lock`, the lock is never held across a sleep, and the handle is
+  re-resolved after every poll (a closed slot is recycled by `ka_obj_new`).
+- `src/host_android/wait_selftest.c`: `debug.korra.waittest=1` runs 18
+  scenarios before the guest thread starts, one
+  `[wait-selftest] <name> PASS|FAIL <detail>` line each, then
+  `[wait-selftest] N/M PASS`. Two host pthreads carry the multi-waiter cases;
+  joins are bounded (bionic has no `pthread_timedjoin_np`) so a semantics
+  failure is reported instead of hanging the boot.
+- This commit is a pure extraction: a wait still consumed the signal bit and
+  left a semaphore's count alone, `ReleaseSemaphore` had no max clamp and always
+  succeeded, and wait-all consumed what it scanned.
+
+Baseline on the S24, unchanged semantics (`logs/stage0_base1_log.txt`):
+
+```
+[wait-selftest] S3 FAIL release over max: ret 1, last error 0, count 2 (first ret 1)
+[wait-selftest] S5 FAIL each wait consumes one: counts 2 then 2, third wait 258
+[wait-selftest] X2 FAIL wait-all: partial 258 kept 0, complete 258 consumed 0/0
+[wait-selftest] 15/18 PASS
+```
+
+`S3`, `S5` and `X2` name the three defects the plan predicted (no max clamp, no
+count consumed, wait-all eating a signal it does not return). The other fifteen
+already held under the old code, including the auto-reset one-credit rule and
+the manual-reset stay-signaled rule.
+
+### The fix (`8da2caf`) - one line per semantic change
+
+- A semaphore is its count: a successful wait takes exactly one and
+  `signaled = count > 0`, test-and-consume under `g_obj_lock` (S5).
+- `ReleaseSemaphore` clamps: `count + n > maxcount` answers 0 with
+  `ERROR_TOO_MANY_POSTS` (298), leaves the count and `lPreviousCount` alone, and
+  a success reports the count before the add (S3, S4).
+- `SetEvent`/`ResetEvent` apply to events only and stay one bit; no accumulation
+  while signaled (A4).
+- A manual-reset event stays signaled until `ResetEvent`; a wait does not
+  consume it (M1-M3).
+- wait-all checks all objects under one lock and consumes nothing until all are
+  ready, then one from each; wait-any consumes only the returned index (X2).
+- Mutex ownership is left as it was, with a comment: Step 0 measured zero mutex
+  waits, so it is implemented consistently but **not exercised**.
+
+Unchanged on purpose: the 1 ms poll and its machine-lock unwind, the `h == 0`
+diagnostic, the thread/file handle paths, `ka_thread_wait`, and the probe
+formats. No wait list, no condvar, no broadcast - the 2026-11-22 77 s frame was
+a broadcast, and Stage 0 only proves observability through the existing poll.
+
+### Proof ladder
+
+1. **Semantics (device).** `[wait-selftest] 18/18 PASS` with
+   `debug.korra.waittest=1`; the three failures above now report
+   `S3 PASS release over max: ret 0, last error 298, count 1`,
+   `S5 PASS each wait consumes one: counts 1 then 0, third wait 258`,
+   `X2 PASS wait-all: partial 258 kept 1, complete 0 consumed 0/0`.
+2. **Repeatability.** Three runs of the same APK (`stage0_fix1/2/3_log.txt`),
+   the third after an explicit `am force-stop` and relaunch: `18/18 PASS` each,
+   and the scenario lines are identical after normalising the measured
+   milliseconds (0 differences, no order dependence).
+3. **Engine.** `scripts\android_route_drive.ps1` reached the tutorial HUD at
+   237 s (`stage0drive_25_gameplay.png`, OCR "Light Attack / Heavy Attack /
+   Jump") and played a 62 s campaign (33 gestures, 4 shots). The pool started:
+   24 `sem:` creates, 56 threads attached, no `[crash]` line, `adb logcat -b
+   crash` empty (0 bytes), our own force-stop gives `reason=10 (USER REQUESTED)
+   subreason=21 (FORCE STOP)`, and `files/perf.txt` holds 305 frame-probe lines.
+4. **No regression.** Save pair after the checkpoint autosave: `GameData.dat`
+   7,856 B + `SystemData.dat` 16 B. Continue: the Story submenu OCRs "Resume the
+   game from where you stopped playing." with Continue as the default entry, and
+   pressing it reaches the HUD at 146 s (`stage0cont_14_gameplay.png`), no New
+   Game. Hw voice fed all run (14,913 `hw block` lines) and the NaN guard is
+   unchanged: it zeroed `7FC00000` words and logged
+   `voice 1: non-finite word in the mix (...), zeroed - N so far`. HOME at
+   145 s, 20 s on the launcher, `am start`: same pid 4632, HUD back at 191 s,
+   the pause menu before and after (Resume / Close the Pause Menu / Options /
+   Quit Game / Back), and gameplay again after closing it. Touch reached the
+   player: the route's held-stick gestures and the idle-vs-move screenshot pair.
+   `scripts\run_selftest.ps1` **60 passed, 0 failed**; the content guard was
+   clean on every commit (7 files, then 2).
+5. **Stage 0 frame baseline, no claim.** Same route/driver/device/cap
+   (`debug.korra.fps=30`, `int=100` in every sample). Gameplay window t=237-319
+   (75 s, 566 frames, 7.5 fps):
+
+| bucket | this run (75 s) | 2026-11-22 reference (330 s) |
+|---|---|---|
+| frame `dt` | 146.5 ms (per-second min 52.8, max 570.0) | 123.9-127.0 ms |
+| inside `Present` | 1.80 ms | 1.8-1.9 ms |
+| `WaitForSingleObject` total | 136.5 ms | 113.3-116.2 ms |
+| - 1 ms `nanosleep` | 55.2 ms | 52.3-54.3 ms |
+| - blocked re-entering the machine lock | 81.7 ms | 61.3-62.3 ms |
+| residual lifted work | 7.8 ms | 8.4-8.6 ms |
+| bridged calls / frame | 7,488 | 6,843-7,493 |
+| process CPU / guest threads | 101 % / 56 | 99 % / 56-72 |
+| frames > 50 ms / > 100 ms | 566 / 349 | 3,154 / 1,191 of 3,159 |
+
+The first 22 s after the HUD averaged 96.7 ms (sleep 45.3, lock 44.9); the last
+20 s 132.7 ms; the cutscene before it 73.0 ms. **No 30 fps claim**: this is a
+75 s sample with 33 gestures against the reference's 330 s and 186, so the
+per-second averages move with the scene and the player's position. Both runs
+still show the same shape (Present ~2 ms, waits > 90 % of the frame, one core,
+~40 polls/frame), and the sleep and lock buckets follow the frame rather than
+one having been exchanged for the other. The Stage 1 session owns the 30 fps
+measurement.
+
+### Environment notes (not code)
+
+- The fixed-tap route (`scripts\android_run.ps1 -Route newgame`) did not advance
+  past the attract screen on this build: its 0 ms `input tap` gestures are not
+  sampled by the poll-based pad. The same route with the driver's 1.1-1.5 s
+  holds works (HUD at 237 s). The base build behaved the same, so this is not a
+  Stage 0 change; input was out of scope and was not modified.
+- The adb link wedged twice after long runs (`adb devices` empty while Windows
+  still enumerated the phone, once `offline`); `adb kill-server` +
+  `start-server` recovered it both times, and both runs' crash buffers were
+  empty, so neither was an app death.
+
+### Not verified
+
+- Mutex waits and ownership (zero measured; no scenario; marked unexercised).
+- `WaitForMultipleObjectsEx` engine call sites (no probe; semantics proven only
+  by the selftest).
+- Event and mutex creation counts; `ReleaseSemaphore` with `n>1` in the engine
+  (only `n=1` observed before the probe budget ran out).
+- Stage 1 (wake queue), any 30 fps claim, a 330 s campaign on this build, other
+  devices, and the Windows long-run. The Windows oracle was not re-run: no
+  `src/host` file changed in this stage.
