@@ -538,3 +538,28 @@ Append only; newest last. Format: date — attempt — outcome — next idea.
   right channel and the front-right speaker into the left. Both shims now index
   `matrix[dest * src_ch + src]`; a 2x2 diagonal matrix is unaffected, so the
   2 ch menu path measured the same before and after.
+- 2026-11-26 - "give DXVK a new HWND token per ANativeWindow bind, so a window
+  change is visible" - **the driver refuses the second surface.** On resume
+  `D3D9SwapChainEx::Present` sees `window != m_window`, builds a new
+  `vk::Presenter` (which creates its `VkSurfaceKHR`) *before* releasing the old
+  one, and `vkCreateAndroidSurfaceKHR` answered `-1000000001`
+  (`VK_ERROR_OUT_OF_HOST_MEMORY`) because the previous surface on the same
+  `ANativeWindow` was still alive; `Presenter::createSurface` then reported
+  "Failed to create surface" and Present answered `D3DERR_DEVICEREMOVED` again.
+  Keep ONE stable token for the app's life (what Win32 does with its HWND) and
+  report the bind as a separate generation for the D3D9 lost/reset state.
+- 2026-11-26 - "forward DXVK's HRESULT for a present it could not rebuild" -
+  **wrong layer for a D3D9 device-lost event.** `D3D9SwapChainEx::Present`
+  turns a failed swap-chain recreate into `D3DERR_DEVICEREMOVED` (0x88760870);
+  the engine's Present wrapper (`sub_00759E70`) only knows success and
+  `D3DERR_DEVICELOST` (0x88760868), so it returned 0 and the caller released a
+  render object that was still referenced (SIGSEGV at `0x7524C0`). Answer the
+  engine's contract from the host: DEVICELOST with no window, DEVICENOTRESET
+  until Reset succeeds, and never call Present while the surface has no window.
+- 2026-11-26 - "let a `dxvk::DxvkError` from `D3D9DeviceEx::Reset` unwind" -
+  **it terminates the process.** `Reset` has no catch, and the throw crosses the
+  lifted guest frames into `std::terminate` (`libc++abi: terminating due to
+  uncaught exception of type dxvk::DxvkError`, exit `reason=5 status=6`). Every
+  Reset/Present goes through a catch that answers `D3DERR_DEVICELOST`;
+  `korra_guest` needs `-fexceptions` because the module's `cppFlags` disable
+  them.
