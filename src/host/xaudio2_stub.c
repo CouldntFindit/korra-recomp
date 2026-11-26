@@ -522,11 +522,16 @@ static void xa2_frame_stereo(const xa2_voice *v, const xa2_slice *s, UINT32 idx,
     float ch[8];
     if (nch > 8) nch = 8;
     for (c = 0; c < nch; c++) ch[c] = xa2_sample_ch(v, s, idx, c);
+    /* XAudio2's level matrix is DestinationChannels x SourceChannels, row-major
+     * (level[dest][src]); the engine installs its 6x2 as the L row then the R
+     * row. Storing it source-major put LFE in the right channel and the
+     * front-right speaker in the left. The matrix is the engine's mix: apply it
+     * in its own order. */
     if (v->matrix_ch == nch && v->matrix_ch > 0) {
         float ml = 0.0f, mr = 0.0f;
         for (c = 0; c < nch; c++) {
-            ml += ch[c] * v->matrix[c * 2 + 0];
-            mr += ch[c] * v->matrix[c * 2 + 1];
+            ml += ch[c] * v->matrix[c];
+            mr += ch[c] * v->matrix[nch + c];
         }
         *l = ml; *r = mr;
         return;
