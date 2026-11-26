@@ -9,9 +9,13 @@
  * The Vulkan entry point is the system loader's. Selecting a custom driver
  * (libadrenotools/Turnip) is the S25 fallback and stays a one-line change here.
  */
+#include <android/log.h>
 #include <android/native_window.h>
+#include <sys/system_properties.h>
 
 #include <atomic>
+#include <cstdarg>
+#include <cstdio>
 #include <mutex>
 #include <vector>
 
@@ -36,6 +40,26 @@ std::vector<std::pair<VkSurfaceKHR, ANativeWindow *>> g_surfaces;
 
 HMONITOR the_monitor() { return reinterpret_cast<HMONITOR>(uintptr_t{1}); }
 
+/* Lifecycle trail: the window/surface pair is the object DXVK presents from, so
+ * every bind, unbind and surface create/destroy is logged when
+ *   adb shell setprop debug.korra.wsi 1
+ * is set. Off by default; a property read happens only on those events, never
+ * per frame. Logcat tag "Korra" is the same tag the shell uses. */
+bool wsi_probe_on() {
+    char v[PROP_VALUE_MAX] = {0};
+    return __system_property_get("debug.korra.wsi", v) > 0 && v[0] == '1';
+}
+
+void wsi_log(const char *fmt, ...) {
+    if (!wsi_probe_on()) return;
+    char line[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    __android_log_write(ANDROID_LOG_INFO, "Korra", line);
+}
+
 }  // namespace
 
 extern "C" void dxvkAndroidSetWindow(ANativeWindow *window) {
@@ -52,9 +76,18 @@ extern "C" void dxvkAndroidSetWindow(ANativeWindow *window) {
             g_buffer_h = 720;
         }
     }
-    if (g_window) ANativeWindow_release(g_window);
+    if (g_window) {
+        wsi_log("[wsi] unbind win=%p token=%llx surfaces=%zu", (void *)g_window,
+                (unsigned long long)(uintptr_t)g_handle, g_surfaces.size());
+        ANativeWindow_release(g_window);
+    }
     g_window = window;
     g_handle = window ? reinterpret_cast<HWND>(++g_generation) : nullptr;
+    if (window) {
+        wsi_log("[wsi] bind win=%p %ux%u buf=%ux%u token=%llx surfaces=%zu",
+                (void *)window, g_screen_w, g_screen_h, g_buffer_w, g_buffer_h,
+                (unsigned long long)(uintptr_t)g_handle, g_surfaces.size());
+    }
 }
 
 extern "C" HWND dxvkAndroidGetWindowHandle() {
@@ -62,15 +95,26 @@ extern "C" HWND dxvkAndroidGetWindowHandle() {
     return g_handle;
 }
 
+/* The D3D9 bridge asks this before it lets a Present reach DXVK: while the
+ * shell has no ANativeWindow there is no surface to present to, and touching
+ * the one built from a destroyed window is what kills the process. */
+extern "C" int dxvkAndroidWindowAlive() {
+    std::lock_guard<std::mutex> guard(g_lock);
+    return g_window != nullptr;
+}
+
 extern "C" void dxvkAndroidSurfaceDestroyed(VkSurfaceKHR surface) {
     std::lock_guard<std::mutex> guard(g_lock);
     for (auto it = g_surfaces.begin(); it != g_surfaces.end(); ++it) {
         if (it->first == surface) {
+            wsi_log("[wsi] surface destroy %llx (surfaces=%zu)",
+                    (unsigned long long)(uintptr_t)surface, g_surfaces.size() - 1);
             ANativeWindow_release(it->second);
             g_surfaces.erase(it);
             return;
         }
     }
+    wsi_log("[wsi] surface destroy %llx not tracked", (unsigned long long)(uintptr_t)surface);
 }
 
 namespace dxvk {
@@ -96,7 +140,12 @@ namespace dxvk::wsi {
 
 VkResult createSurface(HWND window, const Rc<vk::InstanceFn> &vki, VkSurfaceKHR *surface) {
     std::lock_guard<std::mutex> guard(g_lock);
-    if (!g_window || window != g_handle) return VK_ERROR_SURFACE_LOST_KHR;
+    if (!g_window || window != g_handle) {
+        wsi_log("[wsi] surface create req=%llx cur=%llx win=%p -> SURFACE_LOST",
+                (unsigned long long)(uintptr_t)window,
+                (unsigned long long)(uintptr_t)g_handle, (void *)g_window);
+        return VK_ERROR_SURFACE_LOST_KHR;
+    }
 
     auto create = reinterpret_cast<PFN_vkCreateAndroidSurfaceKHR>(
         vkGetInstanceProcAddr(vki->instance(), "vkCreateAndroidSurfaceKHR"));
@@ -108,6 +157,11 @@ VkResult createSurface(HWND window, const Rc<vk::InstanceFn> &vki, VkSurfaceKHR 
     if (r == VK_SUCCESS) {
         ANativeWindow_acquire(g_window);
         g_surfaces.emplace_back(*surface, g_window);
+        wsi_log("[wsi] surface create %llx win=%p token=%llx surfaces=%zu",
+                (unsigned long long)(uintptr_t)*surface, (void *)g_window,
+                (unsigned long long)(uintptr_t)g_handle, g_surfaces.size());
+    } else {
+        wsi_log("[wsi] surface create win=%p -> VkResult %d", (void *)g_window, (int)r);
     }
     return r;
 }

@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/system_properties.h>
 
 #ifndef KORRA_WITH_DXVK
 #define KORRA_WITH_DXVK 0
@@ -100,6 +101,40 @@ uint32_t g_device_token;
 /* Present count for the 1 Hz sampler (ka_d3d9_frame_presented). Incremented in
  * d_Present, i.e. the engine's own frame boundary, not the shell's tick. */
 unsigned g_presents;
+
+/* --------------------------------------------------------- lifecycle probe
+ * `adb shell setprop debug.korra.lifecycle 1` logs the three calls that carry
+ * D3D9's device-lost contract - TestCooperativeLevel, Present and Reset - with
+ * the window token the Android WSI currently reports. The token is the port's
+ * HWND: it changes when the shell binds a new ANativeWindow and is null while
+ * the shell has none. Off by default; the first 20 calls of each kind are
+ * printed, after that only when the token or the answer changes. */
+struct LifeProbe {
+    int    calls;
+    HWND   win;
+    int32_t hr;
+};
+
+LifeProbe g_life_tcl, g_life_present, g_life_reset;
+int g_life_on = -1;
+
+bool life_probe_on() {
+    if (g_life_on < 0) {
+        char v[PROP_VALUE_MAX] = {0};
+        g_life_on = (__system_property_get("debug.korra.lifecycle", v) > 0 && v[0] == '1');
+    }
+    return g_life_on != 0;
+}
+
+void life_probe(const char *what, LifeProbe *p, HWND win, int32_t hr) {
+    if (!life_probe_on()) return;
+    if (p->calls >= 20 && p->win == win && p->hr == hr) return;
+    p->calls++;
+    p->win = win;
+    p->hr = hr;
+    ka_log("[life] %s win=%llx hr=%08X n=%d", what,
+           (unsigned long long)(uintptr_t)win, (unsigned)hr, p->calls);
+}
 
 /* ---------------------------------------------------------------- helpers */
 void *P(uint32_t va) { return va ? ka_host(va) : nullptr; }
@@ -381,7 +416,10 @@ void i9_CreateDevice() {
 #define DEV (reinterpret_cast<IDirect3DDevice9 *>(self_obj()->p))
 #define RET_HR(call, argc) do { HRESULT _hr = (call); RET((uint32_t)_hr, argc); } while (0)
 
-void d_TestCooperativeLevel() { RET(0, 0); }
+void d_TestCooperativeLevel() {
+    life_probe("tcl", &g_life_tcl, life_probe_on() ? dxvkAndroidGetWindowHandle() : nullptr, 0);
+    RET(0, 0);
+}
 void d_GetAvailableTextureMem() { RET(512u << 20, 0); }
 void d_EvictManagedResources() { RET(0, 0); }
 void d_GetDirect3D() {
@@ -428,6 +466,8 @@ void d_Reset() {
     }
     hr = DEV->Reset(gpp ? &pp : nullptr);
     ka_log("d3d9: Reset -> 0x%08X", (unsigned)hr);
+    life_probe("reset", &g_life_reset, life_probe_on() ? dxvkAndroidGetWindowHandle() : nullptr,
+               (int32_t)hr);
     RET((uint32_t)hr, 1);
 }
 void d_Present() {
@@ -438,6 +478,8 @@ void d_Present() {
      * frame cap's watchdog (frame_probe_android.c / fps_cap_android.c). */
     ka_fp_end_present(fp_t0);
     g_presents++;
+    life_probe("present", &g_life_present,
+               life_probe_on() ? dxvkAndroidGetWindowHandle() : nullptr, (int32_t)hr);
     RET((uint32_t)hr, 4);
 }
 void d_GetBackBuffer() {
