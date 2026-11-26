@@ -4499,3 +4499,35 @@ save is the reason-5 one); the exact event id the area receives at call time
 (the icall arguments are pointers; the id is read from `[this+0x14]`, and the
 class/event path is static); a slot or erase flow (proven absent); the M4 audio
 follow-ups (unchanged).
+
+
+## 2026-11-26 - coordinator verification: the Windows oracle and the checkpoint autosave are accepted
+
+Independently re-checked against the tree and the run logs:
+
+- **Tip and commits.** `main == origin/main` at `ef59f79` ("docs(save): record
+  the Windows SystemData oracle and the checkpoint autosave site"), tree clean;
+  `530e885` (left stick), `932ea0e` (route driver), `ef59f79` (docs) present;
+  files in scope.
+- **Windows.** The save lines are in `<game>/korra_host-20261126-193434.log`,
+  not in `logs/win_vib1.txt` (which is the driver console and names that game
+  log): `FindFirstFileExA ... first="."`, `WriteFile 7856`, `SystemData.dat`
+  `CreateFileA` + `WriteFile 16`; the boot log `...193704.log` opens
+  `SystemData.dat` `last=0`. `<Documents>/Korra` was restored (original
+  mtimes).
+- **Device.** `logs/logcat.txt` at 19:59:13 carries `[icall] target=0064EA50
+  from=00641150` twice, `[wlog] +00 = 00000003`, `FindFirstFileExA ...
+  first="GameData.dat"` and `WriteFile 7856`; the live `run-as` files are
+  7,856 B and 16 B; `scont1` reaches the tutorial HUD at 155 s.
+- **Negative.** `sauto2` played 481 s with no second `[0xCA6C28]=3`; the sauto3
+  game log was overwritten by scont1, so its lines are preserved only in
+  logcat. Per-run game logs (`log.txt`) must be copied before the next launch.
+- **Selftest/guard.** `scripts\run_selftest.ps1` 60/60; `tools\check_content.py`
+  exit 0.
+- **Docs.** README status/M3, this entry, `docs/ANDROID_BRINGUP.md` §10.9,
+  AGENTS ledger; MASTER_STATE §3 carries the 2026-11-26 block/row and the
+  corrected 2026-11-25 superseded sentences. No code changed in this
+  verification.
+
+The mid-level checkpoint remains a recorded negative, not a blocker; the static
+site map suggests the tutorial level saves at its start only.
