@@ -4531,3 +4531,101 @@ Independently re-checked against the tree and the run logs:
 
 The mid-level checkpoint remains a recorded negative, not a blocker; the static
 site map suggests the tutorial level saves at its start only.
+
+## 2026-11-26 - M4 close-out: the Hw fill count is block-granular, the 6 ch values are the engine's own hand-off, and the 6x2 downmix was transposed
+
+Base HEAD `4c1eb88` (one docs commit above the hand-off's `ef59f79`; the tip
+subject was verified); the phone was confirmed with `adb devices` at the start
+and at each run. Commits `d0ccc32` (the probe: `hw block`, per-channel frame
+words and per-channel slice spans, verbose 2, off by default) and `57e730e` (the
+matrix order). Logs (gitignored): `logs/m4fix_dev_log.txt` + `logs/m4fix_dev.wav`
+(S24, 157 s), `logs/m4close_dev.wav` (the pre-fix device dump, 152 s),
+`work/m4close_win.wav` / `work/m4close_win_fix.wav` (Windows 115 s each), and
+the two Windows runtime logs in `<game>` (`korra_host-20261126-204548.log`,
+`-205132.log`). **Process failure, recorded:** the pre-fix device *log* was
+overwritten by the next run's pull (the driver always writes `logs/log.txt`);
+its numbers below are from this session's record and its dump survives. Copy
+`log.txt` to a per-run name immediately from now on.
+
+**STEP 0c / 1 - the engine's fill bookkeeping is real and block-granular.** The
+Hw output device (0x0088B000; callback object `device+0x28`, vtable 0x0091ECC8)
+renders one block per mixer tick. `0x008872D0` zeroes `device+0x1E` and calls
+`0x00887200`, which mixes and writes the block's frame count there from
+`[mixer+0x424]` (configured 0x400 = 1024 at `0x00887343`/`0x008874BF`, also
+`0x0088663F`). The fill `0x0088B510` (vtable 0x0091EC80 slot 7) copies exactly
+that many frames from the mix buffer at `device+0x10` into the ring slot at the
+fill cursor `device+0x44`, clamped by `minps`/`maxps` against +/-2^31 (the
+constants at 0x91EC60/0x91EC70); a zero count jumps to slot 8 (`0x0088B5F0`),
+which zero-fills the whole slot. The feed `0x0088B440` submits through
+`device+0x46` with `AudioBytes = block_align << 10` always. `device+0x68` is
+**not** a frame count: each fill `InterlockedIncrement`s it and `OnBufferEnd`
+`InterlockedDecrement`s it (IAT 0x8FD014/0x8FD018), i.e. filled-but-unretired
+blocks.
+
+The probe logs all of it at every submit. S24, 147 s: **4604 blocks count=1024,
+2502 count=0, no other value**; Windows, 115 s: **4102 count=1024, 2133 count=0,
+no other value** (the post-fix runs repeat it: 5079/2272 and 3961/2126). Both
+hosts therefore show the same geometry: the declared fill boundary is the
+*block* - a full 1024-frame block or silence - and never a partial frame count.
+The 491-zero/533-NaN and 336-finite/688-x-`409E91BC` tails are inside blocks the
+engine's own bookkeeping calls full, so a host "skip the tail" would still be
+inventing a boundary. What the count does settle: with count=1024 the fill
+rewrites the *whole* slot from the engine's mix buffer, so the stale tail is
+copied out of that buffer - the engine's own mixer left part of its block
+unwritten for that tick. The fill's skip path (`0x0088B534`, taken when
+`[device+4]` and `[0xca28e4]` are both non-zero) and the mixer's block
+completion are the two candidates for how; neither is traced.
+
+**STEP 2 - the 6 ch finite samples are committed frames of the engine's own
+decode, and device-only.** In the 152 s pre-fix run the slice probe fired three
+times; two were the 6 ch CRI movie voice, and every occurrence has the FNV taken
+at `SubmitSourceBuffer` **equal** to the one at the probe (`BACE1F9C`,
+`319ACCCF`, `6411CEF4`) - the host read exactly what the engine handed over:
+
+| time | voice | slice | geometry |
+|---|---|---|---|
+| 15.579 s | 6 ch CRI | `[179200,180000)` | channel 0 only, 34 frames `[80..117]`, `C0BFD0C4` (-5.99) x4, max 7.39; other channels <= 0.21 |
+| 24.649 s | 6 ch CRI | `[64000,64800)` | **all six** channels, contiguous (c0/c1/c4/c5 `[424..797]`, c3 `[392..772]`), c2 hits exactly **2000.0** (`44FA0000`) at rel 408, c1 max 393 |
+| 39.985 s | 2 ch Hw | `[1888960,1889984)` | 29 frames, -2.2..-2.8 inside a count=1024 block (a legitimately hot mix) |
+
+Windows at the same two movies (6 ch voices at 12.9 s and 23.2 s): **0 bad
+samples**, dump clips **0 of 12.67 M** samples. The device clips 34276 of
+14.59 M (0.2349 %) and, after the matrix fix, 34906 of 15.07 M (0.2316 %) -
+unchanged. Per second both hosts play the *same* music at the *same* RMS
+(73 s -34.0 vs -33.7 dBFS; 77 s -29.9 vs -29.8) while the device's peaks reach
+0.00 dBFS in many menu seconds (74-88 s) where Windows peaks -17..-26: short
+full-scale bursts on top of identical music. Those are **finite** stale values
+(the NaN guard must not touch them, and does not). The post-fix device run had
+its own 6 ch event at 15.273 s (channel 0, 2 frames, `5FD0E000` = 3.0e19), i.e.
+the stale region moves between runs - the content is not deterministic decoder
+output.
+
+So the 6 ch values are committed frames produced by the engine's movie path,
+at the same content Windows plays cleanly; the device's remaining menu clicks
+are the same block-granular stale tail with finite content. Decision table,
+applied: row 2 (uninitialised content but no sub-block count) and the
+committed-frames row - record, no host skip/filter; the underruns are untouched.
+
+**The 6x2 downmix was transposed (host defect, fixed).** The engine installs
+`6 x 2 -> 1.000 0.000 0.707 0.000 0.707 0.000 0.000 1.000 0.707 0.000 0.000
+0.707`. In XAudio2's documented order (`DestinationChannels x SourceChannels`,
+row-major, `level[dest][src]`) that is the textbook downmix L = FL + 0.707 C +
+0.707 BL, R = FR + 0.707 C + 0.707 BR; read source-major it put LFE at 1.0 into
+the right channel and the front-right speaker into the left. Both shims now
+index `matrix[dest * src_ch + src]` (a 2x2 diagonal matrix is unaffected, so the
+2 ch CRI/menu path cannot move). A/B, same route and taps: Windows 0 clipped
+frames before and after, movie window peak -11.4..-14.1 -> -12.0..-16.6 dBFS and
+RMS -25.6..-29.1 -> -24.6..-28.1; device movie window RMS -26.1/-25.8/-27.8 ->
+-25.4/-24.0/-28.0 dBFS and total clipping 0.2349 % -> 0.2316 %. Level-neutral;
+the imaging is now the engine's.
+
+**Also measured.** The two hosts' `credits` differ in shape (device constant 4;
+Windows 1..4) while `qcount` and the block geometry match; the Hw voice feeds
+through the boot movies and the menu on both. `scripts\run_selftest.ps1` 60/60
+before and after the matrix change; content guard clean on both commits.
+
+**Not verified.** Where the NaN/stale words first enter the engine's mix buffer
+(the two candidates above); whether the 6 ch regions are a CRI decode/submit
+ordering effect (the unchanged hash rules out "rewritten while queued", not
+"incomplete when submitted"); a longer device A/B of the matrix change; the
+deferred movie-window underruns; §9.4 4-6 (unchanged).

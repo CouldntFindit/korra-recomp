@@ -1049,6 +1049,87 @@ buffer's audio. The engine's
 committed frame count is not exposed (credits are per buffer), so a host "skip
 the tail" would be inventing a boundary - recorded, not done.
 
+*(Closed out 2026-11-26 in 10.11: `device+0x1E` is a real per-block count, but
+it is block-granular - only 0 or the full 1024 frames, measured on both hosts -
+so it still cannot license a sub-block skip. `device+0x68` is the
+filled-but-unretired block count, not a frame count.)*
+
+---
+
+### 10.11 The boundary, closed out: block-granular, and the 6 ch values are the engine's (2026-11-26)
+
+**The engine's fill bookkeeping exists and is block-granular.** The Hw output
+device (0x0088B000; its `IXAudio2VoiceCallback` object is `device+0x28`) renders
+one block per mixer tick. `0x008872D0` zeroes `device+0x1E` and calls
+`0x00887200`, which mixes and writes the block's frame count there from
+`[mixer+0x424]` (configured 0x400 = 1024 at `0x00887343`/`0x008874BF` and
+`0x0088663F`). The fill `0x0088B510` (vtable slot 7 of 0x0091EC80) copies
+exactly that many frames from the mix buffer at `device+0x10` into the ring slot
+at the fill cursor `device+0x44`, clamped by `minps`/`maxps` against +/-2^31
+(the constants at 0x91EC60/0x91EC70); when the count is 0 it jumps to slot 8
+(`0x0088B5F0`), which zero-fills the whole slot. The feed `0x0088B440` then
+submits through `device+0x46` with `AudioBytes = block_align << 10` always, so
+the declared buffer is fixed and the count is the only per-block bookkeeping.
+`device+0x68` is not that count: it is `InterlockedIncrement`ed by each fill and
+`InterlockedDecrement`ed by `OnBufferEnd` (IAT 0x8FD014 / 0x8FD018), i.e. the
+filled-but-unretired block count.
+
+**Measured at every submit on both hosts** (`[xa2] hw block: frames=.. count=..
+fill=.. cur=.. credits=..`, verbose 2): S24 147 s - **4604 blocks count=1024,
+2502 count=0, no other value**; Windows 115 s - **4102 count=1024, 2133 count=0,
+no other value**. Both hosts therefore show the same geometry, and the engine
+never declares a partial block. The 491-zero/533-NaN and 336-finite/688-constant
+tails live *inside* blocks its own bookkeeping calls full, so a host "skip the
+tail" would still be inventing a boundary: recorded, not done. What the count
+does establish is that the stale tail is not the ring slot's old content (the
+fill rewrites the whole slot when the count is 1024) - it is copied out of the
+engine's own mix buffer, which the mixer left partially written for that block.
+
+**The 6 ch finite samples are the engine's hand-off.** In the 152 s S24 run the
+slice probe fired three times; two were the 6 ch CRI movie voice and every one
+had **the FNV taken at `SubmitSourceBuffer` equal to the one at the probe**
+(`BACE1F9C`, `319ACCCF`, `6411CEF4`) - the host read exactly what the engine
+handed over:
+
+| time | voice | slice | geometry |
+|---|---|---|---|
+| 15.579 s | 6 ch CRI | `[179200,180000)` | channel 0 only, 34 frames `[80..117]`, `C0BFD0C4` (-5.99) x4, max 7.39; other channels <= 0.21 |
+| 24.649 s | 6 ch CRI | `[64000,64800)` | **all six** channels, contiguous (c0/c1/c4/c5 `[424..797]`, c3 `[392..772]`), c2 hits exactly **2000.0** (`44FA0000`) at rel 408, c1 max 393 |
+| 39.985 s | 2 ch Hw | `[1888960,1889984)` | 29 frames, -2.2..-2.8, inside a count=1024 block (a hot mix) |
+
+Windows, same two movies (6 ch voices at 12.9 s and 23.2 s), **0 bad samples**,
+and its dump clips **0 of 12.67 M** samples against the device's 34276 of
+14.59 M (0.2349 %). Per second the device plays the *same* music at the *same*
+RMS as Windows (73 s -34.0 vs -33.7 dBFS; 77 s -29.9 vs -29.8) but its peaks
+reach 0.00 dBFS in many menu seconds (74-88 s) where Windows peaks -17..-26:
+short full-scale bursts on top of identical music, i.e. finite stale values (the
+NaN guard must not and does not touch them). So: the 6 ch values are committed
+frames produced by the engine (CRI's movie path) and are device-only at the same
+content; the menu bursts are the same block-granular stale tail. No host filter
+is licensed for either, and the underruns remain deferred.
+
+**The 6x2 downmix was transposed (host defect, fixed).** The engine installs
+`6 x 2 -> 1.000 0.000 0.707 0.000 0.707 0.000 0.000 1.000 0.707 0.000 0.000
+0.707`. In XAudio2's documented order (`DestinationChannels x SourceChannels`,
+`level[dest][src]`) that is the textbook downmix L = FL + 0.707 C + 0.707 BL,
+R = FR + 0.707 C + 0.707 BR; read source-major it put LFE at 1.0 into the right
+channel and the front-right speaker into the left. Both shims now apply
+`matrix[dest * src_ch + src]`. A/B on Windows (same route/taps, 115 s each):
+0 clipped frames before and after, movie-window peaks -11.4..-14.1 dBFS ->
+-12.0..-16.6, RMS -25.6..-29.1 -> -24.6..-28.1 (level-neutral, imaging
+corrected). The device A/B is recorded in `docs/FINDINGS.md`. The 2026-11-24
+"6 ch through the engine's 6x2 matrix, peak -7.13 dBFS" figure was taken with
+the transposed order; the level-neutral A/B above is the re-measurement, and no
+other acceptance number moves (the 2 ch path is untouched).
+
+**Still open, named.** Where the NaN/stale words first enter the engine's mix
+buffer (the fill's skip path at `0x0088B534` when `[device+4]` and
+`[0xca28e4]` are both non-zero, and the mixer's block completion, are the two
+candidates; neither is traced); whether the 6 ch stale regions are a CRI
+decode/submit ordering effect (the unchanged hash rules out "rewritten while
+queued", not "incomplete when submitted"). The movie-window underruns are the
+deferred performance block.
+
 ---
 
 ## 11. Reproduction recipes

@@ -510,3 +510,31 @@ Append only; newest last. Format: date — attempt — outcome — next idea.
   for the checkpoint save it printed `0x63E900` (a resource constructor), while
   `debug.korra.icall=64EA50` caught the real site, `hap::HapSaveActionArea`,
   called twice from `0x641150` immediately before the `[0xCA6C28]=3` write.
+
+- 2026-11-26 - "the engine exposes a committed frame count at `device+0x1E`, so
+  the host can skip a partially filled tail" - **wrong: it is block-granular.**
+  The count is the mixer's block size (`[mixer+0x424]` = 0x400, written by
+  `0x00887200`, consumed by the fill `0x0088B510`); measured at every submit on
+  both hosts it is only ever **0 or the full 1024 frames** (S24 147 s: 4604 and
+  2502 blocks; Windows 115 s: 4102 and 2133; no other value). A non-zero block is
+  copied whole out of the engine's mix buffer and a zero block zero-fills the
+  whole slot, so a stale tail sits *inside* a block the engine calls full.
+  `device+0x68` is not that count either: each fill `InterlockedIncrement`s it
+  and `OnBufferEnd` `InterlockedDecrement`s it (IAT 0x8FD014/0x8FD018), i.e.
+  filled-but-unretired blocks. Do not skip or zero a finite tail; the only
+  host-legal filter stays the non-finite format rule.
+- 2026-11-26 - "the huge finite values in the 6 ch movie voice are the host
+  reading past a fill boundary" - **no: they are committed.** Every occurrence
+  has the slice FNV taken at `SubmitSourceBuffer` equal to the one at the probe;
+  the bad regions are contiguous across all six channels (c2 reaches exactly
+  2000.0 = `0x44FA0000`) and Windows has 0 bad samples in the same two boot
+  movies. They are the engine's own decode hand-off on this host. Do not filter
+  finite words; the device's remaining menu clipping is the same block-granular
+  stale tail with *finite* content.
+- 2026-11-26 - "the 6x2 `SetOutputMatrix` array is source-major" - **wrong, and
+  it inverted the movie downmix.** XAudio2's matrix is DestinationChannels x
+  SourceChannels, row-major (`level[dest][src]`). Read source-major, the
+  engine's `[1,0,.707,0,.707,0 | 0,1,.707,0,0,.707]` put LFE at 1.0 into the
+  right channel and the front-right speaker into the left. Both shims now index
+  `matrix[dest * src_ch + src]`; a 2x2 diagonal matrix is unaffected, so the
+  2 ch menu path measured the same before and after.
