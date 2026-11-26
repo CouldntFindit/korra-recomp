@@ -4629,3 +4629,13 @@ before and after the matrix change; content guard clean on both commits.
 ordering effect (the unchanged hash rules out "rewritten while queued", not
 "incomplete when submitted"); a longer device A/B of the matrix change; the
 deferred movie-window underruns; §9.4 4-6 (unchanged).
+
+**One lead on the 6 ch region's contents (observation, not established).** Read
+as **int32**, the words of the 24.649 s burst all sit at +/-0.5 FS (c2
+`44FA0000` = 0.539 FS, `409F726A` = 0.505, `42135937` = 0.516, `4173FC4A` =
+0.511, `C20AF104` = -0.484, `C12CB6D0` = -0.509), while as float they are 2000.0,
+4.98, 36.8, 15.25, -34.7 and -10.8. A decoded float waveform does not produce
+that int32 clustering; leftover integer PCM in a slot that was not cleared
+does. So the next check is whether the 6 ch ring slots are zeroed between
+movies (the 2 ch Hw path is: `0x0088B5F0` zero-fills a whole slot on a zero
+count), not to filter anything.
