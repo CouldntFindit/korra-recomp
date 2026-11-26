@@ -4616,8 +4616,9 @@ index `matrix[dest * src_ch + src]` (a 2x2 diagonal matrix is unaffected, so the
 2 ch CRI/menu path cannot move). A/B, same route and taps: Windows 0 clipped
 frames before and after, movie window peak -11.4..-14.1 -> -12.0..-16.6 dBFS and
 RMS -25.6..-29.1 -> -24.6..-28.1; device movie window RMS -26.1/-25.8/-27.8 ->
--25.4/-24.0/-28.0 dBFS and total clipping 0.2349 % -> 0.2316 %. Level-neutral;
-the imaging is now the engine's.
+-25.4/-24.0/-28.0 dBFS and total clipping 0.2349 % -> 0.2316 %. No gross
+level change (peaks within ~2.5 dB, RMS within ~1 dB); the imaging is now the
+engine's.
 
 **Also measured.** The two hosts' `credits` differ in shape (device constant 4;
 Windows 1..4) while `qcount` and the block geometry match; the Hw voice feeds

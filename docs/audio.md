@@ -1116,11 +1116,12 @@ R = FR + 0.707 C + 0.707 BR; read source-major it put LFE at 1.0 into the right
 channel and the front-right speaker into the left. Both shims now apply
 `matrix[dest * src_ch + src]`. A/B on Windows (same route/taps, 115 s each):
 0 clipped frames before and after, movie-window peaks -11.4..-14.1 dBFS ->
--12.0..-16.6, RMS -25.6..-29.1 -> -24.6..-28.1 (level-neutral, imaging
-corrected). The device A/B is recorded in `docs/FINDINGS.md`. The 2026-11-24
-"6 ch through the engine's 6x2 matrix, peak -7.13 dBFS" figure was taken with
-the transposed order; the level-neutral A/B above is the re-measurement, and no
-other acceptance number moves (the 2 ch path is untouched).
+-12.0..-16.6, RMS -25.6..-29.1 -> -24.6..-28.1 (no gross level change: peaks
+within ~2.5 dB and RMS within ~1 dB; the imaging is corrected). The device A/B
+is recorded in `docs/FINDINGS.md`. The 2026-11-24 "6 ch through the engine's 6x2
+matrix, peak -7.13 dBFS" figure was taken with the transposed order; the A/B
+above is the re-measurement, and no other acceptance number moves (the 2 ch path
+is untouched).
 
 **Still open, named.** Where the NaN/stale words first enter the engine's mix
 buffer (the fill's skip path at `0x0088B534` when `[device+4]` and
