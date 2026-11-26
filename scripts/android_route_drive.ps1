@@ -28,7 +28,11 @@ param(
     [string]$Package = "org.korra.recomp",
     [string]$Prefix = "drive",
     [switch]$NoInstall,
-    [switch]$Install
+    [switch]$Install,
+    # Continue (the Story submenu's default entry) instead of New Game. The
+    # checkpoint load rewrites GameData.dat, so the save probe shows the load's
+    # own request; use it to prove the written save resumes.
+    [switch]$Resume
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
@@ -180,6 +184,10 @@ Note ("props: memtrace=1 perf=1 fps={0}" -f $fpsRead)
 & $adb shell am force-stop $Package | Out-Null
 Start-Sleep -Seconds 1
 & $adb shell am start -n "$Package/.MainActivity" | Out-Null
+# `am start` can print "unknown error code 10" while still launching, and the
+# process needs a moment to appear; checking pidof in the same breath read the
+# app as dead at 0 s (2026-11-26).
+Start-Sleep -Seconds 3
 $t0 = Get-Date
 $script:elapsed = 0
 $lastState = ""
@@ -204,7 +212,7 @@ $died = $false
 while (((Get-Date) - $t0).TotalSeconds -lt $Seconds) {
     $script:elapsed = ((Get-Date) - $t0).TotalSeconds
     $pidof = ((Adb-Run @('shell', 'pidof', $Package)) -join "").Trim()
-    if (-not $pidof) { $died = $true; Note "process ended (pidof empty)"; break }
+    if (-not $pidof -and $script:elapsed -gt 3) { $died = $true; Note "process ended (pidof empty)"; break }
 
     # Thermal curve from the PC side: dumpsys battery (temperature, level,
     # charging) and thermalservice (per-sensor severity/status), every 30 s.
@@ -278,7 +286,9 @@ while (((Get-Date) - $t0).TotalSeconds -lt $Seconds) {
     elseif ($flat -match "lightattack|heavyattack|jump") { $state = "gameplay" }
     # Main menu: the Story entry plus its siblings. OCR mangles the logo font,
     # so "Pro-Bending" comes back as "Pro-Bendin" and "Options" as "pptions".
-    elseif ($flat -match "startstorymode") { $state = "main-menu-story" }
+    # OCR mangles "Start Story Mode." into "Sta Story Mode"/"Start Story Model";
+    # the flattened copy still keeps "storymode", so match that too.
+    elseif ($flat -match "startstorymode|storymode") { $state = "main-menu-story" }
     elseif ($flat -match "probendin|pptions|options") { $state = "main-menu" }
     # Story submenu: Continue / New Game / END. Do NOT require "Continue": it
     # reads as "Cpntinue" about half the time (measured 2026-11-22, the route
@@ -303,9 +313,14 @@ while (((Get-Date) - $t0).TotalSeconds -lt $Seconds) {
         "autosave-notice" { Note "act: A (dismiss auto-save notice)"; Press-A }
         "pad-notice"      { Note "act: A (dismiss pad notice)"; Press-A }
         "main-menu-story" { Note "act: A (open Story)"; Press-A }
-        "main-menu"       { Note "act: stick up (select Story)"; Stick-Up }
+        # The main menu opens with Story selected. Pressing up here wraps the
+        # cursor to Exit (the last item), and repeating it cycles forever while
+        # the OCR keeps the state at "main-menu" - measured 2026-11-26, the
+        # sauto1 run spent 60 s doing that. Confirm the default instead.
+        "main-menu"       { Note "act: A (Story is the default entry)"; Press-A }
         "story-submenu"   {
-            if ($text -match "start a new game") { Note "act: A (New Game)"; Press-A; $submenuTries = 0 }
+            if ($Resume) { Note "act: A (Continue is the default entry)"; Press-A; $submenuTries = 0 }
+            elseif ($text -match "start a new game") { Note "act: A (New Game)"; Press-A; $submenuTries = 0 }
             elseif ($submenuTries -ge 3) { Note "act: A anyway (no description read)"; Press-A; $submenuTries = 0 }
             else { Note ("act: stick down (Continue -> New Game), try {0}" -f ($submenuTries + 1)); Stick-Down; $submenuTries++ }
         }
