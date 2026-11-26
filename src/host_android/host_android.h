@@ -240,6 +240,11 @@ uint32_t ka_import_calls(void);
 /* Shell loop iterations (jni_bridge -> main_android.c korra_guest_frame). */
 uint32_t ka_shell_frames(void);
 
+/* Wait-object scenarios (wait_selftest.c): debug.korra.waittest=1 runs them on
+ * the calling pthread before the guest thread starts. Returns 0 when every
+ * scenario passed (or when the prop is off). */
+int ka_wait_selftest(void);
+
 /* XAudio2 / steam / misc module tables registered at boot. */
 void ka_shims_register_all(void);
 

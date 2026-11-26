@@ -849,6 +849,16 @@ them. Use all three or the report will name the wrong layer:
    The frame cap is `debug.korra.fps` (default 30, `0` = the engine's own
    30/60 mode); `[fps] limiter interval 50 -> 100 (cap 30 fps)` in the log is
    the proof it was applied.
+5. **The wait-object selftest.** `adb shell setprop debug.korra.waittest 1`
+   makes `src/host_android/wait_selftest.c` run its object scenarios on the
+   host's main pthread *before* the guest thread starts. It prints one
+   `[wait-selftest] <scenario> PASS|FAIL <detail>` line per case and a final
+   `[wait-selftest] N/M PASS`; the scenarios cover auto-reset and manual-reset
+   events, semaphore counts and `ReleaseSemaphore` bounds, timeouts and
+   `WaitForMultipleObjects`. It drives the same state machine as the shims
+   (`src/host_android/wait_objects.c`) with a plain `nanosleep`, never
+   `guest_sleep_ms`, because these are host pthreads and the guest sleep
+   unwinds the machine lock. The prop must be cleared before a performance run.
 
 RSS is not one number. `dumpsys meminfo`'s TOTAL RSS of 1.19 GB was 1.03 GB
 **Graphics** (dmabuf), 15 MB native heap and ~110 MB of anonymous pages; the

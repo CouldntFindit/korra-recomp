@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 #include "host_android.h"
+#include "wait_objects.h"
 
 /* ------------------------------------------------------ host backtrace ---
  * The guest stack cannot name callers: RECOMP_CALL pushes RECOMP_RETADDR
@@ -53,60 +54,9 @@ static int ka_host_backtrace(void **pc, int max) {
 #define STD_IN  0xFFFFF003u
 
 /* --------------------------------------------------------------- objects */
-#define MAX_OBJ 256
-enum { OBJ_EVENT = 1, OBJ_MUTEX = 2, OBJ_SEM = 3 };
-typedef struct {
-    int used, kind, manual, signaled, count, maxcount, owned;
-} ka_obj;
-static ka_obj g_obj[MAX_OBJ];
-static pthread_mutex_t g_obj_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static ka_obj *obj_get(uint32_t h) {
-    uint32_t i = h - 1;
-    if (h == 0 || i >= MAX_OBJ || !g_obj[i].used) return NULL;
-    return &g_obj[i];
-}
-
-/* Integrity check (M3, 2026-11-21). g_obj[9]'s fields at +4..+16 are found
- * overwritten with host-pointer halves during the render burst, which turns a
- * worker's blocking wait into a 730k/s spin and freezes the frame loop. The
- * wait that first notices it belongs to a different thread than the writer, so
- * the ring of recent imports has to be captured as soon as the table goes bad:
- * this runs from every import dispatch, covering the 256 entries in 32
- * imports. Diagnostics only. */
-void ka_obj_check(void) {
-    static unsigned rot;
-    static int bad;
-    unsigned k;
-    if (bad) return;
-    for (k = 0; k < 8; k++) {
-        unsigned i = (rot + k) & (MAX_OBJ - 1);
-        ka_obj *e = &g_obj[i];
-        if (e->used && (e->kind < OBJ_EVENT || e->kind > OBJ_SEM)) {
-            bad = 1;
-            ka_log("obj: entry %u corrupt: %d %d %d %d %d %d %d (fs=%08X f=0x%08X)", i,
-                   e->used, e->kind, e->manual, e->signaled, e->count,
-                   e->maxcount, e->owned, g_fs_base, g_cur_func);
-            ka_ring_dump("imports just before the object table went bad");
-            return;
-        }
-    }
-    rot = (rot + 8) & (MAX_OBJ - 1);
-}
-static uint32_t obj_new(int kind, int manual, int initial) {
-    pthread_mutex_lock(&g_obj_lock);
-    for (uint32_t i = 0; i < MAX_OBJ; i++) {
-        if (!g_obj[i].used) {
-            g_obj[i].used = 1; g_obj[i].kind = kind; g_obj[i].manual = manual;
-            g_obj[i].signaled = initial; g_obj[i].count = initial;
-            g_obj[i].maxcount = 0;
-            pthread_mutex_unlock(&g_obj_lock);
-            return i + 1;
-        }
-    }
-    pthread_mutex_unlock(&g_obj_lock);
-    return 0;
-}
+/* The table and every state decision live in wait_objects.c (Stage 0,
+ * 2026-11-27); this file owns the guest-facing shims and their probes. Handle
+ * tokens are slot + 1 (1..256); thread ids start above that range. */
 
 /* ------------------------------------------------------ pool slot probe ---
  * M3 deadlock, 2026-11-21. The asset-load pool is two managers of slots, each
@@ -215,22 +165,24 @@ static void guest_sleep_ms(uint32_t ms) {
 /* --------------------------------------------------------------- the shims */
 static void k_CloseHandle(void) {
     uint32_t h = A32(0);
-    ka_obj *o = obj_get(h);
+    ka_obj snap;
+    int idx, isobj = ka_obj_snapshot(h, &snap, &idx);
     {
         /* Handle reuse is normal on Windows too, so this is not a bug by
          * itself: it is how the run shows WHICH object a value stood for at the
-         * moment the pool handed it on. obj_new reuses a freed slot, so a
+         * moment the pool handed it on. ka_obj_new reuses a freed slot, so a
          * stale handle silently becomes the next object created. */
         static int n;
         if (n < 40) {
             n++;
             ka_log("close: h=%08X %s esp=%08X ebp=%08X fs=%08X", h,
-                   o ? (o->kind == OBJ_SEM ? "sem" : o->kind == OBJ_EVENT ? "event" : "mutex")
-                     : "not an object",
+                   isobj ? (snap.kind == KA_OBJ_SEM ? "sem"
+                            : snap.kind == KA_OBJ_EVENT ? "event" : "mutex")
+                         : "not an object",
                    g_esp, g_ebp, g_fs_base);
         }
     }
-    if (o) { o->used = 0; RET(1, 1); }
+    if (isobj) { ka_obj_close(h); RET(1, 1); }
     /* A thread handle: create/openthread ids are real here even though they are
      * not kernel objects, and closing one must not touch the thread table (the
      * engine opens the same worker again to join it). */
@@ -1065,15 +1017,36 @@ static void k_CreateThread(void) {
     RET(tok, 6);
 }
 uint32_t ka_thread_wait(uint32_t token, uint32_t timeout_ms);
+/* The state machine's poll callback: the "MAIN still waiting" probe the inline
+ * loop used to print at 2000 ms. */
+typedef struct { uint32_t h; int ismain, kind, manual; } wait_probe_ctx;
+static void wait_poll_probe(uint32_t polls, void *arg) {
+    wait_probe_ctx *c = (wait_probe_ctx *)arg;
+    /* A main-thread wait is not logged above (it is the common case), but a
+     * boot that goes silent ends in exactly one of two places: a lifted loop
+     * that calls no import, or this call. 2 s is far longer than any
+     * legitimate wait in the load path. */
+    if (!c->ismain || polls != 2000) return;
+    {
+        static int nm;
+        if (nm < 10) {
+            nm++;
+            ka_log("wait: MAIN h=%08X kind=%u manual=%u still waiting after %u ms fs=%08X",
+                   c->h, c->kind, c->manual, polls, g_fs_base);
+        }
+    }
+}
 static void k_WaitForSingleObject(void) {
     uint32_t h = A32(0), ms = A32(1);
-    ka_obj *o = obj_get(h);
+    ka_obj snap;
+    int idx = -1;
+    int isobj = ka_obj_snapshot(h, &snap, &idx);
     /* Repeat-wait probe (M3, 2026-11-21). The pool worker sub_007414E0 spins
      * at ~20k loop passes a second after the first thirteen presents, and the
      * throttled logs cannot show which handle it is polling: a wait that
      * returns at once is what a spin looks like from here. Count waits per
      * handle and print the third, then every 200,000th, with what the handle
-     * resolves to *now* - a closed semaphore's slot is recycled by obj_new,
+     * resolves to *now* - a closed semaphore's slot is recycled by ka_obj_new,
      * so a stale handle can silently become an unrelated signaled event.
      * Diagnostics only; nothing changes what the guest sees. */
     {
@@ -1086,18 +1059,18 @@ static void k_WaitForSingleObject(void) {
         if (slot >= 0) {
             uint32_t n = ++rep[slot].n;
             if (n == 3 || (n % 200000u) == 0) {
-                if (o) {
-                    const int *raw = (const int *)o;
-                    ka_log("wait: rep h=%08X n=%u idx=%ld kind=%u manual=%u sig=%u cnt=%d caller=0x%08X fs=%08X",
-                           h, n, (long)(o - g_obj), o->kind, o->manual, o->signaled, o->count,
+                if (isobj) {
+                    const int *raw = (const int *)&snap;
+                    ka_log("wait: rep h=%08X n=%u idx=%d kind=%u manual=%u sig=%u cnt=%d caller=0x%08X fs=%08X",
+                           h, n, idx, snap.kind, snap.manual, snap.signaled, snap.count,
                            g_cur_func, g_fs_base);
                     ka_log("wait: raw h=%08X %d %d %d %d %d %d %d", h,
                            raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6]);
-                    if (o->kind < OBJ_EVENT || o->kind > OBJ_SEM) {
+                    if (snap.kind < KA_OBJ_EVENT || snap.kind > KA_OBJ_SEM) {
                         static int corrupt_logged;
                         if (!corrupt_logged) {
                             corrupt_logged = 1;
-                            ka_log("wait: obj entry %ld is corrupt (kind=%u)", (long)(o - g_obj), o->kind);
+                            ka_log("wait: obj entry %d is corrupt (kind=%u)", idx, snap.kind);
                             ka_ring_dump("last imports before the corruption was noticed");
                         }
                     }
@@ -1115,38 +1088,27 @@ static void k_WaitForSingleObject(void) {
         if (n < 120) {
             n++;
             int ismain = (g_fs_base && g_fs_base == ka_spine_main_fs());
-            if (o)
+            if (isobj)
                 ka_log("wait: h=%08X kind=%u manual=%u signaled=%u ms=%u main=%d fs=%08X",
-                       h, o->kind, o->manual, o->signaled, ms, ismain, g_fs_base);
+                       h, snap.kind, snap.manual, snap.signaled, ms, ismain, g_fs_base);
             else
                 ka_log("wait: h=%08X notobj ms=%u main=%d fs=%08X",
                        h, ms, ismain, g_fs_base);
         }
     }
-    if (o) {
+    if (isobj) {
         int ismain = (g_fs_base && g_fs_base == ka_spine_main_fs());
         uint64_t wt0 = ka_fp_on() ? ka_fp_now() : 0;
-        uint32_t waited = 0;
-        while (!o->signaled && (ms == 0xFFFFFFFFu || waited < ms)) {
-            guest_sleep_ms(1);
-            waited++;
-            if (ms == 0) break;
-            /* A main-thread wait is not logged above (it is the common case),
-             * but a boot that goes silent ends in exactly one of two places: a
-             * lifted loop that calls no import, or this call. 2 s is far longer
-             * than any legitimate wait in the load path. */
-            if (ismain && waited == 2000) {
-                static int nm;
-                if (nm < 10) {
-                    nm++;
-                    ka_log("wait: MAIN h=%08X kind=%u manual=%u still waiting after %u ms fs=%08X",
-                           h, o->kind, o->manual, waited, g_fs_base);
-                }
-            }
-        }
-        if (!o->signaled) RET(258u, 2);   /* WAIT_TIMEOUT */
-        if (!o->manual) o->signaled = 0;
-        if (waited && wt0) ka_fp_wait_done(wt0);
+        wait_probe_ctx pc;
+        ka_wait_result wr;
+        pc.h = h; pc.ismain = ismain; pc.kind = (int)snap.kind; pc.manual = (int)snap.manual;
+        /* Stage 0 keeps the 1 ms poll and passes the guest sleep: the state
+         * machine re-resolves the handle under g_obj_lock every poll and
+         * consumes the signal there, so a window that vanishes mid-wait is
+         * answered as a timeout, not consumed through a stale pointer. */
+        wr = ka_obj_wait_ex(h, ms, guest_sleep_ms, wait_poll_probe, &pc);
+        if (wr.result != KA_WAIT_OBJECT_0) RET(258u, 2);   /* WAIT_TIMEOUT */
+        if (wr.polls && wt0) ka_fp_wait_done(wt0);
         /* What the slot held when its worker was let through. This cannot ride
          * on the 40-wake budget above: the file pool's early wakes spend it long
          * before the asset pool's critical one. Dump when the block names a
@@ -1167,7 +1129,7 @@ static void k_WaitForSingleObject(void) {
         }
         RET(0, 2);
     }
-    /* A handle of 0 is not an object at all: obj_get rejects it and no thread
+    /* A handle of 0 is not an object at all: ka_obj_snapshot rejects it and no thread
      * token can equal it, so the call below would return WAIT_OBJECT_0 in zero
      * time and the caller loops as fast as it can. That is the terminal state
      * of the M3 device run (worker token 265, after calling a NULL job
@@ -1183,22 +1145,16 @@ static void k_WaitForSingleObject(void) {
 }
 static void k_WaitForMultipleObjectsEx(void) {
     uint32_t count = A32(0), arr = A32(1), waitAll = A32(2), ms = A32(3);
-    uint32_t waited = 0;
-    for (;;) {
-        int ready = 0;
-        for (uint32_t i = 0; i < count; i++) {
-            ka_obj *o = obj_get(MEM32(arr + i * 4));
-            if (o && o->signaled) {
-                if (!o->manual) o->signaled = 0;
-                if (!waitAll) RET(i, 5);
-                ready++;
-            }
-        }
-        if (waitAll && ready == count) RET(0, 5);
-        if (ms != 0xFFFFFFFFu && waited >= ms) RET(258, 5);
-        guest_sleep_ms(1);
-        waited++;
-    }
+    /* MAXIMUM_WAIT_OBJECTS is 64; the engine passes small arrays. The handles
+     * are copied out of guest memory once, then the state machine does the
+     * check-then-consume under the object lock. */
+    uint32_t hs[64];
+    uint32_t i;
+    ka_wait_result wr;
+    if (count > 64) RET(0xFFFFFFFFu, 5);   /* WAIT_FAILED */
+    for (i = 0; i < count; i++) hs[i] = MEM32(arr + i * 4);
+    wr = ka_obj_wait_multi(hs, count, waitAll != 0, ms, guest_sleep_ms);
+    RET(wr.result, 5);
 }
 static void k_ResumeThread(void) {
     uint32_t prev = ka_thread_resume(A32(0));
@@ -1242,36 +1198,38 @@ static void k_GetProcessAffinityMask(void) {
 
 /* -------------------------------------------------------------- events */
 static void k_CreateEventA(void) {
-    RET(obj_new(OBJ_EVENT, A32(1) != 0, A32(2) != 0), 4);
+    RET(ka_obj_new(KA_OBJ_EVENT, A32(1) != 0, A32(2) != 0), 4);
 }
 static void k_CreateEventW(void) {
-    RET(obj_new(OBJ_EVENT, A32(1) != 0, A32(2) != 0), 4);
+    RET(ka_obj_new(KA_OBJ_EVENT, A32(1) != 0, A32(2) != 0), 4);
 }
 static void k_SetEvent(void) {
     uint32_t h = A32(0);
-    ka_obj *o = obj_get(h);
+    ka_obj snap;
+    int idx, isobj = ka_obj_snapshot(h, &snap, &idx);
     {
         static int n;
         if (n < 60) {
             n++;
             ka_log("setevent: h=%08X %s fs=%08X", h,
-                   o ? (o->kind == OBJ_EVENT ? "event" : "other") : "not an object", g_fs_base);
+                   isobj ? (snap.kind == KA_OBJ_EVENT ? "event" : "other") : "not an object",
+                   g_fs_base);
         }
     }
-    if (o) o->signaled = 1;
-    RET(1, 1);
+    RET(ka_obj_set(h), 1);
 }
 static void k_ResetEvent(void) {
-    ka_obj *o = obj_get(A32(0));
-    if (o) o->signaled = 0;
-    RET(1, 1);
+    RET(ka_obj_reset(A32(0)), 1);
 }
-static void k_CreateMutexA(void) { RET(obj_new(OBJ_MUTEX, 0, A32(1) ? 0 : 1), 3); }
+static void k_CreateMutexA(void) {
+    /* Mutex ownership is unexercised: Step 0 measured 0 mutex waits and 0
+     * mutex closes. This is the same mapping the stub had (a not-initially-
+     * owned mutex is signaled); do not add recursion without a call site. */
+    RET(ka_obj_new(KA_OBJ_MUTEX, 0, A32(1) ? 0 : 1), 3);
+}
 static void k_ReleaseMutex(void) { RET(1, 1); }
 static void k_CreateSemaphoreA(void) {
-    uint32_t tok = obj_new(OBJ_SEM, 0, 0);
-    ka_obj *o = obj_get(tok);
-    if (o) { o->signaled = A32(1) != 0; o->count = (int)A32(1); o->maxcount = (int)A32(2); }
+    uint32_t tok = ka_obj_new_sem((int)A32(1), (int)A32(2));
     sem_note(tok, A32(1), A32(2));
     RET(tok, 4);
 }
@@ -1281,27 +1239,29 @@ static void k_CreateSemaphoreA(void) {
  * on the path this host already implements instead of its old fallback. */
 static void k_InitializeCriticalSectionEx(void) { RET(cs_init_at(A32(0)), 3); }
 static void k_CreateSemaphoreExW(void) {
-    uint32_t tok = obj_new(OBJ_SEM, 0, 0);
-    ka_obj *o = obj_get(tok);
-    if (o) { o->signaled = A32(1) != 0; o->count = (int)A32(1); o->maxcount = (int)A32(2); }
+    uint32_t tok = ka_obj_new_sem((int)A32(1), (int)A32(2));
     RET(tok, 6);
 }
 static void k_SetThreadStackGuarantee(void) { RET(1, 1); }
 static void k_FlushProcessWriteBuffers(void) { RETV(0); }
 static void k_GetCurrentProcessorNumber(void) { RET(0, 0); }
 static void k_ReleaseSemaphore(void) {
-    ka_obj *o = obj_get(A32(0));
+    uint32_t h = A32(0), n = A32(1), prev = 0;
     {
-        static int n;
-        if (n < 60) {
-            n++;
+        static int nlog;
+        if (nlog < 60) {
+            nlog++;
             ka_log("semrel: h=%08X n=%u esp=%08X ebp=%08X fs=%08X",
-                   A32(0), A32(1), g_esp, g_ebp, g_fs_base);
+                   h, n, g_esp, g_ebp, g_fs_base);
         }
     }
-    if (A32(2)) MEM32(A32(2)) = o ? (uint32_t)o->count : 0;
-    if (o) { o->count += (int)A32(1); o->signaled = o->count > 0; }
-    RET(1, 3);
+    /* Windows: on failure the count is unchanged and lpPreviousCount is not
+     * written; 298 (ERROR_TOO_MANY_POSTS) is the over-max answer. */
+    if (ka_obj_release_sem(h, n, &prev)) {
+        if (A32(2)) MEM32(A32(2)) = prev;
+        RET(1, 3);
+    }
+    RET(0, 3);
 }
 
 /* ------------------------------------------------------------ charsets */

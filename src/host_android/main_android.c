@@ -95,6 +95,9 @@ int ka_guest_run(const char *game_root) {
     ka_memtrace_start();
     ka_frame_probe_start();
     ka_fps_cap_start();
+    /* debug.korra.waittest=1: the wait-object scenarios run here, on this
+     * host pthread, before the guest thread exists (wait_selftest.c). */
+    ka_wait_selftest();
 
     {
         pthread_t th;
