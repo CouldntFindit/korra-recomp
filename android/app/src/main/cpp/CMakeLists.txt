@@ -91,8 +91,11 @@ if(KORRA_LINK_GUEST)
         "${KORRA_PCRECOMP_DIR}/runtime/win32hle")
     # -fwrapv / -fno-strict-aliasing match the MSVC host's semantics: the lifted
     # C performs 32-bit wrapping arithmetic on one untyped guest memory array.
+    # -fexceptions: d3d9_android.cpp must catch DXVK's DxvkError at the bridge
+    # boundary (D3D9DeviceEx::Reset does not; an escaping throw terminates the
+    # process), and the module-wide cppFlags disable exceptions.
     target_compile_options(korra_guest PRIVATE
-        -O1 -fwrapv -fno-strict-aliasing -ffp-contract=off -w)
+        -O1 -fwrapv -fno-strict-aliasing -ffp-contract=off -w -fexceptions)
     # recomp_0053.c is 142 MB of one translation unit. Clang at -O1 needs ~5 GB
     # and >15 minutes for it alone (measured), which dominates every rebuild; -O0
     # keeps bring-up honest and costs only that file's execution speed.
