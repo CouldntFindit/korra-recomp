@@ -982,10 +982,20 @@ are in `docs/FINDINGS.md` (2026-11-25).
 `FindFirstFileExA(<root>/Korra/*.*) -> <handle> last=0 first="GameData.dat"`,
 no `CreateDirectoryA` follows, and a settings change in Options writes
 `GameData.dat` 7,856 B and `SystemData.dat` 16 B; the next boot opens
-`SystemData.dat` with `last=0`. On the host the same request printed a valid
-search handle and `WriteFile 7856` (the `first=` field was empty before the
-`71e09ce` probe fix and is unproven on Windows until the next Options run). The
-Windows **SystemData** line cannot be
-reached with the current Windows input path: the engine's menus navigate on the
-left stick, and `src/host/xinput_stub.c` exposes buttons only (`wButtons`; both
-sticks stay centred) - 16 dpad presses moved the cursor nowhere.
+`SystemData.dat` with `last=0`. The checkpoint save is
+`hap::HapSaveActionArea` (`0x64EA50`, write at `0x64EB9C`): the level dispatcher
+(`0x641150`) delivers event `0x45ce422b`, the area snapshots the player at
+`0x632A20` and the writer produces `GameData.dat` 7,856 B with no
+`CreateDirectoryA`; the load is reached at the tutorial's level start
+(`docs/FINDINGS.md`, 2026-11-26) and Continue resumes it.
+
+**Windows now walks the same menus.** `src/host/xinput_stub.c` gained
+`KORRA_PAD_STICK=lx,ly` and optional left-stick fields on the `KORRA_PAD_CMD`
+timeline; a 150 ms pulse moves one menu item (an 1,800 ms hold auto-repeats).
+The Options -> Controller -> Vibration `ON -> OFF`, then B, B, wrote
+`GameData.dat` 7,856 B and `SystemData.dat` 16 B in `<Documents>/Korra`, the
+next boot opened `SystemData.dat` with `last=0`, and the probe's `first=` field
+printed the real Windows dot entry (`first="."`; the device shim filters `.`/`..`,
+which is why the device shows `GameData.dat`). That exercises `71e09ce` on
+Windows. The save is only requested on a **net** settings difference
+(`0x5D96C0`): toggling ON -> OFF -> ON writes nothing.

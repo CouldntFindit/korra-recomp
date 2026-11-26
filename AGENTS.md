@@ -497,3 +497,16 @@ Append only; newest last. Format: date — attempt — outcome — next idea.
   the menu samples (boot movies before it are clean). The one-shot probe only
   checks `|x| > 2`, so NaN/Inf passes silently. Next: log the slice
   `[start,end)` and `i0` with the value and classify non-finite samples.
+- 2026-11-26 - "a held left stick moves the menu cursor one item per gesture" -
+  **false: it auto-repeats.** A 150 ms `sThumbLY=-22000` pulse moves exactly one
+  item; an 1,800 ms hold ran Story -> Pro-Bending -> Options -> Exit. The Options
+  save also needs a **net** settings change: `UIOptionMenu` state 4 compares 14
+  fields at `0x5D96C0` on leave, so ON -> OFF -> ON requests nothing; one
+  ON -> OFF does. On the device, `android_route_drive.ps1`'s "stick up to select
+  Story" wrapped the main-menu cursor to Exit and cycled for 60 s - Story is the
+  default entry, so confirm with A (and accept the OCR form `Sta Story Mode`).
+  `am start` can print "unknown error code 10" while launching; wait 3 s before
+  reading `pidof`. **`watchlog ... from=` is the next dispatch, not the writer**:
+  for the checkpoint save it printed `0x63E900` (a resource constructor), while
+  `debug.korra.icall=64EA50` caught the real site, `hap::HapSaveActionArea`,
+  called twice from `0x641150` immediately before the `[0xCA6C28]=3` write.

@@ -4185,7 +4185,7 @@ README, SlotData_0.dat, SystemData.dat):
 | `SlotData_?.dat` | SlotData_0.dat | correct | correct |
 | `*.` | extensionless names only (nofile, README) | **none** | extensionless |
 | `*.*dat` | the three .dat files | **none** | the three |
-| `GameData.*` | GameData and GameData.dat | **none** | both |
+| `GameData.*` | `GameData.dat` only (the measured set has no dotless `GameData`; the DOS rule matches one if it exists) | **none** | `GameData.dat` (and a dotless `GameData` if it existed) |
 | `GF?e*` | no match | correct | correct |
 
 The Windows column is a real `FindFirstFileA` oracle (a small MSVC program over
@@ -4362,3 +4362,140 @@ Open: the Windows SystemData oracle (left-stick injection in
 `src/host/xinput_stub.c`; the stub zeroes both sticks) and an autosave driven
 by gameplay progress (the twelve `[0xCA6C28]=3` sites are named, none
 exercised). The shipping save set itself is closed.
+
+
+## 2026-11-26 - the Windows oracle walks the Options menu on the left stick, and the tutorial's checkpoint save is pinned to `hap::HapSaveActionArea`
+
+Device: Galaxy S24 (Exynos 2400, Xclipse 940, stock Vulkan), `<device-serial>`
+present throughout; Windows oracle: the dGPU host. Base HEAD `361e8ca` (one
+docs commit above the hand-off's `a11cf8a`; the tip subject was verified).
+Commit `530e885` adds the left stick; the route/docs commit follows. Logs are in
+`logs/` (gitignored): `win_opts_stick2.txt`, `win_vib1.txt`,
+`win_boot_after_save.txt`, `sauto2_drive.txt`, `sauto3_drive.txt`,
+`scont1_drive.txt`, and the pulled device `log.txt`.
+
+**The Windows gap was the pad's missing left stick, not the game.** The menus
+navigate on the left stick (`FUN_007606d0` remaps `sThumbLX/LY` into its 0x24-byte
+pad block), while `src/host/xinput_stub.c` wrote `wButtons` only and set all four
+`sThumb*` to 0. `530e885` adds `KORRA_PAD_STICK=lx,ly` (a constant deflection),
+optional `lx ly` fields on the `KORRA_PAD_CMD` timeline, and bumps
+`dwPacketNumber` when the stick changes (the engine edge-detects on it). The
+default is still 0/0 and the knob is inert without `KORRA_PAD=1`.
+
+**The menu walk, measured.** A 150 ms pulse at `sThumbLY=-22000` moves the main
+menu cursor **exactly one item** (`Story -> Pro-Bending -> Options`, each read
+from its description: `Start Story Mode.`, `Complete Story Mode to unlock.`,
+`Change game settings.`); an 1,800 ms hold auto-repeats and ran Story -> Exit in
+one gesture, which is why the first attempt overshot. The Options root is
+`Controller / Camera / Sound / Display`; the Controller page's `Vibration` row
+starts `ON`. The leave path is `UIOptionMenu` state 4: `0x5D96C0` compares fourteen
+live settings (`+0xE4..+0x118`) with the entry snapshot (`+0xAC..+0xE0`) and only
+a **net difference** sets state 7 (`0x5D837B`, `req_save(5)`). The first attempt
+toggled `ON -> OFF -> ON`, ended equal to the snapshot, and wrote nothing; one
+horizontal pulse `ON -> OFF`, then B (Controller -> root) and B (leave), wrote.
+
+**The Windows save lines (first time on Windows).**
+
+```
+[save] SHGetSpecialFolderPathA hwnd=0 csidl=5 create=0 -> ret=1 path="<Documents>"
+[save] FindFirstFileExA pat="<Documents>/Korra/*.*" -> 0x5B25DF08 last=1008 first="."
+[save] FindClose h=0x5B25DF08 -> ret=1
+[save] CreateFileA path="<Documents>/Korra/GameData.dat" access=0x40000000 share=0x00000000 disp=2 flags=0x00000080 -> 0x00000984 last=183
+[save] WriteFile h=0x00000984 n=7856 -> ret=1 put=7856 last=183
+[save] FindFirstFileExA pat="<Documents>/Korra/*.*" -> 0x5B25E008 last=1008 first="."
+[save] CreateFileA path="<Documents>/Korra/SystemData.dat" access=0x40000000 share=0x00000000 disp=2 -> 0x00000980 last=183
+[save] WriteFile h=0x00000980 n=16 -> ret=1 put=16 last=183
+```
+
+`first="."` is the real Windows answer: `FindFirstFileExA` returns the `.`/`..`
+entries, which the device shim filters because the engine's rofs mount skips
+directories (hence the device's `first="GameData.dat"`). It is the first
+**non-empty** `first=` in a Windows log, so the `71e09ce` `args[2]` fix is
+exercised and the two hosts' lines are now comparable field for field. The
+`last=183` on the write lines is `ERROR_ALREADY_EXISTS` from `CREATE_ALWAYS` on
+an existing file, not a failure (`ret=1`, `put=7856`). Disk after the run:
+`GameData.dat` 7,856 B and `SystemData.dat` 16 B; the next boot opened
+SystemData with `last=0`
+(`CreateFileA ... disp=3 -> 0x00000780 last=0`). `<Documents>/Korra` was
+restored from a backup afterwards.
+
+**The gameplay-save sites, statically (original exe).** The twelve direct
+`[0xCA6C28]=3` writes belong to: `hap::HapSaveActionArea` (`0x64EB9C`, method
+`0x64EA50`, RTTI COL `0x9988CC` -> TypeDescriptor `0x9EF1F0`); `cProBendingPhase`
+(`0x5CA688`, `0x5CA77B`, window messages `0x110`/`0x711`); the `UITitleMenu`
+flow (`0x5D3644`, `0x5D37AB`, `0x5D3A05`, methods called by `0x5D2980`); a UI
+scene transition (`0x5DD9FC`, `0x5DD861`); `UIStatusViewBending` (`0x5EA4D4`,
+called by `0x5E8C30`); `UIShop` (`0x5F1D1F`, called by `0x5EFCA0`); and
+`UIAllResult` (`0x5F7A63`, `0x5F9236`). The six `req_save` callers are
+`0x4D16D4`, `UIOptionMenu` `0x5D8380` (reason 5), `UIChapterSelect` `0x5E4DF8`
+and `0x5E5335`, `0x5FA289`, and `hap::ConditionResult` `0x64F37E`. Every direct
+site is the same inlined block: require `[0xE4F44C]!=0` (the save device was
+opened), `[0xDB8BB8]==0` (no save in flight) and `[0xCA6C28]==0`, call
+`0x632A20` to snapshot the player state, then set `[0xCA6C28]=3`,
+`[0xCA6C2C]=0`, `[0xCA6C18]=0`.
+
+`HapSaveActionArea` is the level checkpoint: `0x64EA50` switches on the event id
+at `[this+0x14]`; for `0x45ce422b` it requires `[0xCA6C28]==0` and
+`[0xCA3D10]&0x4000 == 0` (gameplay, not the menu), copies the player transform to
+`0xE3EE00`/`0xE3EE10`, checks the save device and in-flight flags, calls
+`0x632A20`, and writes the save. The other event, `0x4b7b6e51`, is the area's
+activation branch and does not save.
+
+**Device, the checkpoint exercised.** `sauto3` (New Game, 198 s,
+`debug.korra.icall=64EA50`, `debug.korra.watchlog=CA6C28`,
+`debug.korra.trace_save=1`) shows the dispatcher calling the area twice and the
+save immediately after:
+
+```
+[icall] target=0064EA50 from=00641150 esp=C16FFDF0 ... args=C16FFE20 230E18C0 C16FFE0C
+[icall] target=0064EA50 from=00641150 esp=C16FFDF0 ... args=C16FFE20 230E18C0 C16FFE0C
+[wlog] +00 = 00000003 (was 00000000) from=0063E900
+[wlog] +04 = 00000000 (was 00000004) from=0063E900
+[wlog] +04 = 00000001 (was 00000000) from=0056BE90
+[save] SHGetSpecialFolderPathA ... path="/data/user/0/org.korra.recomp/files/game"
+[save] FindFirstFileExA pat=".../game/Korra/*.*" -> 0x02000001 last=0 first="GameData.dat"
+[save] CreateFileA path=".../game/Korra/GameData.dat" access=0x40000000 disp=2 -> 0x01000002
+[save] WriteFile h=0x01000002 n=7856 -> ret=1 count=7856
+```
+
+No `CreateDirectoryA`. The two entries are the area's activation and save
+events; the `watchlog from=0063E900` is the next dispatch after the write
+(`0x63E900` is a resource constructor), so the **icall probe, not `from=`, pins
+the site**. The device file after the run: `GameData.dat` 7,856 B
+(2026-11-26 19:59, md5 `8efbde66...`), `SystemData.dat` untouched at 16 B; this
+is the level's start checkpoint, i.e. a real gameplay autosave written through
+`HapSaveActionArea`, not the Options (reason 5) or the menu's own request.
+
+**Continue after the write.** `scont1` (Resume) boots with SystemData `last=0`,
+opens `GameData.dat` `disp=3 -> last=0`, loads the checkpoint, and reaches the
+tutorial HUD (`Light Attack / Heavy Attack / Jump`) at 155 s with
+`flow=00000009 inst=00000001 step=FFFFFFFF`; the load then rewrites the same
+`GameData.dat` 7,856 B at `0x64EA50`. So the autosave round-trips.
+
+**Negative.** `sauto2` then played 481 s (258 held gestures, 19 OCR-verified HUD
+frames) in the tutorial and produced **no second** `[0xCA6C28]=3`: the checkpoint
+this level activates is at its start, and a mid-level progress checkpoint was
+not reached on the measured route. The site (`0x64EB9C`), the dispatcher
+(`0x641150`), the event (`0x45ce422b`) and the condition are named, so a longer
+or objective-driven run is the next attempt rather than a guess.
+
+**Route fixes on the device driver.** `scripts/android_route_drive.ps1`: the
+main-menu action was "stick up to select Story", which wraps the cursor to Exit
+and cycles forever (measured, 60 s); Story is the default entry, so it now
+confirms with A. The main-menu classifier also accepts the OCR form
+`Sta Story Mode` (`storymode`), and a 3 s start wait stops `pidof` reading a
+just-launched app as dead (`am start` can print "unknown error code 10" while
+launching). `-Resume` presses A on the Story submenu's default Continue.
+
+**Corrections recorded, not silently patched.** The `GameData.*` table row in
+the 2026-11-25 entry is corrected: the measured set has no dotless `GameData`, so
+Windows returns only `GameData.dat`; the DOS rule matches a dotless one only if
+it exists. `71e09ce` is now verified on Windows (`first="."`, a valid
+`WIN32_FIND_DATAA` name), with the dot-entry caveat above.
+
+**Not verified.** A checkpoint after mid-level gameplay progress; the Windows
+New Game/Continue route (the Windows run above stops at the Options menu, so its
+save is the reason-5 one); the exact event id the area receives at call time
+(the icall arguments are pointers; the id is read from `[this+0x14]`, and the
+class/event path is static); a slot or erase flow (proven absent); the M4 audio
+follow-ups (unchanged).
