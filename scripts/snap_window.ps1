@@ -5,7 +5,8 @@
 param(
     [int]$Seconds = 20,
     [string]$Out = "build\shot.png",
-    [string]$Game = ""
+    [string]$Game = "",
+    [int]$ProcessId = 0
 )
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Drawing
@@ -40,9 +41,16 @@ $root = Split-Path -Parent $PSScriptRoot
 $exe = Join-Path $root "build\korra_recomp.exe"
 if (-not $Game) { $Game = Join-Path (Split-Path -Parent (Split-Path -Parent $root)) "The Legend of Korra" }
 
-$p = Start-Process -FilePath $exe -ArgumentList "`"$Game`"" -PassThru -RedirectStandardOutput (Join-Path $root "build\run.out") -RedirectStandardError (Join-Path $root "build\run.err")
-Write-Host "waiting $Seconds s for the window..."
-Start-Sleep -Seconds $Seconds
+# -Pid captures the window of a game that is already running (the oracle runs
+# started by build\win_run.ps1) instead of starting one; nothing is killed and
+# -Seconds is ignored, so several shots can be taken of the same run.
+if ($ProcessId) {
+    $p = Get-Process -Id $ProcessId -ErrorAction Stop
+} else {
+    $p = Start-Process -FilePath $exe -ArgumentList "`"$Game`"" -PassThru -RedirectStandardOutput (Join-Path $root "build\run.out") -RedirectStandardError (Join-Path $root "build\run.err")
+    Write-Host "waiting $Seconds s for the window..."
+    Start-Sleep -Seconds $Seconds
+}
 $p.Refresh()
 $h = [IntPtr]::Zero
 $wins = [W]::Windows([uint32]$p.Id)
@@ -64,11 +72,12 @@ if ($b.Width -le 0 -or $b.Height -le 0) { $b = [System.Drawing.Rectangle]::new(0
 $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
 $g = [System.Drawing.Graphics]::FromImage($bmp)
 $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
-$path = Join-Path $root $Out
+$path = if ([System.IO.Path]::IsPathRooted($Out)) { $Out } else { Join-Path $root $Out }
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
 $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
 $g.Dispose(); $bmp.Dispose()
 Write-Host "saved $path"
 
-if (-not $p.HasExited) { $p.Kill(); $p.WaitForExit() }
+if (-not $ProcessId -and -not $p.HasExited) { $p.Kill(); $p.WaitForExit() }
 Write-Host "exit code: $($p.ExitCode)"
+
