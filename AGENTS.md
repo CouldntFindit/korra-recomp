@@ -601,3 +601,4 @@ Append only; newest last. Format: date — attempt — outcome — next idea.
   hides it. Next: one probe at the pool free entry (`0x00828D80`) that logs
   the block header before the free and at the next allocation, and the same
   load on the Windows oracle.
+- 2026-11-27 - 'dump the 0x00828D80 free by reading the span under ECX' - **the wrong register, and the dump can fault.** On entry ECX is only sometimes the block: the call is (pool index, block), and the log has cx=00000001, cx=C0000002; the 268 readable frees were just the callers that happened to leave the block in ECX, and the unguarded span died at 86.7 s reading  xBFFFFFE2. Read rgs[1] = [esp+8] and guard every span dword with VirtualQuery (src/host/pool_watch.c, KORRA_POOLWATCH=1); the unbiased sample is 12,500 frees, 4,107 with size bit 1, all valid.
