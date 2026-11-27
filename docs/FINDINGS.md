@@ -5188,7 +5188,7 @@ needs the race named (see the new entry).
 - Mutex waits (still zero measured), other devices, 60 fps, and the Windows
   long-run are untouched.
 
-## 2026-11-27 - Stage 1 forensics: both SIGSEGVs are pre-existing, and the 1 ms poll was hiding them
+## 2026-11-27 - Stage 1 forensics: crash 1 is pre-existing, crash 2 is pre-existing by disassembly, and the 1 ms poll was hiding them
 
 Base `6eec79e` verified by subject (clean tree, `main == origin/main`), device
 `<device-serial>` (SM_S921B) confirmed with `adb devices` before every run. Work
@@ -5200,7 +5200,8 @@ The result in one line: **the 1 ms poll was the mask, not the queue.** Crash 1
 (`0x00829560`) reproduces with **no queue code in the tree** once the poll's
 sleep is shortened to 100 us (1 of 5 launches), and 0 of 5 launches at the
 shipping 1 ms reproduce it. The queue is an accelerator of a pre-existing guest
-race, not its cause.
+race, not its cause. Crash 2 (`0x008AF460`) was **not** reproduced without the
+queue in this session; it is a pre-existing *path* by disassembly only.
 
 ### The diagnostics that made this answerable
 
@@ -5322,16 +5323,20 @@ param=` sequence (0x34627140, 0x34628540, 0x34629940, ...), and
 `MEM32(param) = 0x1000` is not a heap object. So `cap`/`post`/`done`/
 `fn`/`arg` were fields of a different struct, `fn=0` was that block's
 `+0x10`, and the identical 400 lines (the cap) appear in the *baseline* runs
-too. With the corrected guard (`MEM32(param)` must be a heap pointer) the
-count is **0 in the control run**: no pool slot was ever dumped, before or after
-the queue, so those dumps say nothing about publish order.
+too. With the corrected guard (`MEM32(param)` must be a heap pointer) the old
+400-line artifact is gone, but the count is **not** 0: `s1c2/3/4` and
+`s1w100_1/2/4/5` each report 400 real pool blocks (`mgr=0x20000970`, `cap=4`,
+`post=0xD36`, `fn=0`), while `s1c1`/`s1c5` report 0. They occur in the stable
+1 ms control runs as well, so they are **not crash-specific**; whether they are
+the asset or file pool, and whether `fn=0` is normal at that point, is **open**.
+They still say nothing about publish order.
 
 ### Conclusion
 
 - **The queue is not causal.** Crash 1 reproduces without a line of queue code
-  at a shorter poll quantum, and the two queue-build crashes sit on
-  pre-existing paths (pool free-list unlink; a code-length table walk) whose
-  inputs are guest data, not wait results. Every queue counter was clean
+  at a shorter poll quantum. Crash 2 sits on a pre-existing *path* by
+  disassembly (a code-length table walk) but was not reproduced without the
+  queue. Neither input is a wait result. Every queue counter was clean
   (`timeouts=0 fail=0 spur=0 peak=1`), the object table was intact, and the
   crash buffer was empty.
 - **The 1 ms poll is the mask.** It is a 1 ms latency floor on every wake; remove
