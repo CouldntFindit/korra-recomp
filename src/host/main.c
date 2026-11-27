@@ -37,6 +37,7 @@ void korra_file_probe_init(void);
 void korra_save_probe_init(void);   /* KORRA_TRACE_SAVE=1: save-chain calls */
 void korra_msg_probe_init(void);
 void korra_crash_probe_init(void);
+void korra_pool_watch_init(void);   /* KORRA_POOLWATCH=1: pool free/alloc watch */
 void korra_perf_probe_init(void);
 void korra_fps_cap_init(void);
 void korra_windowed_init(void);
@@ -136,6 +137,7 @@ int main(int argc, char **argv) {
     korra_windowed_init();
     korra_msg_probe_init();
     korra_crash_probe_init();
+    korra_pool_watch_init();   /* KORRA_POOLWATCH=1: pool free/alloc watch */
     korra_perf_probe_init();   /* KORRA_PERF=1: per-frame where-the-time-goes */
     korra_fps_cap_init();      /* KORRA_FPS=40: hold the engine limiter there */
     if (getenv("KORRA_TRACE")) native32_trace_native = 1;
