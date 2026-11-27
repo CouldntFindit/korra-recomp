@@ -5551,3 +5551,125 @@ guard-on run through the *engine's own* fault (the A/B used the injected state);
 the Windows Continue load (menu-only sample this session); the allocation
 snapshot misses (5.5 %); mutex waits, `WaitForMultipleObjectsEx`, Stage 2, 30
 fps.
+
+## 2026-11-28 - Windows oracle: the t=55 s freeze and the flow=0x9 black frame do not reproduce; DInput polls the keyboard and never sees injected keys
+
+Session scope: Windows only (no device attached by design), HEAD `8129b87` verified
+by subject, diagnostics branch untouched, no pcrecomp change. One new host probe
+(`src\host\oracle_probe.c`, off by default) plus a `-ProcessId` mode in
+`scripts\snap_window.ps1`; `src\host\xinput_stub.c` gained the off-by-default
+`KORRA_KEYS` mapping.
+
+### 1. The t=54-55 s freeze - not reproduced, and not a build regression
+
+The recorded instance (`logs\disc_*` were this session; the 2026-11-22 log is
+`korra_host-20261122-002531.log`, `run_m4c.exe`) is real: last `[perf]` line
+`t=136s 1s tick=0/s present=0/s cpu=5% natcalls=0 eip: native:WaitForSingleObject
+x109`; `[perf] STALL tick unchanged for 81s`; every one of the 24 guest threads
+sampled inside ntdll (`ntdll+0x7837C` / `+0x7A1CC` / `+0x7890C`), main thread in
+the same frame, the sink thread still printing every second; **no** `[wprot]`,
+`[wlog]` or `[crash]` line anywhere in the log, no ExitProcess. The last
+per-frame line before it is `t=32.6s f=1646 dt=78.6ms present=2` - i.e. the tick
+was healthy to 54 s and then stopped dead.
+
+Four 90 s runs on this build with `KORRA_PERF=1`:
+
+| run | env | last `[perf]` | froze |
+|---|---|---|---|
+| a | (none) | `t=88.5s f=2942 dt=68.7ms present=2` | no |
+| b | `KORRA_PAD=1` | `t=88.4s f=3130 dt=77.0ms present=2` | no |
+| c | `KORRA_PAD=1 KORRA_PAD_AUTO=1` | `t=88.7s f=2958 dt=51.9ms present=1` | no |
+| d | `KORRA_PAD=1 KORRA_PAD_AUTO=1`, **`run_m4c.exe`** (the 11-22 binary) | `t=89.0s f=3313 dt=53.4ms present=1` | no |
+
+So the freeze is neither PAD_AUTO-dependent on this build nor tied to the binary
+that recorded it - (d) is the same exe that froze on 2026-11-22 and it passed the
+54-55 s point. It is an intermittent, environment-dependent lost wake, and the
+2026-11-22 log remains its only instance. **Closed as a negative, not fixed.**
+The stall ring (`KORRA_STALLPROBE=1`) was built for it but never fired: there was
+nothing to dump. It is the instrument to use on the next occurrence - it prints
+the pending wait's handle, its creating call and its last signaller, which is
+exactly the pair the census cannot name.
+
+### 2. `flow=0x9` black frame - not reproduced (the area renders)
+
+The New Game route from `docs/audio.md` 10.6 as a `KORRA_PAD_SEQ` timeline
+(44 s A, 47 s A, 53 s A, 61.8 s A, 67.8 s DOWN, 69.8 s A, 73.2 s LEFT, 75.2 s A,
+80.2 s A). One run reports the state with `KORRA_TRACE_SCENE=1`:
+
+```
+[scene] flow=0x9 inst=0x1 list=0x00000001 gate=0x1 early=0xDAF6134
+        player=0x00000000 step=0xFFFFFFFF mode=2 pool=34
+```
+
+Note `mode=2` (the 2026-11-22 entry recorded `mode=0`) and `pool=34` (that entry
+said 63 -> 91); the shape is the same.
+
+A second run of the identical timeline, screenshotted at 100 / 112 / 119 s, has
+**mean 76.0 / 76.5 / 76.5** (0-255, 8-pixel stride) - the post-cutscene area
+renders. The 2026-11-22 black frame (mean 0.0, pixel-identical at 134/160/185 s)
+did not reproduce, which is what the "does not reproduce in 2 runs" branch of the
+plan expects. **Closed as a negative / capture artifact.** Not verified: a
+same-run scene line *and* screenshot (the scene probe was displaced by the new
+probe in that run - see below), and any device comparison (no device in this
+session, by design).
+
+### 3. Keyboard automation - the engine polls DirectInput every frame and the injection never reaches it
+
+`KORRA_DINPUTPROBE=1` on the New Game route, whole run:
+
+```
+[dinput] DINPUT8.dll#-1 this=60000000                 DirectInput8Create(hInstance,0x800,...)
+[dinput] DINPUT8.dll#4/#3  this=01712064              CreateDevice, EnumDevices
+[dinput] DINPUT8.dll#11    this=017EE7FC  a1=...      SetDataFormat  (keyboard)
+[dinput] DINPUT8.dll#13    this=017EE7FC  a1=07A30A0A SetCooperativeLevel 0x0A
+[dinput] DINPUT8.dll#11/#13 this=017EE50C             the same for the mouse
+[dinput] DINPUT8.dll#7     this=017EE7FC  ret=0       Acquire -> DI_OK
+[dinput] DINPUT8.dll#9     this=017EE7FC  cb=256      GetDeviceState x3963 in 117 s
+[dinput]   state cb=256 first8=00 00 00 00 00 00 00 00
+[dinput] DINPUT8.dll#9     this=017EE50C  cb=20       mouse x3963
+```
+
+So: two devices, both **acquired**, both polled **every frame** in immediate mode
+(no `#10` GetDeviceData anywhere), and the keyboard state is all zero. A run that
+held Enter and DOWN for 150 ms each (keybd_event, foreground, exclusive
+fullscreen) produced **no** "state became NONZERO" line in 196 s: the injection
+does not reach the DInput state this engine reads, while `GetAsyncKeyState` does
+see it. That is a sharper version of the 2026-11-20 dead-end, and it rules out
+"never acquired" as the cause.
+
+Branch taken: map the keys onto pad 0 in the XInput stub (`KORRA_KEYS=1`, off by
+default), because the pad path is the one this engine provably acts on. **NOT
+PROVEN**: the three-screenshot key-only walk did not run. Screen capture of the
+running game blocks - `CopyFromScreen` on the exclusive-fullscreen flip chain
+never returned at 30-50 fps (three attempts: two full-screen, one per-window,
+one of them in `KORRA_WINDOWED`), while the same call returned fine on the ~1 fps
+flow=0x9 area. What *is* proven is the diagnosis above; the mapping is committed
+as an off-by-default knob and is unvalidated.
+
+### Instrument defect found on the way (and fixed in the probe)
+
+A probe that chains `native32_post_hook` to "the hook that was installed" is
+captured by `draw_probe.c`'s watchdog, which re-installs its own post hook every
+500 ms. The chain then closes into a cycle and the boot dies 0.2 s in with
+`0xC00000FD` at the first instruction of the hook (resolved against
+`build\korra_recomp.map`: `_sp_post`), which reads exactly like a guest stack
+overflow. `perf_probe.c` already avoids this by not chaining; the new probe does
+the same plus a per-thread depth guard. The same watchdog also silently displaces
+*any* other post-hook probe: with `KORRA_DRAWPATH=1` in the chain, `KORRA_TRACE_SCENE`
+produced zero `[scene]` lines and the draw census stayed `frames=0 draws=0`
+while counting 11.6 M bridged calls. Do not combine the scene probe with the draw
+probe on this host until the chain is a list rather than a single pointer.
+
+### Budget actuals
+
+Wall clock ~165 min (target 120, ceiling 180). **12 Windows runs** (budget 10):
+4 freeze discriminators, 3 flow=0x9 runs (one died at 0.2 s on the hook cycle),
+1 boot test of the same, 3 keyboard runs (2 lost to the capture hang, 1 with the
+scene probe displaced), 1 early flow run. **3 builds** (budget 3): baseline+probe,
+probe fix, keys+census. **3 commits**. Selftest 60/60 after the host changes;
+content guard clean.
+
+**Not verified:** the key-only walk and its pad control; a same-run scene line +
+screenshot at flow=0x9; any device comparison; the freeze's wait/signal pair
+(never occurred); whether `KORRA_WINDOWED` actually took effect in the attempt
+(no window-vs-fullscreen check in that run).

@@ -610,3 +610,38 @@ Append only; newest last. Format: date — attempt — outcome — next idea.
   every span dword with `VirtualQuery` (`src/host/pool_watch.c`,
   `KORRA_POOLWATCH=1`); the unbiased sample is 12,500 frees, 4,107 with size
   bit 1, all valid.
+- 2026-11-28 — chaining `native32_post_hook` from a new probe to "the hook that was
+  installed" — **closes the chain into a cycle and kills the boot**. `draw_probe.c`
+  re-installs its own post hook from a 500 ms watchdog, so it later sits *above* a
+  probe whose saved "previous" already points at it: probe -> draw -> new probe ->
+  draw, and the process dies 0.2 s in with `0xC00000FD` at the first instruction of
+  the hook (`build\korra_recomp.map` resolves the fault address to `_sp_post`), which
+  reads like a guest stack overflow and is not one. `perf_probe.c` already never
+  chains; `src\host\oracle_probe.c` does the same and adds a per-thread depth guard.
+  The same watchdog silently *displaces* other probes: with `KORRA_DRAWPATH=1`,
+  `KORRA_TRACE_SCENE=1` printed zero `[scene]` lines and the draw census reported
+  `frames=0 draws=0` while counting 11.6 M bridged calls. Do not run two post-hook
+  probes together on this host until the hook is a list.
+- 2026-11-28 — screenshotting the running oracle with `CopyFromScreen` — **blocks
+  forever at 30-50 fps**. Three attempts (whole screen, window rect, and with
+  `KORRA_WINDOWED=1`) never returned from the call; the same code returned fine in
+  the same session on the ~1 fps `flow=0x9` area. `scripts\snap_window.ps1 -ProcessId`
+  is therefore only usable on a slow/static screen. Any rung that needs proof *as a
+  picture* of live gameplay has no working capture path yet; take the measurement
+  from a probe line instead, or find a readback that does not go through GDI.
+- 2026-11-28 — "the t=54-55 s freeze and the `flow=0x9` black frame are properties
+  of the current build" — **both are negatives**. Four 90 s runs (no pad, `KORRA_PAD`,
+  `KORRA_PAD=1 KORRA_PAD_AUTO=1`, and the *same* `run_m4c.exe` that froze on
+  2026-11-22) all passed 88 s with tick > 0 and presents > 0, so the freeze is not
+  PAD_AUTO-dependent and not a build regression; the New Game route reaches
+  `flow=0x9 inst=0x1 step=0xFFFFFFFF mode=2 pool=34` and renders (screenshot mean
+  76.0-76.5 at 100/112/119 s). Do not re-open either from a note; re-open only from a
+  fresh instance, and dump `KORRA_STALLPROBE=1` for the freeze.
+- 2026-11-28 — "injected keys do nothing because the DInput keyboard is never
+  acquired" — **wrong, and now measured**. The engine creates two DInput devices
+  (keyboard cb=256, mouse cb=20), sets format and cooperative level 0x0A, calls
+  `Acquire` (`DI_OK`) once and then `GetDeviceState` every frame (3,963 calls in
+  117 s, `DI_OK`). The state is all zero, and a 150 ms `keybd_event` hold of Enter or
+  DOWN never makes it non-zero, while `GetAsyncKeyState` sees it. The keyboard
+  automation route is therefore the XInput stub (`KORRA_KEYS=1`), not an acquire fix;
+  a DInput-device shim would be the alternative and is not in `src\host`.
