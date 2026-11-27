@@ -5458,3 +5458,96 @@ that, when bit 1 is set and the link is implausible, logs and clears bit 1
 before the guest unlinks (still no guest patch), plus a watch on `[block-8]`
 from allocation to free to name the writer. **Not verified:** the faulting
 free's own header (not captured), the writer, the rate (1/13), Stage 2, 30 fps.
+
+## 2026-11-27 - Pool writer watch: the header is correct at allocation and at the free entry in 303k device frees, the fault state is proven sufficient, and the candidate guard is proven to skip it
+
+Base: `f9278d0` (the branch point; main's docs tip was `b2bd13e`). All probe
+work on branch `stage1-poolprobe` (`22b4676`, `0789f56`, `07409a9`,
+`19255d3`, pushed),
+**diagnostics only** (no queue, no Stage 2, no guest patch, no
+pcrecomp/DXVK/WSI/audio/save change). Device `<device-serial>` (SM-S921B) confirmed
+with `adb devices` before every run; every launch logged `guest: entry
+0x0077C3B7`, never `guest: STUB`.
+
+**The Windows watch was biased and is fixed.** The earlier oracle used
+`--watch 0x00828D80 --watchspan -8 16`, i.e. the object under ECX; on entry ECX
+is only sometimes the block (the log has `ecx=00000001`, `ecx=C0000002`), so its
+268 readable frees were the callers that happened to leave the block there, and
+the span dump itself died at 86.7 s reading `0xBFFFFFE2` (instrumentation, not
+guest state). `src/host/pool_watch.c` (`KORRA_POOLWATCH=1`, trace build) reads
+`args[1]` = MEM32(esp+8) and guards every span dword with `VirtualQuery`; it
+also snapshots the header at the allocator's own `LeaveCriticalSection`
+(`sub_00829000`, block in EDI). **Unbiased Windows sample:** 12,500 frees across
+two runs (11,500 + 1,000), **4,107 with size bit 1, every one a plausible and -
+on the 1,000-free run, where the strict test was live - the true previous
+physical chunk (105/105)**, 845 zero links all with bit 1 clear, 0 invalid, 0
+size-0. The Continue load was **not** reached in either run (the flow stayed at
+the main menu; `GameData.dat` opened disp=3 then disp=2, the autosave), so the
+last session's 17:30 oracle log remains the only Windows load sample.
+
+**Pool geometry, re-derived from the disassembly** (the earlier `+8` was
+wrong): the next chunk is `chunk + 4 + (size & ~3)` (`sub_008295F0` 0x829608:
+`ecx = edi + 4; ecx += esi`; the free's writes at 0x8298A0/0x8298A5 land at
+`next+4` and `next`). In `[c+4]`, bit 0 = this chunk is free (free sets it,
+allocator clears it at 0x82996F) and bit 1 = the previous physical chunk is
+free (free sets it on the next chunk; allocator clears it at 0x82996A);
+`[c]` is that previous chunk, and `fd`/`bk` are at `+8`/`+0xC`. `bit1 set with
+[c] == 0` is therefore the inconsistent state the crash needs. The first strict
+test used `- 8` and reported `strict_bad` for every bit-1 free - an instrument
+defect, fixed in `19255d3`; the corrected run reads 105/105 `strict_ok`.
+
+**Device allocation-to-free watch (`debug.korra.poolprobe=1`).** Every pool
+block is snapshotted at the allocator's `LeaveCriticalSection`, and each free is
+sampled three times: at its `EnterCriticalSection` (pre-lock), after the pool
+mutex is taken, and at its `LeaveCriticalSection` (post-free); the ring is
+dumped on a crash with all three plus the allocation snapshot. 11 launches (one
+validation plus the 10-run batch, `debug.korra.wait_us=100`, same OCR Continue
+route into gameplay) read **303,104 frees**: `locked_chg=0` in all of them (the
+header is byte-identical before the pool lock and after it is acquired),
+`alloc_bad=0` (no block was ever handed out with bit 1 and a non-chunk link),
+`size_chg=0`, `link_zeroed=0`, `SUSPECT=0`, **0 crashes**; 50,757 of those frees
+had size bit 1, all with a valid link. Allocation snapshots covered 94.5 % of
+frees (the remainder are blocks the allocator's LeaveCS hook did not see; cause
+not identified). With the prior session that is 0 crashes in 10 launches at
+100 us against the 1/13 prior rate - not a contradiction, and not evidence of
+absence.
+
+**The fault state is sufficient, and the guard skips it (controlled A/B).**
+`debug.korra.poolinject=<free #>` forces the crash's header (`[block-8]=0`,
+`[block-4] |= 2`) on that one free and lets the real free path run into it.
+Guard off, injected at free #8000: `[poolprobe] INJECT blk=221EF648 seq=8000`,
+then `[crash] signal 11 ... guest_func=0x00829560 ... esi=0x00000000`, exit
+`reason=2 (SIGNALED) status=11`, on `tid=4109` (the boot loader) - the historical
+crash reproduced deterministically from exactly that header state. Guard on,
+same injection: `[poolprobe] GUARD blk=221EF940 hdr=00000000/0000000E ->
+size=0000000C`, the free skipped the unlink, the run continued **5,312 further
+frees** and roughly three minutes of gameplay (HUD, play gestures, 11,891 `hw
+block` audio lines, the checkpoint autosave) and ended only on our force-stop
+(`reason=10`). The ring's #8000
+record carries `strict_bad=1` (the injected free) while every natural bit-1 free
+in the same run is `strict_ok`.
+
+**A clean guard-on run without injection** (`gw100`, 352 s, 23,552 frees)
+showed no regression: 7,486/7,486 bit-1 links strict-valid, 16,471 `hw block`
+audio lines, the checkpoint autosave, crash buffer empty, and it ended on our
+force-stop (`reason=10`); with no fault state the guard never fired, so this
+run says the check is inert, not that it fixes anything.
+
+**Conclusion.** The header invariant holds at allocation and at the free entry
+in every observed free, and nothing changes while a free waits for the pool
+lock, so the engine's own writer was not observed at this sample size - the
+window is rarer than ~300k frees. The controlled injection proves the fault
+state alone is enough to produce the exact crash and that a host-side check at
+the free entry can prevent it, but a guard that fires only on a state this
+sample never reached is **not** a measured fix for the engine's race. Keep the
+1 ms poll as the shipping workaround; the guard stays a candidate for the owner
+to gate (it writes one bit of guest memory, patches no code, and skips only an
+unlink the invariant already calls invalid). No queue, no Stage 2, no 30 fps
+claim.
+
+**Not verified / open.** The writer itself (no observation in 303,104 frees);
+the real fault rate at 100 us (0/10 this session, 1/13 before); a long
+guard-on run through the *engine's own* fault (the A/B used the injected state);
+the Windows Continue load (menu-only sample this session); the allocation
+snapshot misses (5.5 %); mutex waits, `WaitForMultipleObjectsEx`, Stage 2, 30
+fps.
