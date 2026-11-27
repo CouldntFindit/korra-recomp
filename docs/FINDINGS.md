@@ -5125,8 +5125,8 @@ generated guest code, both `reason=2 (SIGNALED) status=11`:
 
 | run | died | fault | symbolized site | what the registers say |
 |---|---|---|---|---|
-| `s1fix1` | t=106 s, 5 s into the menu -> cutscene load | `signal 11 code=2 addr=0x71d4e75004`, `guest_func=0x00829560`, `esi=0` | `recomp_0054.c:92924` `edx = MEM32(esi + 4)` | the 2nd argument of the engine's block/link helper is **NULL**; the guest heap free list walked into it |
-| `s1camp` | t=79 s, right after the Story submenu's New Game press | `signal 11 code=2 addr=0x728a61ca80`, `guest_func=0x008AF460`, `edx=0xC0FFFA80`, `ecx=0xBD5A0000` | `recomp_0063.c:8934` `MEM32(edx + ecx * 4) = eax` | `ecx` is a **float bit pattern** used as an array index: an uninitialised local |
+| `s1fix1` | t=106 s, 5 s into the menu -> cutscene load | `signal 11 code=2 addr=0x71d4e75004`, `guest_func=0x00829560`, `esi=0` | `recomp_0054.c:92924` `edx = MEM32(esi + 4)` | the 2nd pushed argument of `unlink_00829560` is **NULL** - the link at the freed block's header. Refined by the 2026-11-27 forensics entry below: the path is the *pool* free (`sub_00828D80 -> sub_00829880 -> unlink_00829560`), not a generic heap walk |
+| `s1camp` | t=79 s, right after the Story submenu's New Game press | `signal 11 addr=0x728a61ca80`, `guest_func=0x008AF460`, `edx=0xC0FFFA80`, `ecx=0xBD5A0000` | `recomp_0063.c:8934` `MEM32(edx + ecx * 4) = eax` | `ecx` is an out-of-range index into the caller's `_alloca` scratch array, and it is a **float bit pattern**. Refined below: the shape is a canonical-Huffman code constructor walking its own length table; the register globals lag the faulting instruction, so the values are the pre-call ones |
 
 Both crashes are *inside lifted guest code*, the object table was intact
 (no `obj: entry` line), **no wait failed or timed out** in either run
@@ -5136,16 +5136,17 @@ build (two selftest launches, 40 s each, and `s1fix2`, 336 s) survived; the two
 baseline launches survived. The queue's own semantics are not implicated by any
 counter - what changed is *when* guest threads run.
 
-**Hypothesis (not proven, and the thing to settle first next time):** the 1 ms
+**Hypothesis at the time (now tested, see the forensics entry below):** the 1 ms
 poll was acting as a latency floor. With it gone, the menu/render loop runs 2-3x
 faster while the asset pool and its file reads do not, so the engine consumes
-state the loader has not published yet. The two fault sites are consistent with
-that (a NULL node in the block/link path; an uninitialised index), and the known
-`slot: fn=00000000` dumps in *both* baseline logs show the pool already being
-woken before a slot's job function is filled - the poll's ~1 ms delay was hiding
-it. A second session should prove or disprove this (e.g. run the queue build
-with the play gestures disabled and with the loader pinned, or instrument the
-slot fill vs its semaphore release order) **before** re-attempting the queue.
+state the loader has not published yet. The two fault sites are broadly
+consistent with "speed exposes a pre-existing race", but the supporting evidence
+quoted here was wrong: the `slot: fn=00000000` dumps are **not** pool slots (they
+are the engine's per-thread `CreateThread` parameter blocks, see the correction
+below), so they show nothing about a pool wake. The forensics session reproduced
+crash 1 at 100 us with **no queue code in the tree**, which settles that the
+queue is not the root cause - the 1 ms floor is what hides it. A real fix still
+needs the race named (see the new entry).
 
 ### Reverted, and the reverted build checked
 
@@ -5186,3 +5187,190 @@ slot fill vs its semaphore release order) **before** re-attempting the queue.
   < 10,000 in 336 s"; the probe logged the first 20 only.
 - Mutex waits (still zero measured), other devices, 60 fps, and the Windows
   long-run are untouched.
+
+## 2026-11-27 - Stage 1 forensics: both SIGSEGVs are pre-existing, and the 1 ms poll was hiding them
+
+Base `6eec79e` verified by subject (clean tree, `main == origin/main`), device
+`RFCYA0VVJKH` (SM_S921B) confirmed with `adb devices` before every run. Work
+is on branch `stage1-forensics`: **diagnostics only** - no queue, no guest
+patch, no pcrecomp/DXVK/WSI/audio/save change. Every launch used the real guest
+(`guest: entry 0x0077C3B7`, never `guest: STUB`).
+
+The result in one line: **the 1 ms poll was the mask, not the queue.** Crash 1
+(`0x00829560`) reproduces with **no queue code in the tree** once the poll's
+sleep is shortened to 100 us (1 of 5 launches), and 0 of 5 launches at the
+shipping 1 ms reproduce it. The queue is an accelerator of a pre-existing guest
+race, not its cause.
+
+### The diagnostics that made this answerable
+
+Two commits on `stage1-forensics` (both inert in a normal run):
+
+- `3b3ad5c` - the crash handler prints `guest_tid`, the thread's
+  `CreateThread` parameter block, `[ebp+4]`, eight dwords at `esp`, the
+  eight stdcall argument slots at `[ebp+8]` and `ka_ring_dump("crash")`;
+  every read is range-checked against the image, the 1 GiB heap window and the
+  stack region first, so a bad read cannot kill the tombstone.
+- `7e00bb0` - `debug.korra.wait_us` (default 1000) replaces the poll's 1 ms
+  sleep in `k_WaitForSingleObject`/`k_WaitForMultipleObjectsEx` with a
+  microsecond sleep (0 = `sched_yield`), with the same full machine-lock
+  unwind; `k_Sleep` stays in ms. The slot probe now requires `MEM32(param)`
+  to be a heap pointer, i.e. a real pool slot.
+
+The device `.so` is unstripped and was built in this session, so a crash
+`pc`/`lr` resolves exactly (`llvm-addr2line` over
+`build/intermediates/cxx/Debug/1z725m3q/obj/arm64-v8a/libkorra.so`). That is
+the difference between "symbolized by eye" and "the line the fault is on".
+
+### Crash 1, named end to end
+
+Reproduced as `s1w100_4`: `wait_us=100`, t=294 s (guest perf clock),
+mid-play in the first area, `reason=2 status=11`:
+
+`[crash] signal 11 code=2 addr=0x71d5473004 guest_func=0x00829560 esp=0xC0EFFE98 ebp=0xC0EFFEA4 eax=0 ecx=0x24 edx=0x10000 ebx=0x2241B9E0 esi=0 edi=0x3FC90FD7`
+
+| item | evidence |
+|---|---|
+| fault instruction | `pc = libkorra+0x9728570` -> `sub_00829560`, `recomp_0054.c:92924` = `edx = MEM32(esi + 0x4)` |
+| fault address | `addr = libkorra+4` (`libkorra base = pc - off = 0x72DD489000`), i.e. `[NULL+4]` |
+| function | `sub_00829560` = the engine allocator's **unlink**: bin index from `[node+4] & ~3` (`cmp 0x80` / `bsr` / `shr`), then `[node+0xC]->+8` / `[node+8]->+0xC` list surgery and a treemap store at `[pool + idx*4 + 0x74]` |
+| caller | `lr = libkorra+0x9722760` = the return from the first `bl sub_00829560@plt` at guest `0x008298B5`, inside `sub_00829880` (exactly one caller: `0x00828DB5` in `sub_00828D80`) |
+| caller role | `sub_00828D80` = **pool free**: `EnterCriticalSection([0xCA1EF0] + arg0*0x48 + 0x20)`, size := `sub_008297E0(block)`, `[pool+0x40] -= size+4`, `free(pool->region [edi+0x38], block)`, `LeaveCriticalSection` |
+| free role | `sub_00829880`: `block==0 -> return`; `chunk = block-8`; `size = [chunk+4]`; if `size & 2` then `node = [chunk]` and `unlink(pool, node)` - **with no NULL check on node** (the original bytes have none: `008298B1 mov esi,[esi] / 008298B3 push esi / 008298B5 call`) |
+| bad value | `node = 0`: the freed block's header dword at `+0` is NULL while its size word has bit 1 set. The stack dump confirms it independently of the register file: `[ebp+0xC] = 0` at the callee |
+| thread | `guest_tid=4109`, `param=0x221212BC`, created at boot as `thread: create va=0087EEE0` (the game's loader thread; its proc calls an import through `[0x8FD0B8]`, stores `[0xCA291C]`, then loops). `esp=0xC0EFFE98` = the 15th 1 MiB guest-stack tile (`0xC0E00000..0xC0F00000`), ~0x1A8 below its top |
+| ring | `EnterCriticalSection`/`LeaveCriticalSection` at `0x00828D80` (plus `0x00767F50`, `0x00764BD0`) - the pool-free path, as the caller says |
+| expected invariant | a chunk whose size word carries bit 1 must have a non-NULL `[chunk]` link; the engine hands `free` a block whose header link is 0 |
+
+Nothing in the wait layer is implicated: no `obj: entry`, no `notobj`, no
+`h=0` wait, crash buffer 0 B, and this build has no queue at all.
+
+### Crash 2, re-read
+
+`s1camp` (queue build, t=79 s, the moment the Story submenu's selection moved
+to New Game) faulted at `0x008AF460`, `recomp_0063.c:8934`
+`MEM32(edx + ecx*4) = eax`. Read from the bytes, not from the dump:
+
+- `sub_008AF460` is a **canonical-Huffman code constructor**, not a string
+  formatter: `arg0` is a byte array of code lengths (read until 0),
+  `arg1` is the symbol count (`< 2` returns 0), `arg2` is the output array
+  of 8-byte `{code, len}` records, and the function keeps a 33-entry
+  `next_code[]`/count table in its own frame (`[ebp-0x98 ..]`, loops bounded
+  by `0x21`), computes `next_code[len] = (next_code[len-1]+count[len-1])<<1`
+  and writes each code OR'ed with `0x80000000`; `sub_008AF443` is its 16-bit
+  sibling (`or ax,0x8000`).
+- caller `sub_008AF0F0` (xrefs `0x008AFFC1`, `0x008B018E`): checks
+  `[edi+0x14]==4`, then calls `sub_008AF460` twice - once with a heap
+  scratch from `[ebx+4]`, then with an `_alloca(8*[edi+8]-8)` **stack**
+  buffer (`mov esi,esp`) passed as `arg2`. The crash's `[ebp+0x10]`
+  (`0xC0FFFA80`) is exactly that `esp`, so the second call is the one that
+  died.
+- the index is `ecx = [ebp-0xC] + 2*esi` with `esi` itself loaded from
+  `arg2[2*esi+bit]`. Every read follows a write of the same slot *provided*
+  the code-length byte is in 0..32; a byte outside that range reads past the
+  33-entry local table into the function's own locals/argument slots, and the
+  walk then indexes the caller's alloca buffer out of range - which is where a
+  recycled stack's leftovers (floats: `0xBD5A0000`, `0x5EAD0000`) become an
+  array index.
+
+**The register dump cannot be read as the faulting operands.** The generated
+code keeps values in host registers between sync points, so the file lags the
+instruction: in `s1camp` `g_ebx` holds a float the function never had, and in
+`s1w100_4` the pushed `edi` is `0x3FC90FD7` (1.5707964f = pi/2). What is
+exact is the host `pc` (symbol + line) and the fault address; the stack's
+*argument slots* are the values the callee actually reads.
+
+### The control and the sweep
+
+Same route (`android_route_drive.ps1`, cap 30, `int=100` in every sample),
+same device, same build (only the `wait_us` property differs between the two
+groups; one launch per row, ~300-390 s wall, `perf t` = guest probe clock).
+
+| run | wait_us | guest `[crash]` | site | perf t | frames |
+|---|---|---|---|---|---|
+| s1c1 | 1000 | 0 | - | 294 | 19,261 |
+| s1c2 | 1000 | 0 | - | 326 | 20,945 |
+| s1c3 | 1000 | 0 | - (one 64 s frame, a separate stall) | 328 | 23,165 |
+| s1c4 | 1000 | 0 | - | 257 | 21,608 |
+| s1c5 | 1000 | 0 | - | 293 | 18,989 |
+| s1w100_1 | 100 | 0 | - | 282 | 18,649 |
+| s1w100_2 | 100 | 0 | - | 335 | 21,439 |
+| s1w100_3 | 100 | 0 | - | 365 | 23,270 |
+| **s1w100_4** | **100** | **1** | **0x00829560** | 294 | 19,320 |
+| s1w100_5 | 100 | 0 | - | 285 | 18,326 |
+
+With the previous session that makes **0 crashes in 9 launches at 1 ms** and
+**1 crash in 5 launches at 100 us**, and the 100 us crash is the *same site* as
+`s1fix1` in the queue build. The 0 us set was not run: 100 us was already not
+clean, and the plan made it conditional on 100 being clean.
+
+That the knob acted is visible in the probe's sleep bucket (mean over
+`perf t=150..280`): 57.2 / 54.8 / 46.0 / 60.8 ms at 1000 us against 27.0 /
+30.8 / 24.2 / 25.3 / 35.3 ms at 100 us - the groups do not overlap. `dt` does
+not separate (102-199 ms in both groups), so **no performance claim** is made
+here; the frame probe's sleep histogram is ms-keyed and therefore cannot show a
+sub-millisecond quantum.
+
+### The `slot:` dumps, corrected
+
+The Stage 1 entry's sentence "the `slot: fn=00000000` dumps ... show the pool
+already being woken before a slot's job function is filled" was **wrong and is
+withdrawn**. The probe read `ka_thread_self_param()`, the engine's per-thread
+`CreateThread` parameter block, whenever that block sat in the heap. It does:
+`param = 0x34627140 + 0x1400*n` is exactly the `thread: create ...
+param=` sequence (0x34627140, 0x34628540, 0x34629940, ...), and
+`MEM32(param) = 0x1000` is not a heap object. So `cap`/`post`/`done`/
+`fn`/`arg` were fields of a different struct, `fn=0` was that block's
+`+0x10`, and the identical 400 lines (the cap) appear in the *baseline* runs
+too. With the corrected guard (`MEM32(param)` must be a heap pointer) the
+count is **0 in the control run**: no pool slot was ever dumped, before or after
+the queue, so those dumps say nothing about publish order.
+
+### Conclusion
+
+- **The queue is not causal.** Crash 1 reproduces without a line of queue code
+  at a shorter poll quantum, and the two queue-build crashes sit on
+  pre-existing paths (pool free-list unlink; a code-length table walk) whose
+  inputs are guest data, not wait results. Every queue counter was clean
+  (`timeouts=0 fail=0 spur=0 peak=1`), the object table was intact, and the
+  crash buffer was empty.
+- **The 1 ms poll is the mask.** It is a 1 ms latency floor on every wake; remove
+  it (queue *or* `wait_us`) and a pre-existing guest race gets a much wider
+  window. The mechanism is not yet named: the fault is a NULL free-list link in
+  the pool, and the thread is the boot-created loader `0x0087EEE0`.
+- **A same-class pointer/float collision appears without the queue:** a
+  backgrounded launch of the diagnostics build (not a route sample) died at
+  `0x007E63C0` dereferencing `[arg0+4] -> [0+0x1C]` with
+  `arg0 = 0x41EFEFD2` (30.0f) read from an object field. 1 of 1 in that
+  invalid launch, and it did not recur in the 10 route runs. Reported as an
+  observation, not a result.
+
+### Recommendation
+
+Do not retry the queue and do not start Stage 2 yet. The next block is to name
+the pool race with the tool that now exists: keep `wait_us=100` (cheap
+accelerator, 1/5), and add **one** probe at the pool free entry
+(`0x00828D80`) that logs `arg0` (pool index), the block, `[block-8]`,
+`[block-4]` and the pool's `[+0x38]`/`[+0x40]` before the free, plus the
+same block at the *next* allocation of that size. A block whose header link is 0
+at free time but non-zero at allocation time is a double free or a
+use-after-free; a block that is 0 at both is an uninitialised header. That
+distinction names the layer (guest engine vs host) without touching the queue.
+Then run the same load on the Windows oracle at `KORRA_WATCH` around
+`0x00828D80` to see whether the guest produces the same header there.
+
+### Not verified / open
+
+- The race's mechanism is **not named**; only the site, the caller chain, the
+  thread and the masked-vs-unmasked behaviour are.
+- 1/5 at 100 us against 0/9 at 1 ms is a small sample (Fisher exact p ~ 0.36);
+  the *rate* is not established. What is established is that the crash does not
+  need the queue.
+- Crash 2 was not reproduced in this session (no queue build, and the 0 us set
+  was not run), so its index's origin is derived from the disassembly, not from
+  a fresh fault with the new probes.
+- The `wait_us` sweep changes *finite* timeout durations (one poll counts as
+  1 ms in the state machine); every wait on this route is INFINITE, so no
+  measured answer changed, but the knob is not a shipping candidate.
+- The 30 fps target is untouched by this session; the Windows oracle comparison
+  and the crisper pool probe are the next step.

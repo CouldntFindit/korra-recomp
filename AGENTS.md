@@ -587,3 +587,17 @@ Append only; newest last. Format: date — attempt — outcome — next idea.
   queue - so settle that before retrying. The 72.8 ms the render thread then
   spends parked on its workers is the machine lock's cost, i.e. Stage 2's, not a
   wake problem.
+- 2026-11-27 - "The queue's 2 SIGSEGVs are a loader race that the 1 ms poll hid,
+  and the `slot: fn=00000000` dumps prove the pool was woken early" - **the
+  second half was an artifact of the probe**. The `slot:` lines read
+  `ka_thread_self_param()`, the per-thread `CreateThread` parameter block
+  (`0x34627140 + 0x1400*n`, `[+0] = 0x1000`), not the pool slot; they appear
+  in the *baseline* logs too, and with a guard that requires `MEM32(param)` to
+  be a heap pointer the count is 0. Reading them as publish-order evidence cost a
+  wrong hypothesis. The first half survives in a sharper form: crash 1
+  (`0x00829560`, pool-free unlink with a NULL header link) reproduces with
+  **no queue code at all** by setting `debug.korra.wait_us=100` (1 of 5
+  launches) while 1 ms is 0 of 9, so the 1 ms poll - not the queue - is what
+  hides it. Next: one probe at the pool free entry (`0x00828D80`) that logs
+  the block header before the free and at the next allocation, and the same
+  load on the Windows oracle.
