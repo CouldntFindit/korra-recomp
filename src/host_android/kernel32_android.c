@@ -14,11 +14,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/system_properties.h>
 #include <time.h>
 #include <unwind.h>
 #include <unistd.h>
@@ -87,11 +89,18 @@ static uint32_t sem_note(uint32_t tok, uint32_t init, uint32_t max) {
 }
 
 /* The worker block, read at wake. `mgr` is the pool object at [0] and its byte
- * at +8 carries the shutdown bits sub_007414E0 tests. */
-static void slot_dump(uint32_t h, uint32_t param) {
-    uint32_t mgr, flags = 0;
-    if (param < KA_HEAP_BASE || param >= KA_HEAP_END) return;
+ * at +8 carries the shutdown bits sub_007414E0 tests. A block that names a real
+ * heap manager is a pool slot; every other block that happens to sit in the heap
+ * is something else (the engine's per-thread CreateThread parameter blocks are
+ * exactly that: 0x34627140 + 0x1400*n, with 0x1000 at +0). */
+static int slot_is_pool(uint32_t param) {
+    uint32_t mgr;
+    if (param < KA_HEAP_BASE || param >= KA_HEAP_END) return 0;
     mgr = MEM32(param);
+    return mgr >= KA_HEAP_BASE && mgr < KA_HEAP_END;
+}
+static void slot_dump(uint32_t h, uint32_t param) {
+    uint32_t mgr = MEM32(param), flags = 0;
     if (mgr >= KA_HEAP_BASE && mgr < KA_HEAP_END) flags = MEM8(mgr + 8);
     ka_log("slot: h=%08X param=%08X cap=%u post=%08X done=%08X fn=%08X arg=%08X"
            " w18=%08X w1c=%08X mgr=%08X mgrflags=%02X",
@@ -161,6 +170,48 @@ static void guest_sleep_ms(uint32_t ms) {
     ka_fp_end_sleep(fp_t0, ms);
     while (depth-- > 0) mach_enter();
 }
+
+/* debug.korra.wait_us - the quantum of the engine wait's poll.
+ *
+ * Diagnostic only (Stage 1 forensics, 2026-11-27): it changes how long a poll
+ * sleeps, never what a wait answers. 1000 (the default, and the value when the
+ * property is absent) is byte-for-byte the shipping 1 ms poll; 100 asks whether
+ * the 1 ms floor is what hides the two guest faults; 0 hands the machine over
+ * with sched_yield() instead of sleeping at all. k_Sleep stays in milliseconds.
+ *
+ * Caveat: ka_obj_wait_ex() counts one poll as one millisecond, so a *finite*
+ * timeout would now expire wait_us/1000 times sooner. Every wait measured on
+ * this route is INFINITE, so no measured answer changes.
+ *
+ * The machine-lock unwind is the same one guest_sleep_ms() performs. */
+#define KA_WAIT_US_DEFAULT 1000u
+static uint32_t wait_us(void) {
+    static uint32_t cached;
+    static int have;
+    if (!have) {
+        char pv[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.korra.wait_us", pv);
+        cached = pv[0] ? (uint32_t)strtoul(pv, NULL, 10) : KA_WAIT_US_DEFAULT;
+        have = 1;
+    }
+    return cached;
+}
+static void guest_sleep_us(uint32_t us) {
+    extern int ka_spine_depth(void);
+    int depth = 0;
+    uint64_t fp_t0 = ka_fp_on() ? ka_fp_begin() : 0;
+    struct timespec ts;
+    ts.tv_sec = us / 1000000u;
+    ts.tv_nsec = (long)(us % 1000000u) * 1000L;
+    while (ka_spine_depth() > 0) { mach_leave(); depth++; }
+    if (us) nanosleep(&ts, NULL); else sched_yield();
+    ka_fp_end_sleep(fp_t0, us ? (us + 999u) / 1000u : 0);
+    while (depth-- > 0) mach_enter();
+}
+/* The kwait callback: one poll quantum. The state machine passes the 1 ms it
+ * wants slept; the knob replaces that with wait_us (or a yield), which is the
+ * whole point of the sweep. */
+static void wait_poll_sleep(uint32_t ms) { (void)ms; guest_sleep_us(wait_us()); }
 
 /* --------------------------------------------------------------- the shims */
 static void k_CloseHandle(void) {
@@ -1106,25 +1157,19 @@ static void k_WaitForSingleObject(void) {
          * machine re-resolves the handle under g_obj_lock every poll and
          * consumes the signal there, so a window that vanishes mid-wait is
          * answered as a timeout, not consumed through a stale pointer. */
-        wr = ka_obj_wait_ex(h, ms, guest_sleep_ms, wait_poll_probe, &pc);
+        wr = ka_obj_wait_ex(h, ms, wait_poll_sleep, wait_poll_probe, &pc);
         if (wr.result != KA_WAIT_OBJECT_0) RET(258u, 2);   /* WAIT_TIMEOUT */
         if (wr.polls && wt0) ka_fp_wait_done(wt0);
-        /* What the slot held when its worker was let through. This cannot ride
-         * on the 40-wake budget above: the file pool's early wakes spend it long
-         * before the asset pool's critical one. Dump when the block names a
-         * semaphore this host created, and always when its job function is
-         * zero - that is the device bug itself. */
+        /* What the slot held when its worker was let through. Only a block whose
+         * first dword names a heap object is a pool slot: the engine's
+         * per-thread CreateThread parameter blocks also live in the heap
+         * (0x1000 at +0), and reading those produced 400 identical
+         * `fn=00000000` lines in the baseline as well. */
         {
             uint32_t sp = ka_thread_self_param();
-            if (sp >= KA_HEAP_BASE && sp < KA_HEAP_END) {
-                uint32_t post = MEM32(sp + 8), fn = MEM32(sp + 0x10);
-                int named = (fn == 0);
-                for (int i = 0; !named && i < g_sem_n; i++)
-                    if (g_sem_rec[i].h == post) named = 1;
-                if (named) {
-                    static int n3;
-                    if (n3 < 400) { n3++; slot_dump(h, sp); }
-                }
+            if (slot_is_pool(sp)) {
+                static int n3;
+                if (n3 < 400) { n3++; slot_dump(h, sp); }
             }
         }
         RET(0, 2);
@@ -1153,7 +1198,7 @@ static void k_WaitForMultipleObjectsEx(void) {
     ka_wait_result wr;
     if (count > 64) RET(0xFFFFFFFFu, 5);   /* WAIT_FAILED */
     for (i = 0; i < count; i++) hs[i] = MEM32(arr + i * 4);
-    wr = ka_obj_wait_multi(hs, count, waitAll != 0, ms, guest_sleep_ms);
+    wr = ka_obj_wait_multi(hs, count, waitAll != 0, ms, wait_poll_sleep);
     RET(wr.result, 5);
 }
 static void k_ResumeThread(void) {
