@@ -314,10 +314,12 @@ void ka_pool_probe_free(uint32_t idx, uint32_t block) {
     r.bin = bin_of(r.size);
     r.prevok = plausible_prev(block, r.h_prev) ? 1 : 0;
     /* The allocator's geometry gives a stronger test: the linked chunk's size
-     * word must make it end exactly at this chunk (next = chunk + 8 + size).
+     * word must make it end exactly at this chunk. The splitter's arithmetic
+     * at 0x829608 gives next = chunk + 4 + requested, and the free's writes at
+     * 0x8298A0/0x8298A5 land at next+4 and next.
      * Only read it after the link is a plausible (readable) heap address. */
     r.prevstrict = (r.prevok &&
-        (MEM32(r.h_prev + 4u) & ~3u) == ((block - 8u) - r.h_prev - 8u)) ? 1 : 0;
+        (MEM32(r.h_prev + 4u) & ~3u) == ((block - 8u) - r.h_prev - 4u)) ? 1 : 0;
     if ((r.h_size & 2u)) {
         if (r.prevstrict) s_strict_ok++; else s_strict_bad++;
     } else {

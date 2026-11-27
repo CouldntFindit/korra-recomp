@@ -98,13 +98,15 @@ static int plausible_prev(uint32_t block, uint32_t p) {
 }
 
 /* The stronger test the allocator's geometry gives: the linked chunk's own
- * size word must make it end exactly at this chunk (next = chunk + 8 + size).
+ * size word must make it end exactly at this chunk. The splitter's own
+ * arithmetic at 0x829608 gives next = chunk + 4 + requested, and the free's
+ * writes at 0x8298A0/0x8298A5 land at next+4 and next.
  * A link that passes this IS the previous physical chunk, not merely an
  * address that happens to point somewhere valid. Only read after the range is
  * known readable. */
 static int strict_prev(uint32_t block, uint32_t p) {
     if (!plausible_prev(block, p)) return 0;
-    return (MEM32(p + 4) & ~3u) == ((block - 8u) - p - 8u);
+    return (MEM32(p + 4) & ~3u) == ((block - 8u) - p - 4u);
 }
 
 static void span_line(const char *tag, uint32_t base, int row) {
