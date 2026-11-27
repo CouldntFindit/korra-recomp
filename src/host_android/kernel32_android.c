@@ -469,9 +469,23 @@ static void k_EnterCriticalSection(void) {
             if (cs_t0) ka_fp_cs_waited(ka_fp_now() - cs_t0);
         }
     }
+    /* With the lock held, the pre-lock free record can be re-read: a change
+     * now means another thread wrote the header while this one waited. */
+    if (g_cur_func == 0x00828D80u && ka_pool_probe_on())
+        ka_pool_probe_locked();
     RETV(1);
 }
 static void k_LeaveCriticalSection(void) {
+    /* The allocator and the free both release the pool lock as their last
+     * action, with the block still in EDI (alloc) or in its own frame (free),
+     * so this is the host-visible return point of sub_00829000 and the
+     * post-free state of sub_00828D80. */
+    if (ka_pool_probe_on()) {
+        if (g_cur_func == 0x00829000u)
+            ka_pool_probe_alloc(g_edi);
+        else if (g_cur_func == 0x00828D80u)
+            ka_pool_probe_postfree();
+    }
     pthread_mutex_t *m = cs_of(A32(0));
     if (m) pthread_mutex_unlock(m);
     RETV(1);

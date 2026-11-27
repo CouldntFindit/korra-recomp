@@ -48,6 +48,9 @@ void      ka_pool_dump(const char *tag);
 /* debug.korra.poolprobe=1: per-free block/header state at the pool free. */
 int       ka_pool_probe_on(void);
 void      ka_pool_probe_free(uint32_t pool_index, uint32_t block);
+void      ka_pool_probe_alloc(uint32_t block);   /* at sub_00829000's LeaveCS */
+void      ka_pool_probe_locked(void);            /* after the pool lock */
+void      ka_pool_probe_postfree(void);          /* at the free's LeaveCS */
 void      ka_pool_probe_dump(const char *why);
 void      ka_ring_dump(const char *why);
 void      ka_obj_check(void);
