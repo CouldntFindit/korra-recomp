@@ -10,8 +10,9 @@ Run by the hook in tools/install_hooks.ps1 (or directly):
 Rules: a tracked path is rejected when it is a game binary/asset, lives in a
 generated-output tree, or is larger than MAX_BYTES (default 20 MiB) anywhere
 outside docs/ images. File *contents* are rejected when they carry an absolute
-user-profile path, a cloud-sync folder name, or the localized Documents folder,
-so machine-specific locations cannot reach the public repository.
+user-profile path, a cloud-sync folder name, the localized Documents folder, or
+a device serial number, so machine-specific locations and hardware IDs cannot
+reach the public repository.
 """
 from __future__ import annotations
 
@@ -85,6 +86,8 @@ LEAK_PATTERNS = (
      "cloud-sync folder name"),
     (re.compile("Bel" + "geler", re.I),
      "localized Documents folder name"),
+    (re.compile(r"\bR[A-Z0-9]{9,10}\b"),
+     "device serial (Samsung R... form)"),
 )
 
 # Files that carry the patterns above on purpose (this guard and its selftest).

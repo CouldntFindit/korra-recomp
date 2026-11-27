@@ -4644,7 +4644,7 @@ count), not to filter anything.
 ## 2026-11-26 (backgrounding/lifecycle session) - HOME no longer kills the process: the bridge now answers D3D9's device-lost contract and the WSI keeps one app window
 
 Base HEAD `f0f0a29` (the expected `64f1522` is in its history, one docs-wording
-commit above it; tree clean, `main == origin/main`). Phone `RFCYA0VVJKH`,
+commit above it; tree clean, `main == origin/main`). Phone `<device-serial>`,
 `adb devices` at the start and before each run. Commits `38011aa` (probes +
 driver), `1f732ed` (exception support in the guest build), `06ea6d0` (the fix),
 then this docs commit.
@@ -5191,7 +5191,7 @@ needs the race named (see the new entry).
 ## 2026-11-27 - Stage 1 forensics: both SIGSEGVs are pre-existing, and the 1 ms poll was hiding them
 
 Base `6eec79e` verified by subject (clean tree, `main == origin/main`), device
-`RFCYA0VVJKH` (SM_S921B) confirmed with `adb devices` before every run. Work
+`<device-serial>` (SM_S921B) confirmed with `adb devices` before every run. Work
 is on branch `stage1-forensics`: **diagnostics only** - no queue, no guest
 patch, no pcrecomp/DXVK/WSI/audio/save change. Every launch used the real guest
 (`guest: entry 0x0077C3B7`, never `guest: STUB`).

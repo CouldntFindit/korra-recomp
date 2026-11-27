@@ -16,6 +16,7 @@ $winFwd = "C:/" + "Users" + "/someone/game"
 $cloud = "One" + "Drive"
 $loc = "Bel" + "geler"
 $posix = "/" + "home" + "/someone/game"
+$serial = "R" + "ABC12" + "3456"
 
 $cases = @(
     @{ name = "win-profile.md"; text = $win; reject = $true },
@@ -23,6 +24,7 @@ $cases = @(
     @{ name = "cloud-sync.md"; text = ("lives in " + $cloud + " sync"); reject = $true },
     @{ name = "documents.md"; text = ("the " + $loc + $bs + "Korra folder"); reject = $true },
     @{ name = "home.md"; text = $posix; reject = $true },
+    @{ name = "device-serial.md"; text = ("phone " + $serial + " attached"); reject = $true },
     @{ name = "clean.md"; text = '<workspace>\android-sdk %LOCALAPPDATA%\Python $env:LOCALAPPDATA'; reject = $false }
 )
 
