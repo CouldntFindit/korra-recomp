@@ -45,6 +45,10 @@ void      ka_guest_free(uint32_t va);
 /* Dumps the engine memory manager, its allocator and the fallback allocator
  * (free lists, used list); see memory_android.c. Diagnostics only. */
 void      ka_pool_dump(const char *tag);
+/* debug.korra.poolprobe=1: per-free block/header state at the pool free. */
+int       ka_pool_probe_on(void);
+void      ka_pool_probe_free(uint32_t pool_index, uint32_t block);
+void      ka_pool_probe_dump(const char *why);
 void      ka_ring_dump(const char *why);
 void      ka_obj_check(void);
 uint32_t  ka_guest_strdup(const char *s);

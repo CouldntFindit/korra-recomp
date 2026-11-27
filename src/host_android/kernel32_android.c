@@ -435,7 +435,14 @@ static pthread_mutex_t *cs_of(uint32_t p) {
 }
 static void k_EnterCriticalSection(void) {
     uint32_t arg = A32(0);
-    pthread_mutex_t *m = cs_of(arg);
+    pthread_mutex_t *m;
+    /* The engine's pool free (sub_00828D80) is the only interesting entry:
+     * arg0 is the pool index at [ebp+8], arg1 the block at [ebp+0xC]. The
+     * guest ebp is still the function's frame here, so the probe reads the
+     * block before the free touches it. Off unless debug.korra.poolprobe=1. */
+    if (g_cur_func == 0x00828D80u)
+        ka_pool_probe_free(MEM32(g_ebp + 8u), MEM32(g_ebp + 0xCu));
+    m = cs_of(arg);
     if (m) {
         /* The uncontended case must not touch the machine lock. The contended
          * case MUST release it: the guest thread that owns this critical

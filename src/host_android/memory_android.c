@@ -523,6 +523,7 @@ static void ka_crash_handler(int sig, siginfo_t *si, void *uc) {
      * how a shim that clobbered a register or popped the wrong arity shows up
      * next to the fault. */
     ka_ring_dump("crash");
+    ka_pool_probe_dump("crash");
     /* `adb shell setprop debug.korra.watch E4D064`: dump that guest address (and
      * the two pointers in front of it) at fault time. Half of a crash is the
      * state of the object the faulting code was reading; the register dump only
