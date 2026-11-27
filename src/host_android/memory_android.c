@@ -436,6 +436,19 @@ void ka_log(const char *fmt, ...) {
  * even if libc's stdio state is the thing that is broken. */
 static uintptr_t g_crash_base;  /* libkorra.so load base, for offline resolution */
 
+/* A second fault inside the handler takes the tombstone with it, so every
+ * address the crash dump dereferences goes through this first. Only the three
+ * ranges the host has committed count: the PE image, the 1 GiB heap window
+ * (mprotect'ed RW at init, pages backed on touch) and the stack region. */
+static int ka_crash_readable(uint32_t va, uint32_t bytes) {
+    uint32_t end = va + bytes;
+    if (!va || end < va) return 0;
+    if (va >= KA_IMAGE_BASE && end <= KA_IMAGE_BASE + ka_pe_span()) return 1;
+    if (va >= KA_HEAP_BASE && end <= KA_HEAP_BASE + HEAP_SIZE) return 1;
+    if (va >= 0xC0000000u && end <= 0xD0000000u) return 1;
+    return 0;
+}
+
 static void ka_crash_handler(int sig, siginfo_t *si, void *uc) {
     char buf[400];
     int n;
@@ -471,6 +484,45 @@ static void ka_crash_handler(int sig, siginfo_t *si, void *uc) {
         ssize_t w = write(2, buf, (size_t)n);
         (void)w;
     }
+    /* Who faulted and where it will return to. The register file is shared by
+     * every guest thread and the generated code keeps values in host registers
+     * between sync points, so a register can lag the faulting instruction by a
+     * few of them; the guest return address at [ebp+4] and the argument slots
+     * at [ebp+8..] are the values the faulting function actually sees. */
+    {
+        uint32_t tid = ka_guest_tid(), param = ka_thread_self_param();
+        uint32_t ret = ka_crash_readable(g_ebp + 4, 4) ? MEM32(g_ebp + 4) : 0;
+        n = snprintf(buf, sizeof buf, "[crash] guest_tid=%u param=%08X ret=%08X\n",
+                     tid, param, ret);
+        if (n > 0) { ssize_t w = write(2, buf, (size_t)n); (void)w; }
+    }
+    /* Eight dwords at esp (the live stack top) and eight at [ebp+8] (the
+     * stdcall argument slots, which is what named the two Stage 1 faults). */
+    {
+        static const char *const tags[2] = { "stack", "args" };
+        uint32_t bases[2];
+        bases[0] = g_esp;
+        bases[1] = g_ebp + 8;
+        for (int i = 0; i < 2; i++) {
+            if (!ka_crash_readable(bases[i], 8 * 4)) {
+                n = snprintf(buf, sizeof buf, "[crash] %s %08X: <unreadable>\n",
+                             tags[i], bases[i]);
+                if (n > 0) { ssize_t w = write(2, buf, (size_t)n); (void)w; }
+                continue;
+            }
+            n = snprintf(buf, sizeof buf,
+                         "[crash] %s %08X: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+                         tags[i], bases[i],
+                         MEM32(bases[i]), MEM32(bases[i] + 4), MEM32(bases[i] + 8),
+                         MEM32(bases[i] + 12), MEM32(bases[i] + 16), MEM32(bases[i] + 20),
+                         MEM32(bases[i] + 24), MEM32(bases[i] + 28));
+            if (n > 0) { ssize_t w = write(2, buf, (size_t)n); (void)w; }
+        }
+    }
+    /* The import ring names the last native calls this thread made, which is
+     * how a shim that clobbered a register or popped the wrong arity shows up
+     * next to the fault. */
+    ka_ring_dump("crash");
     /* `adb shell setprop debug.korra.watch E4D064`: dump that guest address (and
      * the two pointers in front of it) at fault time. Half of a crash is the
      * state of the object the faulting code was reading; the register dump only
