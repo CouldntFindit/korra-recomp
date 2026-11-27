@@ -5379,3 +5379,82 @@ Then run the same load on the Windows oracle at `KORRA_WATCH` around
   measured answer changed, but the knob is not a shipping candidate.
 - The 30 fps target is untouched by this session; the Windows oracle comparison
   and the crisper pool probe are the next step.
+
+## 2026-11-27 - Pool-free probe: the header invariant holds at every observed free, so the crash is a rare timing state, not a routine double free
+
+Base HEAD `f9278d0` (privacy `2057f2e` plus the record correction) verified by
+subject; the probe is branch `stage1-poolprobe`, commit `8eed187`, **diagnostics
+only** (no queue, no guest patch, no pcrecomp/DXVK/WSI/audio/save change).
+Device `<device-serial>` confirmed with `adb devices` before every run; every
+launch used the real guest (`guest: entry 0x0077C3B7`, never `guest: STUB`).
+
+**The probe** (`src/host_android/pool_probe_android.c`, behind
+`debug.korra.poolprobe=1`): at the pool free's own `EnterCriticalSection`
+(`g_cur_func == 0x00828D80`) it reads `[ebp+8]` (pool index), `[ebp+0xC]`
+(block), `[block-8]`, `[block-4]`, `[block]`, the record
+`[0xCA1EF0] + idx*0x48`, `[pool+0x38]` (region) and `[pool+0x40]` (free
+bytes); it derives the unlink's bin from `([block-4] & ~3)` and walks
+`[region+0x74+bin*4]` (fd at +8, region as sentinel) to test whether the chunk
+is already on its free list. The last 256 frees are kept in a ring and dumped
+by the crash handler. Host-only, no relift.
+
+**One field is only valid when it is marked valid.** The first probe version also
+dereferenced the header link `[block-8]` to read the previous chunk's size. In
+`sub_00829880` that dword is the previous physical chunk **only when bit 1 of
+the size word is set**; otherwise it is don't-care. On a free with bit 1 clear
+the probe followed `0x20000002` and faulted at guest `0x20000006` (heap base+6,
+an uncommitted page). That was the probe, not the guest. Fixed: the link is
+recorded as data and only checked for plausibility (4-aligned, heap, below the
+chunk), never dereferenced.
+
+**Header state, 100 us against 1 ms** (same route, cap 30, `int=100`, one launch
+per row; `frees` = `[poolprobe]` lines; `bit1_bad` = size bit 1 set with an
+implausible link; `self` = the chunk was already on its bin):
+
+| run | wait_us | frees | size bit1 | bit1_bad | link 0 | link0+bit1 | self | guest crash |
+|---|---|---|---|---|---|---|---|---|
+| w100_1 | 100 | 4,000 (cap) | 1,164 | 0 | 338 | 0 | 0 | 0 |
+| w100_2 | 100 | 26,925 | 8,971 | 0 | 1,418 | 0 | 0 | 0 |
+| w100_3 | 100 | 32,650 | 10,468 | 0 | 1,687 | 0 | 0 | 0 |
+| w100_4 | 100 | 31,230 | 10,367 | 0 | 1,234 | 0 | 0 | 0 |
+| w100_5 | 100 | 31,101 | 10,358 | 0 | 1,721 | 0 | 0 | 0 |
+| w100_6 | 100 | 24,367 | 7,667 | 0 | 1,096 | 0 | 0 | 0 |
+| w100_7 | 100 | 23,036 | 7,402 | 0 | 1,113 | 0 | 0 | 0 |
+| w100_8 (partial, 131 s) | 100 | 13,101 | 4,186 | 0 | 949 | 0 | 0 | 0 |
+| w1000_1 | 1000 | 23,273 | 7,707 | 0 | 1,033 | 0 | 0 | 0 |
+| w1000_2 | 1000 | 22,003 | 6,522 | 0 | 1,102 | 0 | 0 | 0 |
+| **total** | | **231,686** | **78,812** | **0** | **10,691** | **0** | **0** | **0** |
+
+A zero link is **normal** when bit 1 is clear: it says the previous chunk is in
+use, so the field is not read. Every free with bit 1 set (78,812 in total, of
+which 60,583 at 100 us) had a plausible 4-aligned heap link, and no chunk was on
+its size bin at free. So in every observed free the header invariant the unlink
+needs (`bit 1 set => non-NULL valid link`) held.
+
+**Rate.** 0 crashes in 8 launches at 100 us (seven full ~400 s runs and one
+partial) and 0 in 2 launches at 1 ms. With the previous session that is **1
+crash in 13 launches at 100 us** and **0 in 11 at 1 ms**. The crash did not
+reproduce here, so the probe did not capture the faulting free's own header.
+
+**Windows oracle.** `build\run_poolprobe.exe` (the `-Trace` build) with the pad
+timeline reached the same Continue load: `Korra/GameData.dat` opened
+(`disp=3`, then `disp=2`, `last=183`), `[scene] flow` went
+`9 A B C D 10 11` and then `12 14 16`, and `player=0x0E142B60` was non-NULL.
+`--watch 0x00828D80 --watchspan -8 16` gives `[ecx-0x20..]`; on entry ecx is
+the block only sometimes, so the header is readable only when `ecx == args[1]`:
+**268 such frees, 7 with bit 1, all links plausible, 3 link-0 with bit 1 clear,
+0 invalid** - the same state as the device. The watch itself then faulted at
+86.7 s reading `[ecx-0x20]` with `ecx=C0000002` (a wild register, not the
+block), so that tombstone is instrumentation, not a guest fault.
+
+**Conclusion.** Not a routine double free (0 of 186,410 device frees and 0 of
+268 Windows-readable frees were already on the free list) and not a routine
+uninitialised header (a zero link is legal exactly when bit 1 is clear; every
+bit-1 free had a valid link). The measured state fits the *timing window* row:
+the header is normal at every ordinary free and the fault state appears only in
+the rare timing that also crashes. Keep the 1 ms poll as the shipping workaround
+(0/11); the queue stays out. Candidate next step: a host-side guard at the free
+that, when bit 1 is set and the link is implausible, logs and clears bit 1
+before the guest unlinks (still no guest patch), plus a watch on `[block-8]`
+from allocation to free to name the writer. **Not verified:** the faulting
+free's own header (not captured), the writer, the rate (1/13), Stage 2, 30 fps.
