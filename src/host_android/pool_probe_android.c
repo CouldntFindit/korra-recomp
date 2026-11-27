@@ -43,6 +43,7 @@
 #define _GNU_SOURCE
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
@@ -84,6 +85,7 @@ typedef struct {
     int32_t  bin;       /* derived bin, -1 if not derivable */
     int32_t  self;      /* chunk itself is on the bin list */
     int32_t  prevok;    /* the header link is a plausible chunk address */
+    int32_t  prevstrict;/* ... and its size word ends exactly at this chunk */
     /* lifecycle */
     int32_t  has_alloc;
     uint32_t a_seq, a_tid, a_prev, a_size, a_word;
@@ -104,7 +106,10 @@ static uint32_t s_frees, s_alloc, s_with_snap, s_no_snap;
 static uint32_t s_alloc_bit1, s_alloc_bad, s_size_chg, s_link_zeroed;
 static uint32_t s_locked_chg, s_post_chg, s_log_cap;
 static uint32_t s_guard_hits, s_snap_full;
+static uint32_t s_strict_ok, s_strict_bad, s_bit1_clear;
 static int      s_guard = -1;   /* debug.korra.poolguard: candidate, off */
+static int      s_inject = -2;  /* debug.korra.poolinject=<free seq>, -1 off */
+static uint32_t s_injected;
 
 static __thread pool_rec *t_cur;   /* the free this thread is inside */
 
@@ -132,6 +137,21 @@ static int guard_on(void) {
         if (s_guard) ka_log("[poolprobe] guard on (debug.korra.poolguard=1)");
     }
     return s_guard;
+}
+
+/* Controlled reproduction of the fault state (diagnostics only, off unless
+ * debug.korra.poolinject=<free seq>): on that free, force the header the crash
+ * needs - link 0 and size bit 1 - and let the real free path run into it. With
+ * the guard off this reproduces the NULL unlink; with it on it proves the guard
+ * skips that unlink. It is a synthetic state, not the engine's own corruption. */
+static int inject_seq(void) {
+    if (s_inject == -2) {
+        char v[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.korra.poolinject", v);
+        s_inject = v[0] ? atoi(v) : -1;
+        if (s_inject > 0) ka_log("[poolprobe] inject at free #%d", s_inject);
+    }
+    return s_inject;
 }
 
 static int readable(uint32_t va, uint32_t n) {
@@ -248,11 +268,11 @@ static void log_rec(const pool_rec *r, const char *why) {
     uint32_t p_size = r->has_post ? r->p_size : 0xDEADDEADu;
     ka_log("[poolprobe] %s #%u blk=%08X pre=%08X/%08X w=%08X size=%u "
            "alloc=%s %08X/%08X post=%08X/%08X postfree=%08X/%08X bin=%d "
-           "self=%d prev=%d tid=%u",
+           "self=%d prev=%d strict=%d tid=%u",
            why, r->seq, r->block, r->h_prev, r->h_size, r->h_word, r->size,
            r->has_alloc ? "yes" : "no", r->a_prev, r->a_size,
            l_prev, l_size, p_prev, p_size,
-           r->bin, r->self, r->prevok, r->tid);
+           r->bin, r->self, r->prevok, r->prevstrict, r->tid);
 }
 
 void ka_pool_probe_free(uint32_t idx, uint32_t block) {
@@ -280,12 +300,29 @@ void ka_pool_probe_free(uint32_t idx, uint32_t block) {
             r.freeb = MEM32(pool + 0x40u);
         }
     }
+    if (inject_seq() == (int)r.seq) {
+        MEM32(block - 8) = 0;
+        MEM32(block - 4) = MEM32(block - 4) | 2u;
+        s_injected++;
+        ka_log("[poolprobe] INJECT blk=%08X seq=%u (hdr now 0/%08X)",
+               block, r.seq, MEM32(block - 4));
+    }
     r.h_prev = MEM32(block - 8);
     r.h_size = MEM32(block - 4);
     r.h_word = MEM32(block);
     r.size = r.h_size & ~3u;
     r.bin = bin_of(r.size);
     r.prevok = plausible_prev(block, r.h_prev) ? 1 : 0;
+    /* The allocator's geometry gives a stronger test: the linked chunk's size
+     * word must make it end exactly at this chunk (next = chunk + 8 + size).
+     * Only read it after the link is a plausible (readable) heap address. */
+    r.prevstrict = (r.prevok &&
+        (MEM32(r.h_prev + 4u) & ~3u) == ((block - 8u) - r.h_prev - 8u)) ? 1 : 0;
+    if ((r.h_size & 2u)) {
+        if (r.prevstrict) s_strict_ok++; else s_strict_bad++;
+    } else {
+        s_bit1_clear++;
+    }
     if (r.region && readable(r.region, 0x74))
         r.self = on_bin(r.region, r.bin, block - 8u) ? 1 : 0;
 
@@ -354,10 +391,13 @@ void ka_pool_probe_free(uint32_t idx, uint32_t block) {
     if ((s_frees % 1024u) == 0u) {
         ka_log("[poolprobe] stats frees=%u alloc=%u with_snap=%u no_snap=%u "
                "alloc_bit1=%u alloc_bad=%u size_chg=%u link_zeroed=%u "
-               "locked_chg=%u post_chg=%u guard=%u snap_full=%u",
+               "locked_chg=%u post_chg=%u guard=%u snap_full=%u "
+               "bit1=%u strict_ok=%u strict_bad=%u bit1_clear=%u inj=%u",
                s_frees, s_alloc, s_with_snap, s_no_snap, s_alloc_bit1,
                s_alloc_bad, s_size_chg, s_link_zeroed, s_locked_chg,
-               s_post_chg, s_guard_hits, s_snap_full);
+               s_post_chg, s_guard_hits, s_snap_full,
+               s_strict_ok + s_strict_bad, s_strict_ok, s_strict_bad,
+               s_bit1_clear, s_injected);
     }
 }
 
@@ -412,11 +452,13 @@ void ka_pool_probe_dump(const char *why) {
                            "[poolprobe] counters frees=%u alloc=%u with_snap=%u "
                            "no_snap=%u alloc_bit1=%u alloc_bad=%u size_chg=%u "
                            "link_zeroed=%u locked_chg=%u post_chg=%u guard=%u "
-                           "snap_full=%u\n",
+                           "snap_full=%u bit1=%u strict_ok=%u strict_bad=%u "
+                           "bit1_clear=%u inj=%u\n",
                            s_frees, s_alloc, s_with_snap, s_no_snap,
                            s_alloc_bit1, s_alloc_bad, s_size_chg,
                            s_link_zeroed, s_locked_chg, s_post_chg, s_guard_hits,
-                           s_snap_full);
+                           s_snap_full, s_strict_ok + s_strict_bad, s_strict_ok,
+                           s_strict_bad, s_bit1_clear, s_injected);
         if (len > 0) { ssize_t w = write(2, head, (size_t)len); (void)w; }
     }
     for (i = 0; i < n; i++) {
@@ -428,7 +470,8 @@ void ka_pool_probe_dump(const char *why) {
         len = snprintf(buf, sizeof buf,
                        "[poolprobe] %s #%u blk=%08X pre=%08X/%08X w=%08X "
                        "size=%u alloc=%s %08X/%08X post=%08X/%08X "
-                       "postfree=%08X/%08X bin=%d self=%d prev=%d tid=%u\n",
+                       "postfree=%08X/%08X bin=%d self=%d prev=%d strict=%d "
+                       "tid=%u\n",
                        why, r->seq, r->block, r->h_prev, r->h_size,
                        r->h_word, r->size,
                        r->has_alloc ? "yes" : "no", r->a_prev, r->a_size,
@@ -436,7 +479,7 @@ void ka_pool_probe_dump(const char *why) {
                        r->has_locked ? r->l_size : 0xDEADDEADu,
                        r->has_post ? r->p_prev : 0xDEADDEADu,
                        r->has_post ? r->p_size : 0xDEADDEADu,
-                       r->bin, r->self, r->prevok, r->tid);
+                       r->bin, r->self, r->prevok, r->prevstrict, r->tid);
         if (len > 0) { ssize_t w = write(2, buf, (size_t)len); (void)w; }
     }
 }

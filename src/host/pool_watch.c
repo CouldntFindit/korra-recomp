@@ -65,6 +65,7 @@ static uint32_t s_seq;
 static uint32_t s_frees, s_bit1, s_bit1_ok, s_bit1_bad, s_zero, s_zero_bit1;
 static uint32_t s_bitsize, s_nosnap, s_changed, s_alloc, s_unreadable;
 static uint32_t s_size_chg, s_link_zeroed, s_alloc_bad, s_alloc_bit1;
+static uint32_t s_strict_ok, s_strict_bad;
 static uint32_t s_logged, s_bad_logged, s_span_logged;
 static int s_span;
 
@@ -94,6 +95,16 @@ static int readable(uint32_t va, uint32_t n) {
 static int plausible_prev(uint32_t block, uint32_t p) {
     return p && (p & 3u) == 0 && p < block && p >= 0x10000u &&
            readable(p, 8);
+}
+
+/* The stronger test the allocator's geometry gives: the linked chunk's own
+ * size word must make it end exactly at this chunk (next = chunk + 8 + size).
+ * A link that passes this IS the previous physical chunk, not merely an
+ * address that happens to point somewhere valid. Only read after the range is
+ * known readable. */
+static int strict_prev(uint32_t block, uint32_t p) {
+    if (!plausible_prev(block, p)) return 0;
+    return (MEM32(p + 4) & ~3u) == ((block - 8u) - p - 8u);
 }
 
 static void span_line(const char *tag, uint32_t base, int row) {
@@ -179,12 +190,14 @@ static void alloc_hook(uint32_t fn, uint32_t *args) {
 
 static void summary(void) {
     fprintf(stderr, "[poolwatch] summary frees=%u bit1=%u bit1_ok=%u "
-                    "bit1_bad=%u zero_link=%u zero_bit1=%u size0=%u "
+                    "bit1_bad=%u strict_ok=%u strict_bad=%u "
+                    "zero_link=%u zero_bit1=%u size0=%u "
                     "alloc=%u nosnap=%u changed=%u size_chg=%u link_zeroed=%u "
                     "alloc_bad=%u alloc_bit1=%u unreadable=%u\n",
-            s_frees, s_bit1, s_bit1_ok, s_bit1_bad, s_zero, s_zero_bit1,
-            s_bitsize, s_alloc, s_nosnap, s_changed, s_size_chg,
-            s_link_zeroed, s_alloc_bad, s_alloc_bit1, s_unreadable);
+            s_frees, s_bit1, s_bit1_ok, s_bit1_bad, s_strict_ok, s_strict_bad,
+            s_zero, s_zero_bit1, s_bitsize, s_alloc, s_nosnap, s_changed,
+            s_size_chg, s_link_zeroed, s_alloc_bad, s_alloc_bit1,
+            s_unreadable);
     fflush(stderr);
 }
 
@@ -205,7 +218,11 @@ static void free_hook(uint32_t va) {
     sizev = size & ~3u;
     bit1 = (size & 2u) != 0;
     prevok = plausible_prev(block, prev);
-    if (bit1) { s_bit1++; if (prevok) s_bit1_ok++; else s_bit1_bad++; }
+    if (bit1) {
+        s_bit1++;
+        if (prevok) s_bit1_ok++; else s_bit1_bad++;
+        if (strict_prev(block, prev)) s_strict_ok++; else s_strict_bad++;
+    }
     if (!prev) { s_zero++; if (bit1) s_zero_bit1++; }
     if (!sizev) s_bitsize++;
 
