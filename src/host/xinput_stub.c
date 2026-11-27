@@ -28,6 +28,15 @@
  *                          engine's menus navigate on the left stick, not the
  *                          D-pad, so this is what walks the Options menu on the
  *                          Windows oracle.
+ *   KORRA_KEYS=1           map a few keyboard keys onto pad 0 as well: arrows =
+ *                          the D-pad, Enter/Space = A, Esc/Backspace = B, Tab =
+ *                          START. Off by default; it exists because the engine's
+ *                          own keyboard path is DirectInput and a SendInput
+ *                          press does not reach the DInput state it polls
+ *                          (measured 2026-11-28: GetDeviceState is called every
+ *                          frame, DI_OK, 256 bytes, all zero while SendInput
+ *                          holds VK_DOWN). GetAsyncKeyState does see it, so this
+ *                          is the reliable scripted-input path for automation.
  *
  * Sticks default to 0/0, and nothing here has any effect unless KORRA_PAD is set.
  *
@@ -64,8 +73,32 @@ typedef struct {
 
 static int pad_enabled(void) {
     static int cached = -1;
-    if (cached < 0) cached = getenv("KORRA_PAD") != NULL;
+    if (cached < 0)
+        cached = getenv("KORRA_PAD") != NULL || getenv("KORRA_KEYS") != NULL;
     return cached;
+}
+
+/* KORRA_KEYS=1 - the keyboard as a pad. The engine polls the DirectInput
+ * keyboard every frame but an injected key never appears in its 256-byte
+ * state (see the header), while GetAsyncKeyState does see the injection. This
+ * translates the same physical keys into the XInput bit layout the engine's
+ * remap already understands, so a scripted walk uses the proven pad path and
+ * the game's own action map is untouched. Off unless KORRA_KEYS is set. */
+static uint16_t pad_keys(void) {
+    static int cached = -1;
+    uint16_t b = 0;
+    if (cached < 0) cached = getenv("KORRA_KEYS") != NULL;
+    if (!cached) return 0;
+    if (GetAsyncKeyState(VK_RETURN) & 0x8000) b |= PAD_A;
+    if (GetAsyncKeyState(VK_SPACE)  & 0x8000) b |= PAD_A;
+    if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) b |= PAD_B;
+    if (GetAsyncKeyState(VK_BACK)   & 0x8000) b |= PAD_BACK;
+    if (GetAsyncKeyState(VK_TAB)    & 0x8000) b |= PAD_START;
+    if (GetAsyncKeyState(VK_UP)     & 0x8000) b |= 0x0001;   /* XINPUT dpad up */
+    if (GetAsyncKeyState(VK_DOWN)   & 0x8000) b |= 0x0002;
+    if (GetAsyncKeyState(VK_LEFT)   & 0x8000) b |= 0x0004;
+    if (GetAsyncKeyState(VK_RIGHT)  & 0x8000) b |= 0x0008;
+    return b;
 }
 
 static int pad_auto(void) {
@@ -263,6 +296,7 @@ static void shim_XInputGetState(void) {
         bits |= pad_single_taps(now);
         bits |= pad_timeline(now);
         bits |= pad_command_file(now, &cmd_lx, &cmd_ly);
+        bits |= pad_keys();
         pad_stick(&lx, &ly);
         if (cmd_lx || cmd_ly) { lx = cmd_lx; ly = cmd_ly; }
         /* dwPacketNumber changes only when the state changes, as the real
