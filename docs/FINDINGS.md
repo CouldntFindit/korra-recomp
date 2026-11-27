@@ -4987,3 +4987,202 @@ object, the handle is re-resolved after every poll, and there is no wake list,
 condvar or broadcast. Stage 0 is closed. Stage 1 (one-signal-one-waiter) is
 next; its before/after must use a matched window, because the Stage 0 sample is
 61.7 % of frames over 100 ms against the reference's 37.7 %.
+
+## 2026-11-27 - Stage 1 attempt: the one-signal-one-waiter queue works, then kills the boot (reverted)
+
+Base HEAD `33d8442` verified by subject (tree clean, `main == origin/main`); the
+phone was confirmed with `adb devices` before every run. Every device build used
+the real guest (`gradlew --no-daemon -PkorraLinkGuest=ON -PkorraWithDxvk=ON
+-PkorraDxvkSource=<absolute prepared tree> :app:assembleDebug`) and every log
+shows `guest: entry 0x0077C3B7`, never `guest: STUB`. No pcrecomp, DXVK, lifted
+code or `src/host` change; the six `src/host_android` files were reverted to
+`33d8442` at the end of the session, so **none of the queue ships**.
+
+The result in one line: the queue removes the shim cost completely (the 1 ms
+sleep bucket 53.5 -> 0.6 ms/frame, the machine-lock re-entry bucket 58.2 -> 3.1
+ms/frame) and the tutorial frame falls 119.8/106.5 -> 85.8 ms in the matched
+window, but it misses the 33.3 ms target, **and 2 of the 5 launches of the queue
+build died with SIGSEGV in guest code**. Reverted in full as a losing fix
+(AGENTS section 6).
+
+### Step 0 - the engine's waits, counted from the probes
+
+The existing probes (not new code) answer what the engine waits on; the only
+thing that needed a probe was `WaitForMultipleObjectsEx`.
+
+- **120 probed waits: 90 semaphore (`kind=3`), 30 event (`kind=1`), 0 mutex**,
+  all `ms=4294967295` (INFINITE). 24 semaphores created per boot, every one
+  `init=0 max=1`, handles `0x6-0x13`, `0x1E-0x25`, `0x2D-0x2E`. The worker
+  `sub_007414E0` waits on `0x8-0x12` (`wait: rep ... caller=0x007414E0`); the
+  render/menu thread waits on events `0x2-0x5`, `0x19`, `0x1B`, `0x26`
+  (`wait: rep ... caller=0x008D1F78`).
+- **Per frame on the presenting thread** (matched baseline window, below): 44.3
+  `nanosleep(1)` calls and 9.73 `WaitForSingleObject` calls that polled; the
+  sleep histogram's largest requested value is 1 ms, so every one of them is the
+  engine's wait poll, not the frame limiter.
+- **`WaitForMultipleObjectsEx` has 32 static call instructions** in the generated
+  C (IAT slot `0x8FD024`: 35 references = 32 `RECOMP_ICALL(MEM32(0x8FD024))` +
+  3 `mov reg, MEM32(0x8FD024)` before an indirect call), in 32 distinct lifted
+  functions. **At runtime it is a boot/loading path**: the Stage 1 probe logged
+  the first 20 calls, every one `count=2|3 waitall=0 ms=INFINITE`, the last of
+  them by `t=77 s`; no `n=10000` line appeared in a 336 s run, so fewer than
+  10,000 calls in that run (<= 30/s) against ~13 waits/frame on the render
+  thread. The multi-object wait therefore keeps the 1 ms poll as the correct
+  fallback, and the queue leaves it alone.
+
+### The wake channel, decided before coding
+
+A **per-object condvar (CLOCK_MONOTONIC) plus a waiter count**, not a counting
+token: a token can outlive a timed-out waiter and drift above the waiter count
+(the documented over-wake failure), while a condvar has no token to drift, and
+`pthread_cond_signal` cannot over-wake. The state, not the wake, carries the
+signal: the waiter tests and consumes under the object lock, enqueues, drops the
+lock, releases the full machine-lock recursion through the shim's gate,
+re-takes the lock and **re-tests immediately before blocking**, so a set that
+lands in the window is consumed by the re-test instead of being lost. Wake
+budget: auto-reset one signal if `waiters > 0`, manual-reset one broadcast (the
+only all-wake), semaphore `min(released, waiters)`, reset none, close a
+teardown broadcast (the waiter re-tests, finds no object and answers 258).
+`INFINITE` is a 1 s slice loop so the shim's 2000 ms "main thread still waiting"
+probe keeps its trigger without a 1 ms poll.
+
+### The queue (`src/host_android/wait_objects.{c,h}` + the shim's gate)
+
+Implemented as described, with the machine-lock plumbing in
+`kernel32_android.c` (`wait_gate_unlock`/`wait_gate_relock`, the same full-depth
+unwind `guest_sleep_ms` uses) and a new frame-probe bucket `blk` for the time a
+wait is parked on the wake channel. `wait_selftest.c` gained Q1-Q4 (no lost
+wake through a test-only pre-block hook, 9 waiters/8 sets -> 8 wakes and 1
+timeout, `release(3)` with 2 waiters -> 2 wakes and count 1, and 1,000 set/wait
+round trips over two auto-reset events); the probe prints one `[waitq]` line a
+second with the cumulative wait/wake counters. **Semantics were correct in
+isolation**: `[wait-selftest] 22/22 PASS` on two distinct launches, identical
+after normalising the measured milliseconds (0 differences), with
+`Q1 hook 1, wake 0 at 0 ms`, `Q2 8 woke, 1 timed out, worst set->wake 2 ms`,
+`Q3 count 3->1, next wait 0, count 0`, `Q4 2000 round trips in 19-27 ms` and a
+cumulative `spurious=0` over 2,038 queue waits. Nothing here lost a wake.
+
+### The matched baseline (Stage 0 build) and the queue's frame
+
+Same route (`android_route_drive.ps1`), same window definition (the play
+campaign the driver starts at the tutorial HUD: `-PlaySeconds 120`, fps cap 30,
+`int=100` in every sample), same device. The window is anchored in the probe's
+own clock by mapping the driver's elapsed time through the thermal anchors and
+the `Korra` logcat timestamps, not by assuming the two clocks agree.
+
+| | base1 | base2 | queue (fix2) |
+|---|---|---|---|
+| window (perf `t=`) | 143-262 (120 s) | 148-269 (122 s) | 217-338 (122 s) |
+| one-second samples / frames | 112 / 1,004 | 115 / 1,147 | 116 / 1,429 |
+| gestures in the window | 69 | 66 | 45 |
+| frame `dt` | **119.8 ms** | **106.5 ms** | **85.8 ms** |
+| per-second p10/p50/p90 | 84.1/105.2/241.7 | 74.2/93.0/233.5 | 38.4/135.3/172.3 |
+| per-frame min/max | 55.8/363.0 | 53.2/363.2 | 18.5/288.6 |
+| `Present` | 1.35 | 1.14 | 1.17 |
+| `WaitForSingleObject` | 111.25 | 99.22 | 75.17 |
+| - 1 ms `nanosleep` | **53.50** | **51.55** | **0.63** |
+| - blocked re-entering the lock | 58.16 | 47.99 | **3.13** |
+| - blocked on the wake channel (`blk`) | - | - | **72.76** |
+| residual lifted work | 6.74 | 5.82 | 8.08 |
+| bridged calls/frame | 7,680 | 7,465 | 7,068 |
+| frames >50 / >100 ms | 100 % / 41.1 % | 100 % / 29.7 % | 53.2 % / 35.8 % |
+| fps (frames / span) | 8.37 | 9.40 | 11.71 |
+| process CPU / threads / `int` | 99 % / 56 / 100 | 93 % / 56 / 100 | 123 % / 56 / 100 |
+
+The two baseline rows are 12 % apart, so both are reported; both queue-vs-
+baseline comparisons are made row by row. Distribution of the same window:
+
+| window | seconds <=33.3 ms | 33-50 | 50-100 | >100 |
+|---|---|---|---|---|
+| base1 | 0 | 0 | 51 | 61 |
+| base2 | 0 | 0 | 68 | 47 |
+| queue | 0 | 26 | 12 | 78 |
+
+Two sub-windows matter more than the average, because the campaign's frame cost
+is scene-weighted and the player covers the same gesture cycle at a different
+rate when the frame rate changes (69 gestures/120 s at 8.4 fps, 45 at 11.7):
+
+- **Menus** (t=80-200 queue vs t=80-130 baseline): 39.3 ms vs 51.7 ms, sleep
+  7.43 vs 25.19, lock 1.83 vs 21.31; 25.5 vs 19.1 fps.
+- **Light part of the area** (queue, t=309-338): 41.8 ms (24.4 fps), `blk` 34.75,
+  lock 1.09, residual 4.47, 11.7 % of frames >50 ms.
+- **Streaming/loading part** (queue, t=233-307): 135-195 ms, `blk` 115-165,
+  calls/frame 7,000-10,000.
+
+So the poll and its lock re-entry are gone (that half of the plan is proven),
+the frame is 24-28 % faster in the matched window and ~2x faster in the menus,
+and **the 30 fps target is not met**: the remaining 72.8 ms is the render thread
+parked on its workers, i.e. the serialized worker work behind the global machine
+lock - Stage 2's problem, not Stage 1's. The engine never had more than one
+waiter on an object (`[waitq] peak=1` over 954,091 waits), so a per-object
+signal is structurally a wake-one and the 2026-11-22 broadcast class cannot
+recur.
+
+### The failure that reverted it
+
+**2 of 5 launches of the queue build died with SIGSEGV**, both in `src/recomp`
+generated guest code, both `reason=2 (SIGNALED) status=11`:
+
+| run | died | fault | symbolized site | what the registers say |
+|---|---|---|---|---|
+| `s1fix1` | t=106 s, 5 s into the menu -> cutscene load | `signal 11 code=2 addr=0x71d4e75004`, `guest_func=0x00829560`, `esi=0` | `recomp_0054.c:92924` `edx = MEM32(esi + 4)` | the 2nd argument of the engine's block/link helper is **NULL**; the guest heap free list walked into it |
+| `s1camp` | t=79 s, right after the Story submenu's New Game press | `signal 11 code=2 addr=0x728a61ca80`, `guest_func=0x008AF460`, `edx=0xC0FFFA80`, `ecx=0xBD5A0000` | `recomp_0063.c:8934` `MEM32(edx + ecx * 4) = eax` | `ecx` is a **float bit pattern** used as an array index: an uninitialised local |
+
+Both crashes are *inside lifted guest code*, the object table was intact
+(no `obj: entry` line), **no wait failed or timed out** in either run
+(`[waitq] timeouts=0 fail=0 spurious=0`), and the crash buffer was empty (the
+guest's own handler wrote the lines above). The other three launches of the same
+build (two selftest launches, 40 s each, and `s1fix2`, 336 s) survived; the two
+baseline launches survived. The queue's own semantics are not implicated by any
+counter - what changed is *when* guest threads run.
+
+**Hypothesis (not proven, and the thing to settle first next time):** the 1 ms
+poll was acting as a latency floor. With it gone, the menu/render loop runs 2-3x
+faster while the asset pool and its file reads do not, so the engine consumes
+state the loader has not published yet. The two fault sites are consistent with
+that (a NULL node in the block/link path; an uninitialised index), and the known
+`slot: fn=00000000` dumps in *both* baseline logs show the pool already being
+woken before a slot's job function is filled - the poll's ~1 ms delay was hiding
+it. A second session should prove or disprove this (e.g. run the queue build
+with the play gestures disabled and with the loader pinned, or instrument the
+slot fill vs its semaphore release order) **before** re-attempting the queue.
+
+### Reverted, and the reverted build checked
+
+`git checkout` of the six `src/host_android` files, rebuilt with the same flags,
+`adb install -r`, then:
+
+- **Boot and save resume**: the Story submenu's Continue (its default entry)
+  opened `SystemData.dat` (16 B) and `GameData.dat` with `last=0`, rewrote
+  `GameData.dat` (`disp=2`) and reached the tutorial HUD at 101 s
+  (`s1cont_09_gameplay.png`), no crash - i.e. the save the *queue* build's
+  checkpoint wrote (7,856 B at 03:05) round-trips on the reverted build.
+- **Audio**: the Hw voice is fed in both builds (16,613 `hw block` lines in the
+  336 s queue run, 7,840 in the Continue run), and the NaN guard is unchanged -
+  it zeroed `7FC00000` words in voice 1 (`non-finite word in the mix (...),
+  zeroed - N so far`, 12 in the queue run, 6 in the Continue run).
+- **HOME -> resume with the pause menu**: pause menu at 136 s (Resume / Close the
+  Pause Menu / Options / Quit Game / Back), HOME at 136 s, 17 s on the launcher,
+  `am start` -> **same pid 8535**, HUD back at 178 s, the same pause menu after
+  (`s1life_18_pause-after.png`) and gameplay again after closing it.
+- **Windows `scripts\run_selftest.ps1`: 60 passed, 0 failed.**
+- **Install**: `adb install -r` of the rebuilt APK + the internal game tree
+  (marker + `LoK.exe` + both CPKs) is what every run above booted from; the SAF
+  picker path itself was not re-run (it would wipe the save pair) and is
+  untouched by this session.
+- Content guard clean on the docs commit.
+
+### Not verified / open
+
+- **The 30 fps target is not met** (85.8 ms in the matched window; 41.8 ms in
+  the light part of the area). The measured residual is the render thread
+  blocked on serialized worker work, which is the Stage 2 question.
+- **The two SIGSEGVs are not explained**, only sited and symbolized. They are
+  the reason the queue does not ship. 5 launches is a small sample.
+- A >=300 s campaign on the queue build: the campaign launch (`s1camp`) crashed
+  at 79 s, so there is no queue-build campaign row (min/avg/max fps, RSS,
+  thermals).
+- The `WaitForMultipleObjectsEx` runtime count is bounded only as ">= 20 and
+  < 10,000 in 336 s"; the probe logged the first 20 only.
+- Mutex waits (still zero measured), other devices, 60 fps, and the Windows
+  long-run are untouched.

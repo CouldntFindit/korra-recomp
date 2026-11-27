@@ -569,3 +569,21 @@ Append only; newest last. Format: date — attempt — outcome — next idea.
   file. Hash the pulled logs before counting runs; identical size and timestamp
   are the tell. The same report's "7.5 fps" was 566 frames divided by 75 sample
   lines, not by the 83 s span (6.8 fps).
+- 2026-11-27 - Replacing the 1 ms poll with a **per-object condvar queue**
+  (signal-one per auto-reset set, broadcast only for a manual-reset event,
+  `min(released, waiters)` per semaphore, a waiter count, and a re-test under the
+  object lock immediately before the block) - **semantically right, boot unsafe:
+  2 of 5 launches died with SIGSEGV in lifted guest code**. The queue passed the
+  18 Stage 0 scenarios plus Q1-Q4 twice (`22/22`, `spurious=0` over 2,038 waits,
+  `peak` waiters 1, worst set->wake 2 ms), and it does remove the shim cost (the
+  1 ms sleep bucket 53.5 -> 0.6 ms/frame, the machine-lock re-entry 58.2 -> 3.1)
+  and take the matched tutorial window from 119.8/106.5 to **85.8 ms** - but
+  `s1fix1` died at t=106 s in `0x00829560` (`MEM32(NULL+4)`, the engine's
+  block/link path) and `s1camp` at t=79 s in `0x008AF460` (a float bit pattern
+  used as an array index), both `reason=2 status=11`, with the object table
+  intact and `timeouts=0 fail=0`, so no wait was lost, fabricated or timed out.
+  Reverted in full; nothing ships. Suspect (unproven) that the 1 ms poll was a
+  latency floor hiding a loader race - the `slot: fn=00000000` dumps predate the
+  queue - so settle that before retrying. The 72.8 ms the render thread then
+  spends parked on its workers is the machine lock's cost, i.e. Stage 2's, not a
+  wake problem.
