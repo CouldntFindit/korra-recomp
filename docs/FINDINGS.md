@@ -5741,3 +5741,85 @@ live exclusive-fullscreen chain). `KORRA_KEYS` stays off by default and unproven
 
 Runs this session: 3 (budget 3). Builds: 1. Commits: `408ba43` (probe),
 this docs commit. Selftest 60/60; content guard clean.
+
+## 2026-11-28 - Pool guard ported to main: the injected fault is contained, the natural-fault qualification was stopped at 2 valid runs with no GUARD
+
+Base HEAD `77f5491` verified by subject (clean, `main == origin/main`); phone
+`<device-serial>` (SM-S921B) confirmed with `adb devices` before the work and
+re-checked before the campaign. Branch `stage1-poolprobe` @ `5455ad8` was read
+as the source and **not merged or cherry-picked**; only the guard was
+hand-ported. Every launch in the A/B and the campaign logged `guest: entry
+0x0077C3B7`, never `guest: STUB`.
+
+**The port (commit `7902218`).** New `src/host_android/pool_guard_android.c`
+with one entry `ka_pool_guard_free(uint32_t pool_index, uint32_t block)`, hooked
+in `k_EnterCriticalSection` before `cs_of(arg)`, gated on
+`g_cur_func == 0x00828D80u`. The four facts, re-verified on main: the hook sits
+at the pool free's own `EnterCriticalSection`; the guest `ebp` is still the
+free's frame there, so the pool index is `MEM32(g_ebp+8)` and the block
+`MEM32(g_ebp+0xC)` (the same pair `A32(0)` already relies on, and
+`RECOMP_REGS_OUT()` writes `g_ebp` immediately before the shim call); the
+plausibility rule is `prev && (prev & 3) == 0 && prev >= KA_HEAP_BASE &&
+prev < KA_HEAP_END && prev + 8 <= block`; the write is
+`MEM32(block - 4) = size & ~2u`.
+
+Both properties are read once with `__system_property_get` and logged once
+(`[poolguard] state guard=N inject=N`). `debug.korra.poolguard` is default off;
+`debug.korra.poolinject=<free seq>` forces `[block-8]=0` and `[block-4] |= 2` on
+one free for the A/B. The header is read only for a block inside
+`[KA_HEAP_BASE+8, KA_HEAP_END)`; GUARD logging is capped at 200 lines, then one
+summary per 1000 hits. With both properties unset the entry is one cached check
+plus the free-VA comparison: no ring, snapshots, allocation or stdio. No
+`pool_watch.c`, ring, `ALLOCBAD` or `SUSPECT` was ported.
+
+Build: `android\gradlew.bat --no-daemon -PkorraLinkGuest=ON -PkorraWithDxvk=ON
+-PkorraDxvkSource=<absolute prepared dxvk-native> :app:assembleDebug`, one
+build, success in 35 s; the new object and the `[poolguard] GUARD`/`INJECT`
+strings are in `libkorra.so`.
+
+**Injection A/B on main (the proof).** Same OCR Continue route and
+`debug.korra.wait_us=100`; the only difference is the guard property.
+Guard off: `[poolguard] INJECT blk=221EF608 seq=8000 (hdr now 0/0000003E)`,
+then `[crash] signal 11 code=2 addr=...+4 guest_func=0x00829560 ... esi=0`,
+`guest_tid=4109`, exit `reason=2 (SIGNALED) status=11` - the historic crash,
+reproduced from exactly that header state. Guard on: `INJECT
+blk=221F0228 (hdr now 0/00000016)` then `[poolguard] GUARD blk=221F0228
+hdr=00000000/00000016 -> size=00000014`, no crash; the HUD was read at 105 s and
+the run continued through active play to the deliberate force-stop
+(`reason=10`). The ported guard fires and skips the unlink on main, not on the
+branch.
+
+**Qualification, cut short by the owner at 8 launches.** The agreed scope was 8
+valid launches at `wait_us=100` with `poolguard=1` and `poolinject`/`poolprobe`
+empty (the 20-launch program was reduced because each run is 300 s plus route,
+and at 1/13 even 20 only reaches ~80 % power). Two valid runs completed before
+the stop, both with the log line `[poolguard] state guard=1 inject=-1`:
+
+| run | t reached | GUARD | crash | HUD |
+|---|---|---|---|---|
+| qual 1 | 316 s | 0 | 0 | yes |
+| qual 2 | 320 s | 0 | 0 | yes |
+
+No natural GUARD and no crash in 2 runs: at the measured 1/13 rate that is
+`1-(12/13)^2 = 15 %` power, so the honest statement is **not observed, ~15 %
+power**, not qualified. Six further launches are void and are not counted: one
+used the fixed-timeline `android_run.ps1 -Route continue` and stayed on the
+title through 90 s, so free #8000 was never reached; five used
+`setprop debug.korra.poolinject ""` through PowerShell, which dropped the empty
+argument and left `8000` in place, so each run's single GUARD was the injected
+one. The fifth of those crashed at guest `0x00866400` four log lines after the
+injected GUARD, on the synthetic corrupt header - a forced-state consequence,
+not a natural fault and not evidence about containment. One earlier campaign
+start lost the adb daemon at run 1; `adb kill-server/start-server` restored the
+device and that attempt is void too.
+
+**Not verified.** A natural GUARD and a natural crash contained (none observed);
+qualification power beyond 15 %; the 1 ms frame-cost A/B (not run - the guard's
+steady-state cost is one cached check per pool free, not measured as a frame
+delta); the pool writer (still unnamed); mutex waits, Stage 2, 30 fps.
+
+**Budget actuals.** Wall time ~100 min (target 150, hard 210); 12 device
+launches attempted = 2 injection A/B + 2 valid qualification + 6 void + 2
+aborted campaign starts; 1 build; commits `7902218` (port) and this docs
+commit. Device properties were returned to shipping/default at the end
+(`poolguard=0`, `wait_us=1000`, `poolinject`/`poolprobe` empty).
