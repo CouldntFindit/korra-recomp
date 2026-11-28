@@ -25,9 +25,13 @@
  *    SetEventNotification, 13 SetCooperativeLevel. Every new call site prints
  *    once with its arguments and result; a one-second summary prints the
  *    per-site counts, so "the engine never polls the keyboard" is a count of
- *    zero rather than the absence of a name in a top-6 list. GetDeviceState's
- *    first eight state bytes are printed on the first call per device, which
- *    is what separates "never polled" from "polled, state all zero".
+ *    zero rather than the absence of a name in a top-6 list. For slots 9/10
+ *    the state buffer is sampled on EVERY poll (validated once, so the steady
+ *    path is an 8-byte read): `first8` is the first poll, `or8` is the OR of
+ *    every byte of every poll, and a one-shot line reports when that OR goes
+ *    nonzero. That is what makes "does a held key ever appear in this state"
+ *    decidable; before 2026-11-28 the site lookup returned before the read, so
+ *    `or8` was the first poll forever and the line could not fire.
  *
  * Neither probe writes guest memory, takes the machine lock or calls guest
  * code. The dump runs on its own host thread and only reads the ring, so a
@@ -96,8 +100,8 @@ static uint64_t g_t0;
  * later re-install (draw_probe's watchdog re-installs its post hook every
  * 500 ms) turns the chain into a cycle: measured 2026-11-28 as
  * exception 0xC00000FD in sp_post's prologue, 0.2 s into the boot, with
- * KORRA_DRAWPATH=1. The depth counter is a second line of defence. */
-static __declspec(thread) int t_depth;
+ * KORRA_DRAWPATH=1. The hooks below carry a per-thread depth counter as a
+ * second line of defence. */
 
 static __declspec(thread) int t_pend = -1;      /* index of this thread's call */
 static __declspec(thread) uint32_t t_pend_kind;
@@ -210,9 +214,12 @@ typedef struct {
     uint32_t last_ret;
     uint32_t first_ms;     /* ms of the first call */
     uint32_t a1, a2, a3;   /* arguments of the first call */
-    uint32_t state8;       /* first 8 state bytes, packed; 0 when unread */
-    uint32_t state_cb;
-    uint32_t state_or;     /* OR of every state byte seen (slot 9/10) */
+    uint32_t state_ptr;    /* the engine's state buffer, validated once */
+    uint32_t state_cb;     /* cbData of the first call                  */
+    uint32_t state8;       /* FIRST poll's bytes 0-3, packed            */
+    uint32_t state8b;      /* FIRST poll's bytes 4-7, packed            */
+    uint32_t state_or;     /* OR of every state byte of every poll      */
+    uint32_t state_n;      /* polls sampled                             */
     uint32_t nz_logged;
     uint32_t logged;
 } din_site;
@@ -263,6 +270,37 @@ static int vtable_slot(uint32_t this_ptr, uint32_t target) {
     return -1;
 }
 
+/* Sample the device's state buffer. Called on the site's first poll and on
+ * every poll after it: the buffer is validated once (at first sighting, and
+ * again only if the engine moves it), so the steady path is an 8-byte read and
+ * eight ORs - no VirtualQuery, no stdio, no allocation - which keeps this
+ * affordable inside a post hook that runs thousands of times a frame.
+ *
+ * `state_or` is the OR of every byte of every poll, the only form that can
+ * answer "does a held key ever appear here": one sample taken before the key
+ * went down says nothing. `state8`/`state8b` stay the FIRST poll, labelled. */
+static void din_state_sample(din_site *s, const uint32_t *args) {
+    const unsigned char *p;
+    uint32_t k;
+    if (s->slot != 9 && s->slot != 10) return;
+    if (args[2] != s->state_ptr) {          /* first poll, or the buffer moved */
+        if (!readable(args[2], 8)) return;
+        s->state_ptr = args[2];
+        s->state_cb = args[1];
+        s->state8 = s->state8b = 0;
+        s->state_n = 0;
+    }
+    s->state_n++;
+    p = (const unsigned char *)(uintptr_t)s->state_ptr;
+    for (k = 0; k < 8; k++) s->state_or |= p[k];
+    if (s->state_n == 1) {
+        s->state8  = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                     ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+        s->state8b = (uint32_t)p[4] | ((uint32_t)p[5] << 8) |
+                     ((uint32_t)p[6] << 16) | ((uint32_t)p[7] << 24);
+    }
+}
+
 static void din_record(uint32_t target, const uint32_t *args, uint32_t ret) {
     /* Same direct-mapped filter as kind_of: the post hook sees every bridged
      * call, and only a handful of targets live in DINPUT8.dll. Nothing here
@@ -286,6 +324,10 @@ static void din_record(uint32_t target, const uint32_t *args, uint32_t ret) {
         if (g_din[i].target == target && g_din[i].this_ptr == args[0]) {
             g_din[i].calls++;
             g_din[i].last_ret = ret;
+            /* Every poll, not just the first: until 2026-11-28 this returned
+             * here, so state_or stayed the first sample forever and the
+             * "NONZERO" line could never fire after t~1.5 s. */
+            din_state_sample(&g_din[i], args);
             return;
         }
     }
@@ -299,21 +341,13 @@ static void din_record(uint32_t target, const uint32_t *args, uint32_t ret) {
     s->last_ret = ret;
     s->first_ms = (uint32_t)now_ms();
     s->a1 = args[1]; s->a2 = args[2]; s->a3 = args[3];
-    s->state8 = 0;
+    s->state_ptr = 0;
+    s->state8 = s->state8b = s->state_or = 0;
+    s->state_n = 0;
     s->state_cb = 0;
+    s->nz_logged = 0;
     s->logged = 0;
-    /* GetDeviceState (slot 9) / GetDeviceData (10): the engine's own byte
-     * count and pointer; the first 8 state bytes say whether a device that IS
-     * polled is answering with a real state or with zeros. */
-    if ((slot == 9 || slot == 10) && readable(args[2], 8)) {
-        const unsigned char *p = (const unsigned char *)(uintptr_t)args[2];
-        s->state_cb = args[1];
-        s->state8 = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
-                    ((uint32_t)p[3] << 24);
-        for (k = 0; k < 8; k++) s->state_or |= p[k];
-        s->a3 = (uint32_t)p[4] | ((uint32_t)p[5] << 8) | ((uint32_t)p[6] << 16) |
-                ((uint32_t)p[7] << 24);
-    }
+    din_state_sample(s, args);
     g_din_n++;
 }
 
@@ -321,7 +355,8 @@ static void din_record(uint32_t target, const uint32_t *args, uint32_t ret) {
 /* A probe that installs itself later (draw_probe's watchdog re-installs its
  * post hook every 500 ms) can end up above this one while this one's saved
  * "previous" already points at it, which makes the chain a cycle. A re-entrant
- * call means exactly that, and chaining once is enough: skip the repeat. */
+ * call means exactly that, and running the probe once is enough. This is the
+ * only definition of the guard (the file had a duplicate tentative one). */
 static __declspec(thread) int t_depth;
 
 static void sp_pre(uint32_t target, uint32_t *args) {
@@ -465,12 +500,13 @@ static DWORD WINAPI sp_thread(LPVOID param) {
                         g_din[i].a1, g_din[i].a2, g_din[i].a3);
                 if ((g_din[i].slot == 9 || g_din[i].slot == 10) && g_din[i].state_cb)
                     fprintf(stderr, "[dinput]   state cb=%u first8=%02X %02X %02X %02X"
-                                    " %02X %02X %02X %02X\n",
+                                    " %02X %02X %02X %02X polls=%u or8=%02X\n",
                             g_din[i].state_cb,
                             g_din[i].state8 & 0xFF, (g_din[i].state8 >> 8) & 0xFF,
                             (g_din[i].state8 >> 16) & 0xFF, (g_din[i].state8 >> 24) & 0xFF,
-                            g_din[i].a3 & 0xFF, (g_din[i].a3 >> 8) & 0xFF,
-                            (g_din[i].a3 >> 16) & 0xFF, (g_din[i].a3 >> 24) & 0xFF);
+                            g_din[i].state8b & 0xFF, (g_din[i].state8b >> 8) & 0xFF,
+                            (g_din[i].state8b >> 16) & 0xFF, (g_din[i].state8b >> 24) & 0xFF,
+                            g_din[i].state_n, g_din[i].state_or & 0xFF);
                 if ((g_din[i].slot == 9 || g_din[i].slot == 10) &&
                     g_din[i].state_or && !g_din[i].nz_logged) {
                     g_din[i].nz_logged = 1;
