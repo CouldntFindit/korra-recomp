@@ -45,6 +45,10 @@ void      ka_guest_free(uint32_t va);
 /* Dumps the engine memory manager, its allocator and the fallback allocator
  * (free lists, used list); see memory_android.c. Diagnostics only. */
 void      ka_pool_dump(const char *tag);
+/* debug.korra.poolguard=1: containment at the pool free - clear size bit 1
+ * when the "previous chunk free" link is not a plausible chunk. Default off.
+ * debug.korra.poolinject=<free seq>: force that fault state once (A/B only). */
+void      ka_pool_guard_free(uint32_t pool_index, uint32_t block);
 void      ka_ring_dump(const char *why);
 void      ka_obj_check(void);
 uint32_t  ka_guest_strdup(const char *s);
