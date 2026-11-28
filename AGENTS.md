@@ -645,3 +645,21 @@ Append only; newest last. Format: date — attempt — outcome — next idea.
   DOWN never makes it non-zero, while `GetAsyncKeyState` sees it. The keyboard
   automation route is therefore the XInput stub (`KORRA_KEYS=1`), not an acquire fix;
   a DInput-device shim would be the alternative and is not in `src\host`.
+- 2026-11-28 — **correction to the two entries above** (do not delete them; this is
+  what the later measurement says). (1) "the *same* `run_m4c.exe` that froze on
+  2026-11-22" is wrong: the log's header is `korra_recomp 2026-11-22 00:25:31` and
+  `build\run_m4c.exe` was written `00:41:18`, 16 minutes later - same name, later
+  build, and the exact freezing binary is not on disk. Four clean runs therefore do
+  not show "not a build regression"; at the historical 1/13 rate they are expected
+  `1-(12/13)^4 = 27 %` of the time by chance, so the freeze was **not detected at
+  ~27 % power** and stays open. (2) The DInput census sampled the state buffer only
+  on a site's *first* poll, so "the state is all zero" and "no NONZERO line" were
+  statements about one poll at boot. After the probe fix (`408ba43`, every poll
+  sampled; the mouse site's `or8` changing 0x00 -> 0xFF at t=1.6 s is the
+  instrument's own check) the answer is: keyboard `or8=0x00` across 120 s with
+  300 ms Enter and DOWN holds while `keybd_event` -> `GetAsyncKeyState` returns
+  `0x8001` - **zero while held**, so the injection never reaches this engine's
+  DInput state buffer. `KORRA_KEYS` remains off by default and **unproven**: the
+  scene globals do not move at the menus and the engine's pad accumulator did not
+  change in the one run that watched it, with the driver never forcing the
+  foreground.

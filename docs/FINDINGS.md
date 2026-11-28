@@ -5579,16 +5579,23 @@ Four 90 s runs on this build with `KORRA_PERF=1`:
 | a | (none) | `t=88.5s f=2942 dt=68.7ms present=2` | no |
 | b | `KORRA_PAD=1` | `t=88.4s f=3130 dt=77.0ms present=2` | no |
 | c | `KORRA_PAD=1 KORRA_PAD_AUTO=1` | `t=88.7s f=2958 dt=51.9ms present=1` | no |
-| d | `KORRA_PAD=1 KORRA_PAD_AUTO=1`, **`run_m4c.exe`** (the 11-22 binary) | `t=89.0s f=3313 dt=53.4ms present=1` | no |
+| d | `KORRA_PAD=1 KORRA_PAD_AUTO=1`, a copy **named** `run_m4c.exe` | `t=89.0s f=3313 dt=53.4ms present=1` | no |
 
-So the freeze is neither PAD_AUTO-dependent on this build nor tied to the binary
-that recorded it - (d) is the same exe that froze on 2026-11-22 and it passed the
-54-55 s point. It is an intermittent, environment-dependent lost wake, and the
-2026-11-22 log remains its only instance. **Closed as a negative, not fixed.**
-The stall ring (`KORRA_STALLPROBE=1`) was built for it but never fired: there was
-nothing to dump. It is the instrument to use on the next occurrence - it prints
-the pending wait's handle, its creating call and its last signaller, which is
-exactly the pair the census cannot name.
+**Correction (2026-11-28, later the same day).** Run (d) does **not** show "not a
+build regression". The log's header is `korra_recomp 2026-11-22 00:25:31`;
+`build\run_m4c.exe` was written `22.11.2026 00:41:18`, i.e. **16 minutes after
+the log it was supposed to reproduce**. Same name, later build: the exact
+freezing binary is not on disk, so the freeze's build dependence is untested
+rather than disproved.
+
+What the four runs do support, and no more: the event is **intermittent** and was
+**not detected** at ~**27 % power**. At the historical rate (1 crash in 13 runs,
+2026-11-27 device data) four clean runs happen `1 - (12/13)^4 = 27 %` of the time
+by chance; 0 of 4 is therefore expected just over a quarter of the time and says
+nothing about absence. The freeze is **still open**, instrumented
+(`KORRA_STALLPROBE=1`: pending handle, creating call, last signaller) so the next
+occurrence names its wait/signal pair instead of parking 24 threads anonymously.
+
 
 ### 2. `flow=0x9` black frame - not reproduced (the area renders)
 
@@ -5630,21 +5637,40 @@ session, by design).
 ```
 
 So: two devices, both **acquired**, both polled **every frame** in immediate mode
-(no `#10` GetDeviceData anywhere), and the keyboard state is all zero. A run that
-held Enter and DOWN for 150 ms each (keybd_event, foreground, exclusive
-fullscreen) produced **no** "state became NONZERO" line in 196 s: the injection
-does not reach the DInput state this engine reads, while `GetAsyncKeyState` does
-see it. That is a sharper version of the 2026-11-20 dead-end, and it rules out
-"never acquired" as the cause.
+(no `#10` GetDeviceData anywhere), and the keyboard's first poll is all zero.
 
-Branch taken: map the keys onto pad 0 in the XInput stub (`KORRA_KEYS=1`, off by
-default), because the pad path is the one this engine provably acts on. **NOT
-PROVEN**: the three-screenshot key-only walk did not run. Screen capture of the
-running game blocks - `CopyFromScreen` on the exclusive-fullscreen flip chain
-never returned at 30-50 fps (three attempts: two full-screen, one per-window,
-one of them in `KORRA_WINDOWED`), while the same call returned fine on the ~1 fps
-flow=0x9 area. What *is* proven is the diagnosis above; the mapping is committed
-as an off-by-default knob and is unvalidated.
+**Correction (2026-11-28, later the same day).** That probe sampled the state
+buffer only on a site's *first* poll, so "first8" above is all it ever proved.
+The probe now samples every poll (`408ba43`) and the question is decidable:
+
+| run, `KORRA_DINPUTPROBE=1` | keyboard site (slot 9, cb=256) | mouse site (cb=20) |
+|---|---|---|
+| 120 s, Enter 300 ms at t=46 s, DOWN 300 ms at t=52 s | `first8=00...` and **`or8=0x00` for the whole run** | `first8=00...`, `or8=0xFF` at t=1.6 s |
+
+The mouse site is the instrument's own check: its OR changed *after* the first
+poll, so later polls are sampled; the keyboard's OR never left zero, including
+during both holds. **Conclusion: zero while held - the injection does not reach
+the DInput state this engine polls.** That is the 2026-11-20 dead-end, now
+measured at the state buffer itself, and "never acquired" is ruled out as its
+cause (Acquire returns DI_OK). A free-standing check in the same session shows
+`keybd_event` -> `GetAsyncKeyState` works (`0x8001` while held), so the failure
+is not the injection API.
+
+Branch: map the keys onto pad 0 in the XInput stub (`KORRA_KEYS=1`, off by
+default), because the pad path is the one this engine provably acts on.
+
+**The mapping is UNPROVEN, and one observation leans against it.** The scene
+globals do not move at the menus (a keys-only run holds `flow=0x9` from t=42 s),
+so `KORRA_TRACE_SCENE` cannot see a menu walk. The engine's own pad accumulator
+(`0xE4E558`, watched with `KORRA_WATCHLOG=0xE4E554`) never changed during a run
+that held Enter and DOWN, while the same watch did capture the boot writes to the
+controller table at `0xE4E564..0xE4E570` - so the watch works and the key press
+did not reach the engine's pad path in that run. The driver never forced the game
+to the foreground (it relied on exclusive fullscreen), which is the first thing
+to fix before calling `KORRA_KEYS` working. Screen capture of the live game still
+blocks (`CopyFromScreen` on the exclusive-fullscreen flip chain never returns at
+30-50 fps), so no picture proof exists either.
+
 
 ### Instrument defect found on the way (and fixed in the probe)
 
@@ -5673,3 +5699,45 @@ content guard clean.
 screenshot at flow=0x9; any device comparison; the freeze's wait/signal pair
 (never occurred); whether `KORRA_WINDOWED` actually took effect in the attempt
 (no window-vs-fullscreen check in that run).
+
+## 2026-11-28 (second session) - the DInput state probe is fixed, and the keyboard question is decided at the state buffer
+
+The 2026-11-28 census above recorded the state buffer only when a `(target, this)`
+site was first seen (the existing-site path returned after `calls++`), so `state_or`
+was the first poll forever and its "NONZERO" line could not fire. Fixed in
+`408ba43`: slots 9/10 sample every poll, the buffer is validated once and only
+again if the engine moves it, so the steady path is an 8-byte read and eight ORs
+(no VirtualQuery, no stdio, no allocation; inert when the probe is off). The
+duplicate tentative `t_depth` is gone.
+
+Instrument check, same run: the mouse site (`cb=20`) prints `first8=00...` and
+`or8=0xFF` at t=1.6 s - a poll *after* the first changed the accumulator, so the
+per-poll path is live.
+
+**STEP 1 (120 s, `KORRA_DINPUTPROBE=1`, Enter 300 ms at t=46 s, DOWN 300 ms at
+t=52 s, foreground by exclusive fullscreen):**
+
+| observation | keyboard site (slot 9, cb=256) | conclusion |
+|---|---|---|
+| `first8` | `00 00 00 00 00 00 00 00` | first poll zero (all the old probe proved) |
+| `or8` after both 300 ms holds | **`0x00`** | zero while held: the injection never appears in the DInput state this engine polls |
+
+`keybd_event` -> `GetAsyncKeyState` in the same session returns `0x8001` while
+held, so the injection API works; the gap is between the OS key state and this
+engine's DInput state buffer. Acquire still returns `DI_OK`, so "never acquired"
+is not the cause.
+
+**STEP 2 (keys-only walk, log-visible signal): unproven.** `KORRA_KEYS=1
+KORRA_TRACE_SCENE=1` with Enter/DOWN/Enter shows no `[scene]` change after the
+boot transition to `flow=0x9` at t=42 s - the menu screens do not move those
+globals, so the scene line cannot see a walk. A second signal was tried: the
+engine's own pad accumulator (`0xE4E558`, `KORRA_WATCHLOG=0xE4E554`) did not
+change during a run that held Enter and DOWN, while the same watch captured the
+boot writes at `0xE4E564..0xE4E570` (values 0,1,2,3) - the watch works, so the
+key press did not reach the pad path in that run. The driver never forced the
+game to the foreground; that is the first thing to fix before trusting
+`KORRA_KEYS`. No picture proof exists either (`CopyFromScreen` still blocks on the
+live exclusive-fullscreen chain). `KORRA_KEYS` stays off by default and unproven.
+
+Runs this session: 3 (budget 3). Builds: 1. Commits: `408ba43` (probe),
+this docs commit. Selftest 60/60; content guard clean.
